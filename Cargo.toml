@@ -1,0 +1,6 @@
+[workspace]
+# Nexty workspace 骨架（MusKitty 不造轮子分支）。
+# 当前为空：尚未确定模块划分，后续按需把 crate 加进 members。
+members = []
+
+resolver = "2"
