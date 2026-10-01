@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 use std::cell::RefCell;
+use std::sync::Mutex;
 
 use parley::StyleProperty;
 
@@ -70,6 +71,39 @@ pub struct FontMetrics {
     pub line_height: f32,
 }
 
+/// 解析出的字体资源：字体文件字节与 collection 内 face 索引。
+///
+/// 供光栅层（paint）构造字形渲染所需的字体数据；字节为共享快照，
+/// 解析结果可按族列表缓存。
+#[derive(Clone, PartialEq, Eq)]
+pub struct ResolvedFont {
+    data: std::sync::Arc<[u8]>,
+    index: u32,
+}
+
+impl ResolvedFont {
+    /// 字体文件字节（TTC 时为整个 collection）。
+    #[must_use]
+    pub fn data(&self) -> &std::sync::Arc<[u8]> {
+        &self.data
+    }
+
+    /// face 在 collection 中的索引（单字体文件为 0）。
+    #[must_use]
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+}
+
+impl std::fmt::Debug for ResolvedFont {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedFont")
+            .field("bytes", &self.data.len())
+            .field("index", &self.index)
+            .finish()
+    }
+}
+
 /// 文本整形后端。
 ///
 /// 实现方负责把 [`TextStyle`] 映射到具体字体选择与整形引擎，
@@ -98,6 +132,93 @@ pub enum TextError {
     /// 单个未知族名不会触发本错误：parley/fontique 会按 CSS Fonts 的回退
     /// 语义选择可用字体。
     FontUnavailable,
+}
+
+/// 字体解析器：把 CSS 字体族列表解析为字体文件字节。
+///
+/// 独立于整形器（无布局上下文），内部用 `Mutex` 提供可变性，
+/// 可跨线程共享（`Send + Sync`）。
+#[derive(Default)]
+pub struct FontResolver {
+    context: Mutex<parley::FontContext>,
+}
+
+impl std::fmt::Debug for FontResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FontResolver").finish()
+    }
+}
+
+impl FontResolver {
+    /// 创建解析器并发现系统字体。
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 按字体族列表解析出可用字体的文件字节。
+    ///
+    /// 族名 / generic 关键字的语义与 [`TextShaper::shape`] 一致；全部族名
+    /// 都不可用时按 CSS Fonts 回退语义退到 sans-serif，仍无则返回 `None`。
+    /// 空族列表返回 `None`。
+    pub fn resolve_font(&self, families: &[String]) -> Option<ResolvedFont> {
+        if families.is_empty() {
+            return None;
+        }
+        // 族名 / generic 关键字的解析与整形同源（parlance）；
+        // QueryFamily 借用族名字符串，故持有 owned 副本保证生命周期
+        enum FamilySpec {
+            Named(String),
+            Generic(parley::GenericFamily),
+        }
+        fn build_items(specs: &[FamilySpec]) -> Vec<parley::fontique::QueryFamily<'_>> {
+            specs
+                .iter()
+                .map(|spec| match spec {
+                    FamilySpec::Named(name) => parley::fontique::QueryFamily::Named(name),
+                    FamilySpec::Generic(generic) => {
+                        parley::fontique::QueryFamily::Generic(*generic)
+                    }
+                })
+                .collect()
+        }
+        let specs: Vec<FamilySpec> = families
+            .iter()
+            .filter_map(|family| match parley::FontFamilyName::parse(family)? {
+                parley::FontFamilyName::Named(name) => Some(FamilySpec::Named(name.into_owned())),
+                parley::FontFamilyName::Generic(generic) => Some(FamilySpec::Generic(generic)),
+            })
+            .collect();
+
+        let mut context = self.context.lock().expect("font resolver poisoned");
+        // 拆字段借用：collection 与 source_cache 同时可变借用
+        let parley::FontContext {
+            collection,
+            source_cache,
+        } = &mut *context;
+        let mut resolve = |specs: &[FamilySpec]| -> Option<ResolvedFont> {
+            let items = build_items(specs);
+            let mut query = collection.query(source_cache);
+            query.set_families(items);
+            let mut found = None;
+            query.matches_with(|font| {
+                // Blob 是共享引用计数，字节取快照供跨线程使用
+                found = Some(ResolvedFont {
+                    data: std::sync::Arc::from(font.blob.as_ref()),
+                    index: font.index,
+                });
+                parley::fontique::QueryStatus::Stop
+            });
+            found
+        };
+
+        let mut resolved = resolve(&specs);
+        if resolved.is_none() {
+            // 回退：sans-serif（CSS Fonts 的 last-resort 语义简化）
+            resolved = resolve(&[FamilySpec::Generic(parley::GenericFamily::SansSerif)]);
+        }
+        resolved
+    }
 }
 
 /// [`TextShaper`] 的 parley 实现。
@@ -129,6 +250,13 @@ impl ParleyTextShaper {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 按字体族列表解析出可用字体的文件字节。
+    ///
+    /// 语义见 [`FontResolver::resolve_font`]。
+    pub fn resolve_font(&self, families: &[String]) -> Option<ResolvedFont> {
+        FontResolver::new().resolve_font(families)
     }
 
     /// 按样式对文本做单行 parley 布局（不折行）。
@@ -338,5 +466,39 @@ mod tests {
             .metrics(&style(&[], 16.0))
             .expect_err("no families");
         assert_eq!(error, TextError::FontUnavailable);
+    }
+
+    #[test]
+    fn resolve_font_returns_bytes_for_known_and_unknown_families() {
+        let shaper = shaper();
+        let resolved = shaper
+            .resolve_font(&["serif".to_owned()])
+            .expect("generic family resolves");
+        assert!(!resolved.data().is_empty(), "字体字节非空");
+        assert_eq!(resolved.index(), 0, "常规字体文件单 face");
+
+        // 全部族名未知 → 回退仍能解析出字体
+        let fallback = shaper
+            .resolve_font(&["no-such-family-xyz".to_owned()])
+            .expect("fallback resolves");
+        assert!(!fallback.data().is_empty());
+    }
+
+    #[test]
+    fn resolve_font_empty_family_list_is_none() {
+        assert!(shaper().resolve_font(&[]).is_none());
+    }
+
+    #[test]
+    fn resolved_font_bytes_are_valid_font_data() {
+        // skrifa（parley 的字体解析库依赖路径）能读取为合法 face
+        let shaper = shaper();
+        let resolved = shaper
+            .resolve_font(&["serif".to_owned()])
+            .expect("resolves");
+        let face_count = skrifa::FontRef::from_index(resolved.data(), resolved.index())
+            .map(|_| 1)
+            .unwrap_or(0);
+        assert_eq!(face_count, 1, "字节可被 skrifa 解析");
     }
 }

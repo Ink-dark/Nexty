@@ -1,7 +1,7 @@
 [package]
 name = "nexty-text"
 description = "Nexty 文本整形与字体 facade"
-version = "0.1.2"
+version = "0.1.3"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,3 +10,5 @@ rust-version.workspace = true
 [dependencies]
 # parley 内部经 fontique 选字、harfrust 整形；swash 自 parley 0.11 起不再参与
 parley = "0.11.1"
+# ResolvedFont 字节的合法性校验（skrifa 已是 parley 的传递依赖）
+skrifa = "0.44.0"
