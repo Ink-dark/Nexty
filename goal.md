@@ -1,64 +1,52 @@
-# goal.md — 本轮任务：落地 nexty-css
+# goal.md — 本轮任务：落地 nexty-text，补全 nexty-network 与 nexty-paint
 
-日期：2026-10-01。前置：nexty-dom / nexty-html 已落地；本轮按管线顺序落地 CSS 层
-（cssparser + selectors 封装 + 自研 cascade，选型见
-docs/decisions/2026-10-01-crate-selection.md）。
+日期：2026-10-01。前置：nexty-dom / nexty-html / nexty-css 已落地。本轮做「有现成
+轮子」的三层：text（主任务）、network、paint——三者骨架 trait 已定，本轮补内部
+实现。layout（自研）与 chrome（integration，依赖本轮三层）留待后续轮。
 
 ## 任务清单与退出条件
 
-### T1 stylesheet 解析
-- 任务：`Stylesheet::parse`。样式规则 = 选择器列表 prelude + 声明块；声明级错误
-  单条恢复（CSS Syntax §5.5）；选择器列表含无效选择器时整条规则丢弃
-  （CSS Syntax §5.3.2 qualified rule 的 invalid 处理）；未知 @ 规则整块跳过
-  （CSS Syntax §5.4 error recovery）；`!important` 解析（CSS Cascading §5.1）。
-- 退出条件：上述行为各有单测；解析结果保持源顺序。
+### T1 nexty-network：ReqwestNetworkFetcher
+- 任务：用 reqwest（blocking）实现既有 `NetworkFetcher` trait。URL 解析失败 →
+  `InvalidUrl`；超时 → `Timeout`；其余传输错误 → `Transport`。响应头、状态码、
+  响应体逐项透传；重定向跟随交给 reqwest 默认行为。
+- 退出条件：离线回环测试（std TcpListener 起本地 HTTP 服务）覆盖
+  success（GET/HEAD、状态码、响应头、响应体）、`InvalidUrl`、`Timeout` 三条路径；
+  `cargo check` 零 warning。
 
-### T2 选择器匹配
-- 任务：为 arena DOM 实现 `selectors` crate 的 `Element` trait；提供
-  `parse_selector_list` 与 `matches_selector` 公共 API。HTML 元素的类型选择器
-  按规范 ASCII case-insensitive 匹配（Selectors §3.1.3 case-sensitivity）。
-- 退出条件：type/class/id/attribute 选择器、后代/子/兄弟组合器、`:first-child`
-  等结构伪类、`:is()`/`:not()` 各有匹配单测。
+### T2 nexty-text：parley 后端实现 TextShaper
+- 任务：`TextStyle` 扩为字体族列表（命名族 + CSS generic 族关键字），实现
+  `ParleyTextShaper`：fontique 选字体（按族列表顺序，generic 关键字映射），
+  parley 布局出字形（id/位置/advance），单位 CSS px（scale = 1）。
+- 退出条件：单测覆盖——空文本零输出、非空文本字形非空且 advance/width 为正、
+  字号缩放比例正确、字体族列表与 generic 族不 panic（回退路径）、族列表为空
+  → `FontUnavailable`。上游类型不进入 pub 导出。
 
-### T3 自研 cascade
-- 任务：对元素收集匹配声明，按 CSS Cascade 5 §6 排序：origin+importance →
-  特异度 → 源顺序，同属性取最后胜者；内联 style 属性按 author origin 参与，
-  normal 内联声明排在样式表 normal 声明之后（CSS Cascade 5 §6.4 style
-  attribute 的排序位置）。
-- 退出条件：origin/importance 分桶、特异度决胜、源顺序决胜、内联样式排序
-  各有单测。
+### T3 nexty-paint：VelloCpuRasterizer
+- 任务：用 vello_cpu 实现 `Rasterizer`（本轮指令集仅 FillRect）。CPU 后端本轮
+  落地；GPU 后端（vello_hybrid）依赖 wgpu device/surface，由 chrome 层提供，
+  **本轮从 nexty-paint 摘除 vello_hybrid 依赖**并在模块文档记录（ADR 已注明
+  GPU 侧后续评估），Rasterizer trait 即双后端接缝。
+- 退出条件：单测——FillRect 像素级验证（矩形内颜色、矩形外空白）、零尺寸
+  → `EmptySize`、多矩形叠加顺序正确。
 
-### T4 computed style（最小属性集）
-- 任务：级联值 → 继承 → initial（CSS Cascading §4.3/§4.4）。属性表只收当前
-  管线需要的最小集合（display/color/background-color/font-size/font-weight/
-  font-style/font-family/text-align 等），inherited 标志与 initial 值逐条引用
-  各属性规范；不扩充到布局属性。
-- 退出条件：inherited 属性无级联值时取父值，根取 initial；非 inherited 取
-  initial；各有单测。
-
-### T5 门禁与收尾
-- 任务 + 退出条件：
-  - `cargo check --workspace` 零 warning
-  - `cargo test --workspace` 全绿
-  - `cargo clippy --workspace --all-targets -- -D warnings` 零告警
-  - `cargo fmt --all -- --check` 通过
-  - `cargo deny check` 通过（本轮不引新依赖，仍作为门禁复跑）
-  - 覆盖率：本机无 tarpaulin/llvm-cov（Windows），以「每个公共 API 的
-    success + error 路径、每条规范行为分支有单测」替代 ≥80% 判据，测试代码
-    行数 ≥ 实现代码行数作为自检
-  - nexty-css `Cargo.toml` 版本显式化为 0.1.1（骨架 0.1.0 → 落地 +1 patch，
-    对齐 nexty-dom / nexty-html 的先例）
-  - AGENTS.md「当前状态」更新
-  - 分任务 commit；最终 push
+### T4 门禁与收尾
+- `cargo check --workspace` 零 warning；`cargo test --workspace` 全绿；
+  clippy `-D warnings` 零告警；`cargo fmt --all -- --check` 通过。
+- 本轮摘除 vello_hybrid 依赖 → 依赖树变化 → `cargo deny check` +
+  `cargo about generate` 重跑入库。
+- 三个 crate 版本 0.1.0 → 显式 0.1.1（骨架 → 落地 +1 patch，对齐先例）。
+- AGENTS.md「当前状态」更新（已落地六层）。
+- 分层 commit（network / text / paint 各一笔），最终 push。
 
 ## 非目标（本轮不做）
-- `var()`/custom properties、`@media`/`@import`/`@font-face` 的求值（未知
-  @ 规则按语法跳过）
-- 伪元素、浏览器前缀
-- 布局属性（margin/padding/width…）进入 computed 属性表——留给 layout 轮
-- WPT CSS 语料钉版——待 css 层行为面扩大后由架构师组织比对
+- 渲染隔离线程与 `catch_unwind` 兜底（chrome 层持有，见选型 ADR）
+- vello_hybrid GPU 后端（等 chrome 提供 wgpu surface）
+- 文本多行/换行/bidi（white-space 折叠是 layout 层职责；本轮 shape 单行）
+- @font-face 与自定义字体加载（fontique 系统字体集合）
+- 网络并发/流式、HTTPS 证书定制
 
 ## 验证流（AGENTS.md Verification Flow）
-每完成一个任务：cargo check 零 warning → cargo test 全绿 → fmt/clippy →
-commit。本轮 WPT 语义比对以规范引用单测替代（比对范围见非目标），架构师
-复核后允许 push。
+每层：cargo check 零 warning → cargo test 全绿 → fmt/clippy → commit。
+WPT 语义比对以规范引用单测替代（network/text/paint 无对应 WPT 语料钉版任务），
+架构师复核后允许 push。
