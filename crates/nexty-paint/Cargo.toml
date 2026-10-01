@@ -1,7 +1,7 @@
 [package]
 name = "nexty-paint"
 description = "Nexty 绘制 facade：自有绘制指令 + 可替换光栅后端（CPU 后端已落地，GPU 后端待 chrome 层接入）"
-version = "0.1.1"
+version = "0.1.2"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -11,3 +11,5 @@ rust-version.workspace = true
 # vello_hybrid（GPU 后端）依赖 wgpu device/surface，由 chrome 层提供后引入；
 # Rasterizer trait 是双后端接缝，见 docs/decisions/2026-10-01-crate-selection.md
 vello_cpu = "0.2.0"
+# 字体解析归 text 层：DrawText 指令的族列表经 FontResolver 取字体数据
+nexty-text = { path = "../nexty-text", version = "0.1.3" }

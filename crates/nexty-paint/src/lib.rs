@@ -16,6 +16,9 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 /// 像素尺寸。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Size {
@@ -59,6 +62,17 @@ pub struct Rect {
     pub height: f32,
 }
 
+/// 一个字形（文本 run 内；`y` 相对基线，负值在基线上方）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextGlyph {
+    /// 字体内部字形编号。
+    pub id: u32,
+    /// 相对基线原点的水平偏移，px。
+    pub x: f32,
+    /// 相对基线的垂直偏移，px。
+    pub y: f32,
+}
+
 /// 一条绘制指令。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -67,6 +81,31 @@ pub enum Command {
         /// 目标矩形。
         rect: Rect,
         /// 填充色。
+        color: Color,
+    },
+    /// 用纯色描边矩形（线宽向内向外各半），边框绘制用。
+    StrokeRect {
+        /// 目标矩形（描边中心线）。
+        rect: Rect,
+        /// 描边色。
+        color: Color,
+        /// 线宽，px；非正值不绘制。
+        width: f32,
+    },
+    /// 绘制一行字形。
+    ///
+    /// 字形必须已经过 text 层整形（字形 id 对应 [`Command::DrawText::families`]
+    /// 解析出的字体）；`glyphs[i].y` 相对基线，`baseline` 是基线的绝对 y。
+    DrawText {
+        /// 字形序列（x 为绝对坐标，y 相对基线）。
+        glyphs: Vec<TextGlyph>,
+        /// 基线的绝对 y，px。
+        baseline: f32,
+        /// 字体族列表（CSS font-family 语义），经 text 层解析为字体数据。
+        families: Vec<String>,
+        /// 字号，px。
+        size: f32,
+        /// 文本颜色。
         color: Color,
     },
 }
@@ -129,17 +168,37 @@ pub enum RasterError {
 }
 
 /// [`Rasterizer`] 的 vello_cpu 实现（CPU 光栅）。
+/// [`Rasterizer`] 的 vello_cpu 实现（CPU 光栅）。
 ///
 /// `vello_cpu` 对未支持特性是 panic 而非返回错误；按渲染隔离规则，
 /// 调用方须把本实现放进独立线程并以 `catch_unwind` 兜底。
-#[derive(Debug, Default, Clone, Copy)]
-pub struct VelloCpuRasterizer;
+///
+/// 文本渲染的字体解析经 text 层的 [`nexty_text::FontResolver`] 完成，
+/// 按族列表缓存解析结果。
+#[derive(Debug, Default)]
+pub struct VelloCpuRasterizer {
+    font_cache: std::sync::Mutex<HashMap<String, Option<std::sync::Arc<nexty_text::ResolvedFont>>>>,
+}
 
 impl VelloCpuRasterizer {
     /// 创建 CPU 光栅后端。
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 解析并缓存字体（族列表 → 字体数据）。
+    fn font_for(&self, families: &[String]) -> Option<std::sync::Arc<nexty_text::ResolvedFont>> {
+        let key = families.join(", ");
+        let mut cache = self.font_cache.lock().expect("font cache poisoned");
+        if let Some(cached) = cache.get(&key) {
+            return cached.clone();
+        }
+        let resolved = nexty_text::FontResolver::new()
+            .resolve_font(families)
+            .map(Arc::from);
+        cache.insert(key, resolved.clone());
+        resolved
     }
 }
 
@@ -156,6 +215,7 @@ impl Rasterizer for VelloCpuRasterizer {
         };
 
         let mut context = vello_cpu::RenderContext::new(width, height);
+        let mut resources = vello_cpu::Resources::new();
         for command in &scene.commands {
             match command {
                 Command::FillRect { rect, color } => {
@@ -169,11 +229,63 @@ impl Rasterizer for VelloCpuRasterizer {
                         f64::from(rect.y) + f64::from(rect.height),
                     ));
                 }
+                Command::StrokeRect { rect, color, width } => {
+                    if *width <= 0.0 {
+                        continue;
+                    }
+                    context.set_paint(vello_cpu::peniko::Color::from_rgba8(
+                        color.r, color.g, color.b, color.a,
+                    ));
+                    context.set_stroke(vello_cpu::kurbo::Stroke::new(f64::from(*width)));
+                    context.stroke_rect(&vello_cpu::kurbo::Rect::new(
+                        f64::from(rect.x),
+                        f64::from(rect.y),
+                        f64::from(rect.x) + f64::from(rect.width),
+                        f64::from(rect.y) + f64::from(rect.height),
+                    ));
+                }
+                Command::DrawText {
+                    glyphs,
+                    baseline,
+                    families,
+                    size,
+                    color,
+                } => {
+                    let Some(font) = self.font_for(families) else {
+                        continue;
+                    };
+                    context.set_paint(vello_cpu::peniko::Color::from_rgba8(
+                        color.r, color.g, color.b, color.a,
+                    ));
+                    // 字体数据按引用计数共享给 vello 的 Blob
+                    //（Sized 包装以完成到 trait 对象的胖指针转换）
+                    #[derive(Clone)]
+                    struct FontBytes(Arc<[u8]>);
+                    impl AsRef<[u8]> for FontBytes {
+                        fn as_ref(&self) -> &[u8] {
+                            &self.0
+                        }
+                    }
+                    let bytes: Arc<dyn AsRef<[u8]> + Send + Sync> =
+                        Arc::new(FontBytes(font.data().clone()));
+                    let font_data = vello_cpu::peniko::FontData::new(
+                        vello_cpu::peniko::Blob::new(bytes),
+                        font.index(),
+                    );
+                    let glyphs = glyphs.iter().map(|glyph| vello_cpu::Glyph {
+                        id: glyph.id,
+                        x: glyph.x,
+                        y: baseline + glyph.y,
+                    });
+                    context
+                        .glyph_run(&mut resources, &font_data)
+                        .font_size(*size)
+                        .fill_glyphs(glyphs);
+                }
             }
         }
 
         let mut target = vello_cpu::Pixmap::new(width, height);
-        let mut resources = vello_cpu::Resources::new();
         context.render(&mut target, &mut resources);
 
         // vello_cpu 输出预乘像素；facade 契约为非预乘，用上游自带转换
@@ -333,6 +445,123 @@ mod tests {
     fn empty_scene_yields_transparent_pixmap() {
         let pixmap = VelloCpuRasterizer::new()
             .rasterize(&Scene::default(), size(3, 3))
+            .expect("rasterize");
+        assert!(pixmap.data.iter().all(|byte| *byte == 0));
+    }
+
+    /// 用 text 层整形一个字符，返回其字形与基线度量。
+    fn shape_char(character: char) -> (Vec<TextGlyph>, f32) {
+        use nexty_text::TextShaper;
+        let shaper = nexty_text::ParleyTextShaper::new();
+        let style = nexty_text::TextStyle {
+            families: vec!["serif".to_owned()],
+            size: 32.0,
+        };
+        let text = character.to_string();
+        let shaped = shaper.shape(&text, &style).expect("shape");
+        let metrics = shaper.metrics(&style).expect("metrics");
+        let glyphs = shaped
+            .glyphs
+            .iter()
+            .map(|glyph| TextGlyph {
+                id: glyph.id,
+                x: glyph.x,
+                y: glyph.y,
+            })
+            .collect();
+        (glyphs, metrics.ascent)
+    }
+
+    #[test]
+    fn draw_text_produces_opaque_pixels() {
+        let (glyphs, ascent) = shape_char('A');
+        let scene = Scene {
+            commands: vec![Command::DrawText {
+                glyphs,
+                baseline: 40.0,
+                families: vec!["serif".to_owned()],
+                size: 32.0,
+                color: Color::opaque(0, 0, 0),
+            }],
+        };
+        let pixmap = VelloCpuRasterizer::new()
+            .rasterize(&scene, size(48, 48))
+            .expect("rasterize");
+
+        // 字形区域内应有大量不透明像素（基线在 40，字形主体在其上方）
+        let opaque = (0..48u32)
+            .flat_map(|x| (0..ascent as u32 + 8).map(move |y| (x, y)))
+            .filter(|(x, y)| pixmap.pixel(*x, *y).is_some_and(|p| p[3] > 200))
+            .count();
+        assert!(opaque > 20, "字形应产生不透明像素，实际 {opaque}");
+    }
+
+    #[test]
+    fn draw_text_honors_color_and_draw_order() {
+        let (glyphs, _) = shape_char('A');
+        let scene = Scene {
+            commands: vec![
+                Command::FillRect {
+                    rect: rect(0.0, 0.0, 48.0, 48.0),
+                    color: Color::opaque(255, 255, 255),
+                },
+                Command::DrawText {
+                    glyphs,
+                    baseline: 40.0,
+                    families: vec!["serif".to_owned()],
+                    size: 32.0,
+                    color: Color::opaque(255, 0, 0),
+                },
+            ],
+        };
+        let pixmap = VelloCpuRasterizer::new()
+            .rasterize(&scene, size(48, 48))
+            .expect("rasterize");
+
+        // 存在偏红的字形像素（抗锯齿边缘允许混色）
+        let has_red = (0..48u32).any(|x| {
+            (0..48u32).any(|y| {
+                pixmap
+                    .pixel(x, y)
+                    .is_some_and(|p| p[3] > 200 && p[0] > 150 && p[1] < 120)
+            })
+        });
+        assert!(has_red, "白底上的红色字形应可辨");
+    }
+
+    #[test]
+    fn stroke_rect_draws_outline_only() {
+        let scene = Scene {
+            commands: vec![Command::StrokeRect {
+                rect: rect(2.0, 2.0, 10.0, 10.0),
+                color: Color::opaque(255, 0, 0),
+                width: 2.0,
+            }],
+        };
+        let pixmap = VelloCpuRasterizer::new()
+            .rasterize(&scene, size(16, 16))
+            .expect("rasterize");
+
+        // 边框线上有红色
+        assert_eq!(pixmap.pixel(2, 2), Some([255, 0, 0, 255]));
+        assert_eq!(pixmap.pixel(11, 2), Some([255, 0, 0, 255]));
+        assert_eq!(pixmap.pixel(11, 11), Some([255, 0, 0, 255]));
+        // 中心保持透明（只描边不填心）
+        assert_eq!(pixmap.pixel(7, 7), Some([0, 0, 0, 0]));
+        assert_eq!(pixmap.pixel(6, 6), Some([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn stroke_rect_zero_width_is_noop() {
+        let scene = Scene {
+            commands: vec![Command::StrokeRect {
+                rect: rect(2.0, 2.0, 8.0, 8.0),
+                color: Color::opaque(255, 0, 0),
+                width: 0.0,
+            }],
+        };
+        let pixmap = VelloCpuRasterizer::new()
+            .rasterize(&scene, size(16, 16))
             .expect("rasterize");
         assert!(pixmap.data.iter().all(|byte| *byte == 0));
     }
