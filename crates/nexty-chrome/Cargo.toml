@@ -1,0 +1,19 @@
+[package]
+name = "nexty-chrome"
+description = "Nexty 浏览器外壳：窗口、输入与导航"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nexty-dom = { path = "../nexty-dom", version = "0.1.0" }
+nexty-html = { path = "../nexty-html", version = "0.1.0" }
+nexty-css = { path = "../nexty-css", version = "0.1.0" }
+nexty-layout = { path = "../nexty-layout", version = "0.1.0" }
+nexty-text = { path = "../nexty-text", version = "0.1.0" }
+nexty-paint = { path = "../nexty-paint", version = "0.1.0" }
+nexty-network = { path = "../nexty-network", version = "0.1.0" }
+winit = "0.30.13"
+wgpu = "29"

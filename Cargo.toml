@@ -1,6 +1,23 @@
 [workspace]
-# Nexty workspace 骨架（MusKitty 不造轮子分支）。
-# 当前为空：尚未确定模块划分，后续按需把 crate 加进 members。
-members = []
+# Nexty workspace（MusKitty 不造轮子分支）。
+# 分层与 crate 选型见 docs/decisions/2026-10-01-crate-selection.md
+members = [
+    "crates/nexty-dom",
+    "crates/nexty-html",
+    "crates/nexty-css",
+    "crates/nexty-layout",
+    "crates/nexty-text",
+    "crates/nexty-paint",
+    "crates/nexty-network",
+    "crates/nexty-chrome",
+]
 
 resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/Ink-dark/Nexty"
+# 取依赖中最高 MSRV（vello_cpu / vello_hybrid 为 1.88）
+rust-version = "1.89"

@@ -1,0 +1,13 @@
+[package]
+name = "nexty-text"
+description = "Nexty 文本整形与字体 facade"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fontique = "0.11.1"
+parley = "0.11.1"
+swash = "0.2.10"

@@ -1,0 +1,11 @@
+[package]
+name = "nexty-network"
+description = "Nexty 网络 facade"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+reqwest = { version = "0.13.5", features = ["blocking"] }

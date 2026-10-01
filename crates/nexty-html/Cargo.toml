@@ -1,0 +1,12 @@
+[package]
+name = "nexty-html"
+description = "Nexty HTML 解析层：html5ever 到自有 DOM 的桥接"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+html5ever = "0.40.1"
+nexty-dom = { path = "../nexty-dom", version = "0.1.0" }

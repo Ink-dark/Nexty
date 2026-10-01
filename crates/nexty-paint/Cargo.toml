@@ -1,0 +1,12 @@
+[package]
+name = "nexty-paint"
+description = "Nexty 绘制 facade：vello_cpu 与 vello_hybrid 双后端"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vello_cpu = "0.2.0"
+vello_hybrid = "0.2.0"
