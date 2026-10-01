@@ -17,12 +17,15 @@ mod parser;
 mod selector;
 #[cfg(test)]
 mod test_support;
+mod ua;
 mod value;
 
-pub use cascade::{ComputedStyle, cascade, compute_document_styles};
+pub use cascade::{ComputedStyle, Edges, cascade, compute_document_styles};
 pub use parser::{Declaration, StyleRule, Stylesheet, parse_inline_style};
 pub use selector::{SelectorError, matches_selector};
+pub use ua::html_ua_stylesheet;
 pub use value::{
-    AbsoluteSize, CssWideKeyword, DeclaredValue, DisplayValue, FontFamilyValue, FontSizeValue,
-    FontStyleValue, FontWeightValue, PropertyId, PropertyValue, Rgba, TextAlignValue,
+    AbsoluteSize, BorderColorValue, BorderStyle, BorderWidthValue, CssWideKeyword, DeclaredValue,
+    DisplayValue, FontFamilyValue, FontSizeValue, FontStyleValue, FontWeightValue, LineHeightValue,
+    MarginValue, PaddingValue, PropertyId, PropertyValue, Rgba, SizeValue, TextAlignValue,
 };

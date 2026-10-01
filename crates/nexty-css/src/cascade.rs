@@ -175,39 +175,59 @@ const PROPERTY_ORDER: [PropertyId; 31] = [
     PropertyId::BorderLeftColor,
 ];
 
-/// 级联排序键（CSS Cascade 5 §6.4，仅 author origin）。
+/// 级联 origin 桶（CSS Cascade 5 §6.4，仅 UA 与 author 两个 origin；
+/// user origin 尚未引入）。
 ///
-/// 字典序即优先级：`!important` 压过普通声明；同为普通声明时内联样式排在
+/// 值越大优先级越高：UA 普通 < author 普通 < author `!important` <
+/// UA `!important`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum OriginBucket {
+    UaNormal = 0,
+    AuthorNormal = 1,
+    AuthorImportant = 2,
+    UaImportant = 3,
+}
+
+/// 级联排序键（CSS Cascade 5 §6.4）。
+///
+/// 字典序即优先级：先 origin/importance 桶；author 声明中内联样式排在
 /// 样式表声明之后（§6.4 style attribute）；然后按特异度、规则顺序、声明顺序。
-/// `bool` 的 `Ord` 恰好满足 false < true。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct CascadeKey {
-    important: bool,
+    bucket: OriginBucket,
     inline: bool,
     specificity: u32,
     rule_order: usize,
     declaration_order: usize,
 }
 
-/// 对单个元素做级联，产出 computed style。
-///
-/// `parent` 是树序父元素的 computed style（元素没有元素祖先时为 `None`）。
-/// 各属性：级联胜者 → CSS-wide 关键字 → 继承 → initial。
-#[must_use]
-pub fn cascade(
+/// 级联 origin（CSS Cascade 5 §6.4；user origin 尚未引入）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    Ua,
+    Author,
+}
+
+/// origin + importance → 排序桶：UA 普通 < author 普通 < author `!important`
+/// < UA `!important`。
+fn bucket_of(origin: Origin, important: bool) -> OriginBucket {
+    match (origin, important) {
+        (Origin::Ua, false) => OriginBucket::UaNormal,
+        (Origin::Author, false) => OriginBucket::AuthorNormal,
+        (Origin::Author, true) => OriginBucket::AuthorImportant,
+        (Origin::Ua, true) => OriginBucket::UaImportant,
+    }
+}
+
+/// 收集一个 origin 样式表中命中元素的全部声明。
+fn collect_origin_declarations(
     document: &Document,
     element: NodeId,
-    stylesheets: &[&Stylesheet],
-    parent: Option<&ComputedStyle>,
-) -> ComputedStyle {
-    let mut matched: Vec<(CascadeKey, Declaration)> = Vec::new();
-
-    // 规则顺序跨样式表连续编号：样式表按传入顺序、规则按源顺序
-    for (rule_order, rule) in stylesheets
-        .iter()
-        .flat_map(|sheet| sheet.rules())
-        .enumerate()
-    {
+    sheet: &Stylesheet,
+    origin: Origin,
+    matched: &mut Vec<(CascadeKey, Declaration)>,
+) {
+    for (rule_order, rule) in sheet.rules().iter().enumerate() {
         // 规则内多个选择器都能命中时，取特异度最高者
         // （CSS Cascade 5：声明的特异度取其匹配选择器中的最大值）。
         let specificity = rule
@@ -222,7 +242,57 @@ pub fn cascade(
             for (declaration_order, declaration) in rule.declarations().iter().enumerate() {
                 matched.push((
                     CascadeKey {
-                        important: declaration.important,
+                        bucket: bucket_of(origin, declaration.important),
+                        inline: false,
+                        specificity,
+                        rule_order,
+                        declaration_order,
+                    },
+                    declaration.clone(),
+                ));
+            }
+        }
+    }
+}
+
+/// 对单个元素做级联，产出 computed style。
+///
+/// `ua_sheet` 是 UA origin 样式表（浏览器默认样式），参与级联但优先级
+/// 低于 author 声明（UA `!important` 最高，见 [`OriginBucket`]）。
+/// `parent` 是树序父元素的 computed style（元素没有元素祖先时为 `None`）。
+/// 各属性：级联胜者 → CSS-wide 关键字 → 继承 → initial。
+#[must_use]
+pub fn cascade(
+    document: &Document,
+    element: NodeId,
+    stylesheets: &[&Stylesheet],
+    ua_sheet: Option<&Stylesheet>,
+    parent: Option<&ComputedStyle>,
+) -> ComputedStyle {
+    let mut matched: Vec<(CascadeKey, Declaration)> = Vec::new();
+
+    if let Some(ua) = ua_sheet {
+        collect_origin_declarations(document, element, ua, Origin::Ua, &mut matched);
+    }
+    // 规则顺序跨样式表连续编号：样式表按传入顺序、规则按源顺序
+    for (rule_order, rule) in stylesheets
+        .iter()
+        .flat_map(|sheet| sheet.rules())
+        .enumerate()
+    {
+        let specificity = rule
+            .selectors()
+            .iter()
+            .filter(|parsed| {
+                match_element_selectors(std::slice::from_ref(parsed), document, element)
+            })
+            .map(|parsed| parsed.specificity)
+            .max();
+        if let Some(specificity) = specificity {
+            for (declaration_order, declaration) in rule.declarations().iter().enumerate() {
+                matched.push((
+                    CascadeKey {
+                        bucket: bucket_of(Origin::Author, declaration.important),
                         inline: false,
                         specificity,
                         rule_order,
@@ -241,7 +311,7 @@ pub fn cascade(
         {
             matched.push((
                 CascadeKey {
-                    important: declaration.important,
+                    bucket: bucket_of(Origin::Author, declaration.important),
                     inline: true,
                     specificity: 0,
                     rule_order: usize::MAX,
@@ -262,9 +332,17 @@ pub fn cascade(
 pub fn compute_document_styles(
     document: &Document,
     stylesheets: &[&Stylesheet],
+    ua_sheet: Option<&Stylesheet>,
 ) -> HashMap<NodeId, ComputedStyle> {
     let mut styles = HashMap::new();
-    walk(document, document.root(), None, stylesheets, &mut styles);
+    walk(
+        document,
+        document.root(),
+        None,
+        stylesheets,
+        ua_sheet,
+        &mut styles,
+    );
     styles
 }
 
@@ -273,12 +351,13 @@ fn walk(
     node: NodeId,
     parent: Option<&ComputedStyle>,
     stylesheets: &[&Stylesheet],
+    ua_sheet: Option<&Stylesheet>,
     out: &mut HashMap<NodeId, ComputedStyle>,
 ) {
     for child in document.children(node) {
         if matches!(document.node(child), Some(NodeKind::Element(_))) {
-            let style = cascade(document, child, stylesheets, parent);
-            walk(document, child, Some(&style), stylesheets, out);
+            let style = cascade(document, child, stylesheets, ua_sheet, parent);
+            walk(document, child, Some(&style), stylesheets, ua_sheet, out);
             out.insert(child, style);
         }
     }
@@ -616,6 +695,7 @@ fn relative_weight(parent_weight: f32, bolder: bool) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::html_ua_stylesheet;
     use crate::test_support::{build_document, find_first_by_name};
 
     fn style_of(html: &str, sheets: &[&str], name: &str) -> ComputedStyle {
@@ -623,7 +703,7 @@ mod tests {
         let parsed: Vec<Stylesheet> = sheets.iter().map(|css| Stylesheet::parse(css)).collect();
         let refs: Vec<&Stylesheet> = parsed.iter().collect();
         let element = find_first_by_name(&document, name).expect("element");
-        cascade(&document, element, &refs, None)
+        cascade(&document, element, &refs, None, None)
     }
 
     #[test]
@@ -631,7 +711,7 @@ mod tests {
         let document = build_document("<div style=\"color: red\"><p>x</p></div>");
         let refs: Vec<&Stylesheet> = vec![];
         let div = find_first_by_name(&document, "div").expect("div");
-        let div_style = cascade(&document, div, &refs, None);
+        let div_style = cascade(&document, div, &refs, None, None);
         assert_eq!(div_style.color, Rgba::opaque(255, 0, 0), "内联样式生效");
         assert_eq!(
             div_style.background_color,
@@ -640,7 +720,7 @@ mod tests {
         );
 
         let p = find_first_by_name(&document, "p").expect("p");
-        let p_style = cascade(&document, p, &refs, Some(&div_style));
+        let p_style = cascade(&document, p, &refs, None, Some(&div_style));
         assert_eq!(p_style.color, Rgba::opaque(255, 0, 0), "继承属性取父值");
         assert_eq!(p_style.background_color, Rgba::transparent());
         assert_eq!(p_style.font_size, 16.0);
@@ -717,10 +797,10 @@ mod tests {
         );
         let parsed = Stylesheet::parse("");
         let div = find_first_by_name(&document, "div").expect("div");
-        let div_style = cascade(&document, div, &[&parsed], None);
+        let div_style = cascade(&document, div, &[&parsed], None, None);
         assert_eq!(div_style.font_size, 20.0);
         let p = find_first_by_name(&document, "p").expect("p");
-        let p_style = cascade(&document, p, &[&parsed], Some(&div_style));
+        let p_style = cascade(&document, p, &[&parsed], None, Some(&div_style));
         assert_eq!(p_style.font_size, 30.0);
 
         // 继承的是计算值：孙辈再乘 em 时基于 30px
@@ -730,7 +810,7 @@ mod tests {
             attributes: Vec::new(),
         }));
         document.insert_node(span, p, None);
-        let span_style = cascade(&document, span, &[&parsed], Some(&p_style));
+        let span_style = cascade(&document, span, &[&parsed], None, Some(&p_style));
         assert_eq!(span_style.font_size, 30.0, "继承计算字号而非声明值");
     }
 
@@ -749,11 +829,13 @@ mod tests {
             find_first_by_name(&document, "div").unwrap(),
             &[&parsed],
             None,
+            None,
         );
         let p_style = cascade(
             &document,
             find_first_by_name(&document, "p").unwrap(),
             &[&parsed],
+            None,
             Some(&div_style),
         );
         assert_eq!(
@@ -771,11 +853,13 @@ mod tests {
             find_first_by_name(&document, "div").unwrap(),
             &[&parsed],
             None,
+            None,
         );
         let p_style = cascade(
             &document,
             find_first_by_name(&document, "p").unwrap(),
             &[&parsed],
+            None,
             Some(&div_style),
         );
         assert!((p_style.font_size - 100.0 / 1.2).abs() < 1e-4);
@@ -802,12 +886,14 @@ mod tests {
                 find_first_by_name(&document, "div").unwrap(),
                 &[&parsed],
                 None,
+                None,
             );
             assert_eq!(div_style.font_weight, parent_weight);
             let p_style = cascade(
                 &document,
                 find_first_by_name(&document, "p").unwrap(),
                 &[&parsed],
+                None,
                 Some(&div_style),
             );
             assert_eq!(
@@ -832,11 +918,13 @@ mod tests {
             find_first_by_name(&document, "div").unwrap(),
             &[&parsed],
             None,
+            None,
         );
         let p_style = cascade(
             &document,
             find_first_by_name(&document, "p").unwrap(),
             &[&parsed],
+            None,
             Some(&div_style),
         );
         assert_eq!(p_style.color, Rgba::opaque(255, 0, 0));
@@ -871,7 +959,7 @@ mod tests {
         let document =
             build_document("<body><div style=\"color: red\"><p><em>x</em></p></div></body>");
         let sheet = Stylesheet::parse("em { font-style: italic }");
-        let styles = compute_document_styles(&document, &[&sheet]);
+        let styles = compute_document_styles(&document, &[&sheet], None);
 
         let div = find_first_by_name(&document, "div").expect("div");
         let p = find_first_by_name(&document, "p").expect("p");
@@ -900,6 +988,7 @@ mod tests {
             find_first_by_name(&document, "p").unwrap(),
             &[&first, &second],
             None,
+            None,
         );
         assert_eq!(style.color, Rgba::opaque(0, 0, 255), "后传入的样式表胜出");
     }
@@ -916,6 +1005,7 @@ mod tests {
             find_first_by_name(&document, "p").unwrap(),
             &[&sheet],
             None,
+            None,
         );
         // :is(#a) 特异度 (1,0,0) 压过其余两条
         assert_eq!(style.color, Rgba::opaque(0, 128, 0));
@@ -926,9 +1016,105 @@ mod tests {
             find_first_by_name(&document, "p").unwrap(),
             &[&sheet],
             None,
+            None,
         );
         // :where(p.x) 特异度为 0，p (0,0,1) 按源顺序在后仍胜出
         assert_eq!(style.color, Rgba::opaque(255, 0, 0));
+    }
+
+    #[test]
+    fn ua_origin_ordering_matches_cascade_5() {
+        let ua_block = Stylesheet::parse("div { display: block }");
+        let ua_important_none = Stylesheet::parse("div { display: none !important }");
+        let div = || build_document("<div>x</div>");
+
+        // UA normal < author normal
+        let document = div();
+        let author = Stylesheet::parse("div { display: inline }");
+        let style = cascade(
+            &document,
+            find_first_by_name(&document, "div").unwrap(),
+            &[],
+            Some(&ua_block),
+            None,
+        );
+        assert_eq!(
+            style.display,
+            DisplayValue::Block,
+            "无 author 声明时 UA 生效"
+        );
+        let style = cascade(
+            &document,
+            find_first_by_name(&document, "div").unwrap(),
+            &[&author],
+            Some(&ua_block),
+            None,
+        );
+        assert_eq!(
+            style.display,
+            DisplayValue::Inline,
+            "author normal 压过 UA normal"
+        );
+
+        // author normal < author important < UA important
+        let document = div();
+        let author_normal = Stylesheet::parse("div { display: block }");
+        let style = cascade(
+            &document,
+            find_first_by_name(&document, "div").unwrap(),
+            &[&author_normal],
+            Some(&ua_important_none),
+            None,
+        );
+        assert_eq!(
+            style.display,
+            DisplayValue::None,
+            "UA !important 压过 author normal"
+        );
+
+        let document = div();
+        let author_important = Stylesheet::parse("div { display: block !important }");
+        let style = cascade(
+            &document,
+            find_first_by_name(&document, "div").unwrap(),
+            &[&author_important],
+            Some(&ua_important_none),
+            None,
+        );
+        assert_eq!(
+            style.display,
+            DisplayValue::None,
+            "UA !important 压过 author !important"
+        );
+    }
+
+    #[test]
+    fn html_ua_stylesheet_provides_rendering_defaults() {
+        let document =
+            build_document("<div><p>x</p></div><head></head><ul><li>item</li></ul><b>bold</b>");
+        let styles = compute_document_styles(&document, &[], Some(html_ua_stylesheet()));
+        let display_of = |name: &str| {
+            let node = find_first_by_name(&document, name).expect(name);
+            styles[&node].display
+        };
+        assert_eq!(display_of("div"), DisplayValue::Block);
+        assert_eq!(display_of("p"), DisplayValue::Block);
+        assert_eq!(display_of("head"), DisplayValue::None);
+        assert_eq!(display_of("li"), DisplayValue::ListItem);
+        assert_eq!(
+            display_of("b"),
+            DisplayValue::Inline,
+            "未列入 UA 表的元素保持 initial"
+        );
+
+        // author normal 声明覆盖 UA 默认 margin
+        let sheet = Stylesheet::parse("body { margin: 0 }");
+        let styles = compute_document_styles(&document, &[&sheet], Some(html_ua_stylesheet()));
+        let body = find_first_by_name(&document, "body").expect("body");
+        assert_eq!(
+            styles[&body].margin,
+            crate::Edges::splat(MarginValue::Length(0.0))
+        );
     }
 
     #[test]
@@ -983,9 +1169,9 @@ mod tests {
         );
         let parsed = Stylesheet::parse("");
         let div = find_first_by_name(&document, "div").expect("div");
-        let div_style = cascade(&document, div, &[&parsed], None);
+        let div_style = cascade(&document, div, &[&parsed], None, None);
         let p = find_first_by_name(&document, "p").expect("p");
-        let p_style = cascade(&document, p, &[&parsed], Some(&div_style));
+        let p_style = cascade(&document, p, &[&parsed], None, Some(&div_style));
         assert_eq!(div_style.line_height, LineHeightValue::Number(2.0));
         assert_eq!(
             p_style.line_height,
