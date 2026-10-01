@@ -59,6 +59,17 @@ pub struct ShapedText {
     pub height: f32,
 }
 
+/// 字体度量（CSS px；strut / 行盒计算用）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FontMetrics {
+    /// ascent：基线到行内最高点的距离（CSS px，正值）。
+    pub ascent: f32,
+    /// descent：基线到行内最低点的距离（CSS px，正值）。
+    pub descent: f32,
+    /// 该字体的默认行高（ascent + descent + leading，CSS px）。
+    pub line_height: f32,
+}
+
 /// 文本整形后端。
 ///
 /// 实现方负责把 [`TextStyle`] 映射到具体字体选择与整形引擎，
@@ -70,6 +81,13 @@ pub trait TextShaper {
     ///
     /// 字体缺失或整形失败时返回 [`TextError`]。
     fn shape(&self, text: &str, style: &TextStyle) -> Result<ShapedText, TextError>;
+
+    /// 返回字体族列表对应字体的度量。
+    ///
+    /// # Errors
+    ///
+    /// 字体族列表为空时返回 [`TextError::FontUnavailable`]。
+    fn metrics(&self, style: &TextStyle) -> Result<FontMetrics, TextError>;
 }
 
 /// 文本整形错误。
@@ -112,21 +130,16 @@ impl ParleyTextShaper {
     pub fn new() -> Self {
         Self::default()
     }
-}
 
-impl TextShaper for ParleyTextShaper {
-    fn shape(&self, text: &str, style: &TextStyle) -> Result<ShapedText, TextError> {
+    /// 按样式对文本做单行 parley 布局（不折行）。
+    fn build_layout(
+        &self,
+        text: &str,
+        style: &TextStyle,
+    ) -> Result<parley::Layout<[u8; 4]>, TextError> {
         if style.families.is_empty() {
             return Err(TextError::FontUnavailable);
         }
-        if text.is_empty() {
-            return Ok(ShapedText {
-                glyphs: Vec::new(),
-                width: 0.0,
-                height: 0.0,
-            });
-        }
-
         // CSS font-family 列表的解析（族名/引号/generic 关键字/回退顺序）
         // 交给 parley 的 FontFamily::Source
         let family_list = style.families.join(", ");
@@ -142,6 +155,21 @@ impl TextShaper for ParleyTextShaper {
         let mut layout = builder.build(text);
         // max_advance = None：单行整形，不做折行
         layout.break_all_lines(None);
+        Ok(layout)
+    }
+}
+
+impl TextShaper for ParleyTextShaper {
+    fn shape(&self, text: &str, style: &TextStyle) -> Result<ShapedText, TextError> {
+        if text.is_empty() {
+            return Ok(ShapedText {
+                glyphs: Vec::new(),
+                width: 0.0,
+                height: 0.0,
+            });
+        }
+
+        let layout = self.build_layout(text, style)?;
 
         let mut glyphs = Vec::new();
         for line in layout.lines() {
@@ -166,6 +194,19 @@ impl TextShaper for ParleyTextShaper {
             glyphs,
             width: layout.width(),
             height: layout.height(),
+        })
+    }
+
+    fn metrics(&self, style: &TextStyle) -> Result<FontMetrics, TextError> {
+        // 用不换行空格探针取度量：NBSP 在几乎所有字体中都有字形，
+        // parley 的行度量来自 run 字体的 ascent/descent/leading
+        let layout = self.build_layout("\u{00A0}", style)?;
+        let line = layout.lines().next().ok_or(TextError::FontUnavailable)?;
+        let metrics = line.metrics();
+        Ok(FontMetrics {
+            ascent: metrics.ascent,
+            descent: metrics.descent,
+            line_height: metrics.line_height,
         })
     }
 }
@@ -272,5 +313,30 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{family} should shape: {error:?}"));
             assert!(!shaped.glyphs.is_empty(), "{family} produced glyphs");
         }
+    }
+
+    #[test]
+    fn metrics_are_positive_and_scale_with_size() {
+        let shaper = shaper();
+        let small = shaper
+            .metrics(&style(&["serif"], 16.0))
+            .expect("metrics for serif");
+        assert!(small.ascent > 0.0);
+        assert!(small.descent > 0.0);
+        assert!(small.line_height >= small.ascent + small.descent);
+
+        let large = shaper
+            .metrics(&style(&["serif"], 32.0))
+            .expect("metrics at 2x size");
+        let ratio = large.ascent / small.ascent;
+        assert!((ratio - 2.0).abs() < 0.05, "ascent 应约随字号翻倍: {ratio}");
+    }
+
+    #[test]
+    fn metrics_empty_family_list_is_font_unavailable() {
+        let error = shaper()
+            .metrics(&style(&[], 16.0))
+            .expect_err("no families");
+        assert_eq!(error, TextError::FontUnavailable);
     }
 }
