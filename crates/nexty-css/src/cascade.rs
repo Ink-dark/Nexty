@@ -17,15 +17,16 @@ use nexty_dom::{Document, NodeId, NodeKind};
 use crate::parser::{Declaration, Stylesheet, parse_inline_style};
 use crate::selector::match_element_selectors;
 use crate::value::{
-    AbsoluteSize, CssWideKeyword, DeclaredValue, DisplayValue, FontFamilyValue, FontSizeValue,
-    FontStyleValue, FontWeightValue, PropertyId, PropertyValue, Rgba, TextAlignValue,
+    AbsoluteSize, BorderColorValue, BorderStyle, BorderWidthValue, CssWideKeyword, DeclaredValue,
+    DisplayValue, FontFamilyValue, FontSizeValue, FontStyleValue, FontWeightValue, LineHeightValue,
+    MarginValue, PaddingValue, PropertyId, PropertyValue, Rgba, SizeValue, TextAlignValue,
 };
 
 /// 本层 UA 的 medium 字号基准（CSS Fonts 4 §2.5：initial 值由 UA 决定，
 /// 对齐浏览器默认 16px；绝对尺寸关键字按 §2.5.1 缩放系数相对它计算）。
 pub(crate) const MEDIUM_FONT_SIZE: f32 = 16.0;
 
-/// 一个元素的 computed style（本轮最小属性集）。
+/// 一个元素的 computed style（属性集随管线逐轮扩展）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComputedStyle {
     /// `display`。
@@ -44,14 +45,57 @@ pub struct ComputedStyle {
     pub font_family: Vec<FontFamilyValue>,
     /// `text-align`。
     pub text_align: TextAlignValue,
+    /// `line-height`（数值/normal 保持原样；长度为绝对 px；
+    /// 百分比与 em 已按本元素 font-size 折算）。
+    pub line_height: LineHeightValue,
+    /// `width`（百分比由 layout 解析）。
+    pub width: SizeValue,
+    /// `height`（百分比由 layout 解析）。
+    pub height: SizeValue,
+    /// 四边 margin（百分比与 auto 由 layout 解析）。
+    pub margin: Edges<MarginValue>,
+    /// 四边 padding（百分比由 layout 解析）。
+    pub padding: Edges<PaddingValue>,
+    /// 四边 border 宽度（computed 值：style 为 none/hidden 时为 0）。
+    pub border_width: Edges<f32>,
+    /// 四边 border 样式。
+    pub border_style: Edges<BorderStyle>,
+    /// 四边 border 颜色（currentcolor 已按本元素 color 解析）。
+    pub border_color: Edges<Rgba>,
+}
+
+/// 四边值（top / right / bottom / left）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Edges<T> {
+    /// 上边。
+    pub top: T,
+    /// 右边。
+    pub right: T,
+    /// 下边。
+    pub bottom: T,
+    /// 左边。
+    pub left: T,
+}
+
+impl<T: Copy> Edges<T> {
+    /// 用同一值填充四边。
+    #[must_use]
+    pub const fn splat(value: T) -> Self {
+        Self {
+            top: value,
+            right: value,
+            bottom: value,
+            left: value,
+        }
+    }
 }
 
 impl ComputedStyle {
     /// 全部属性取 initial 值。
     ///
     /// initial 值逐条对应各属性规范；UA 相关的（`color` 的 `CanvasText`、
-    /// `font-family` 的 UA 默认、`font-size` 的 medium）取本层固定选择：
-    /// 黑色、serif、16px。
+    /// `font-family` 的 UA 默认、`font-size` 的 medium、`line-height` 的
+    /// normal）取本层固定选择：黑色、serif、16px。
     #[must_use]
     pub fn initial() -> Self {
         Self {
@@ -63,6 +107,14 @@ impl ComputedStyle {
             font_style: FontStyleValue::Normal,
             font_family: vec![FontFamilyValue::Generic("serif")],
             text_align: TextAlignValue::Start,
+            line_height: LineHeightValue::Normal,
+            width: SizeValue::Auto,
+            height: SizeValue::Auto,
+            margin: Edges::splat(MarginValue::Length(0.0)),
+            padding: Edges::splat(PaddingValue::Length(0.0)),
+            border_width: Edges::splat(0.0),
+            border_style: Edges::splat(BorderStyle::None),
+            border_color: Edges::splat(Rgba::opaque(0, 0, 0)),
         }
     }
 }
@@ -79,12 +131,17 @@ impl PropertyId {
                 | Self::FontStyle
                 | Self::FontFamily
                 | Self::TextAlign
+                | Self::LineHeight
         )
     }
 }
 
 /// 全部属性的固定枚举顺序。
-const PROPERTY_ORDER: [PropertyId; 8] = [
+///
+/// 顺序承载计算依赖：`FontSize` 先于 `LineHeight`（百分比按自身字号折算）、
+/// `Color` 先于 border 颜色（currentcolor）、border style 先于 width
+/// （none/hidden 时宽度归零）。
+const PROPERTY_ORDER: [PropertyId; 31] = [
     PropertyId::Display,
     PropertyId::Color,
     PropertyId::BackgroundColor,
@@ -93,6 +150,29 @@ const PROPERTY_ORDER: [PropertyId; 8] = [
     PropertyId::FontStyle,
     PropertyId::FontFamily,
     PropertyId::TextAlign,
+    PropertyId::LineHeight,
+    PropertyId::Width,
+    PropertyId::Height,
+    PropertyId::MarginTop,
+    PropertyId::MarginRight,
+    PropertyId::MarginBottom,
+    PropertyId::MarginLeft,
+    PropertyId::PaddingTop,
+    PropertyId::PaddingRight,
+    PropertyId::PaddingBottom,
+    PropertyId::PaddingLeft,
+    PropertyId::BorderTopStyle,
+    PropertyId::BorderRightStyle,
+    PropertyId::BorderBottomStyle,
+    PropertyId::BorderLeftStyle,
+    PropertyId::BorderTopWidth,
+    PropertyId::BorderRightWidth,
+    PropertyId::BorderBottomWidth,
+    PropertyId::BorderLeftWidth,
+    PropertyId::BorderTopColor,
+    PropertyId::BorderRightColor,
+    PropertyId::BorderBottomColor,
+    PropertyId::BorderLeftColor,
 ];
 
 /// 级联排序键（CSS Cascade 5 §6.4，仅 author origin）。
@@ -309,6 +389,83 @@ fn resolve_all(
             (PropertyId::FontFamily, Decision::Use(PropertyValue::FontFamily(value))) => {
                 style.font_family = value.clone();
             }
+            (PropertyId::LineHeight, Decision::Use(PropertyValue::LineHeight(value))) => {
+                // CSS 2.1 §10.8.1：百分比/em 的 computed 值为绝对长度
+                //（按本元素自身 font-size，已在 PROPERTY_ORDER 中先求）
+                style.line_height = match *value {
+                    LineHeightValue::Percent(fraction) => {
+                        LineHeightValue::Length(style.font_size * fraction)
+                    }
+                    LineHeightValue::Em(em) => LineHeightValue::Length(style.font_size * em),
+                    other => other,
+                };
+            }
+            (PropertyId::Width, Decision::Use(PropertyValue::Size(value))) => {
+                style.width = *value;
+            }
+            (PropertyId::Height, Decision::Use(PropertyValue::Size(value))) => {
+                style.height = *value;
+            }
+            (PropertyId::MarginTop, Decision::Use(PropertyValue::Margin(value))) => {
+                style.margin.top = *value;
+            }
+            (PropertyId::MarginRight, Decision::Use(PropertyValue::Margin(value))) => {
+                style.margin.right = *value;
+            }
+            (PropertyId::MarginBottom, Decision::Use(PropertyValue::Margin(value))) => {
+                style.margin.bottom = *value;
+            }
+            (PropertyId::MarginLeft, Decision::Use(PropertyValue::Margin(value))) => {
+                style.margin.left = *value;
+            }
+            (PropertyId::PaddingTop, Decision::Use(PropertyValue::Padding(value))) => {
+                style.padding.top = *value;
+            }
+            (PropertyId::PaddingRight, Decision::Use(PropertyValue::Padding(value))) => {
+                style.padding.right = *value;
+            }
+            (PropertyId::PaddingBottom, Decision::Use(PropertyValue::Padding(value))) => {
+                style.padding.bottom = *value;
+            }
+            (PropertyId::PaddingLeft, Decision::Use(PropertyValue::Padding(value))) => {
+                style.padding.left = *value;
+            }
+            (PropertyId::BorderTopStyle, Decision::Use(PropertyValue::BorderStyle(value))) => {
+                style.border_style.top = *value;
+            }
+            (PropertyId::BorderRightStyle, Decision::Use(PropertyValue::BorderStyle(value))) => {
+                style.border_style.right = *value;
+            }
+            (PropertyId::BorderBottomStyle, Decision::Use(PropertyValue::BorderStyle(value))) => {
+                style.border_style.bottom = *value;
+            }
+            (PropertyId::BorderLeftStyle, Decision::Use(PropertyValue::BorderStyle(value))) => {
+                style.border_style.left = *value;
+            }
+            (PropertyId::BorderTopWidth, Decision::Use(PropertyValue::BorderWidth(value))) => {
+                style.border_width.top = used_border_width(*value, style.border_style.top);
+            }
+            (PropertyId::BorderRightWidth, Decision::Use(PropertyValue::BorderWidth(value))) => {
+                style.border_width.right = used_border_width(*value, style.border_style.right);
+            }
+            (PropertyId::BorderBottomWidth, Decision::Use(PropertyValue::BorderWidth(value))) => {
+                style.border_width.bottom = used_border_width(*value, style.border_style.bottom);
+            }
+            (PropertyId::BorderLeftWidth, Decision::Use(PropertyValue::BorderWidth(value))) => {
+                style.border_width.left = used_border_width(*value, style.border_style.left);
+            }
+            (PropertyId::BorderTopColor, Decision::Use(PropertyValue::BorderColor(value))) => {
+                style.border_color.top = resolve_border_color(*value, style.color);
+            }
+            (PropertyId::BorderRightColor, Decision::Use(PropertyValue::BorderColor(value))) => {
+                style.border_color.right = resolve_border_color(*value, style.color);
+            }
+            (PropertyId::BorderBottomColor, Decision::Use(PropertyValue::BorderColor(value))) => {
+                style.border_color.bottom = resolve_border_color(*value, style.color);
+            }
+            (PropertyId::BorderLeftColor, Decision::Use(PropertyValue::BorderColor(value))) => {
+                style.border_color.left = resolve_border_color(*value, style.color);
+            }
             // 关键字与继承：按属性回退
             (property, decision @ (Decision::Parent | Decision::Initial)) => {
                 let source = match decision {
@@ -324,6 +481,47 @@ fn resolve_all(
                     PropertyId::FontStyle => style.font_style = source.font_style,
                     PropertyId::FontFamily => style.font_family = source.font_family.clone(),
                     PropertyId::TextAlign => style.text_align = source.text_align,
+                    PropertyId::LineHeight => style.line_height = source.line_height,
+                    PropertyId::Width => style.width = source.width,
+                    PropertyId::Height => style.height = source.height,
+                    PropertyId::MarginTop => style.margin.top = source.margin.top,
+                    PropertyId::MarginRight => style.margin.right = source.margin.right,
+                    PropertyId::MarginBottom => style.margin.bottom = source.margin.bottom,
+                    PropertyId::MarginLeft => style.margin.left = source.margin.left,
+                    PropertyId::PaddingTop => style.padding.top = source.padding.top,
+                    PropertyId::PaddingRight => style.padding.right = source.padding.right,
+                    PropertyId::PaddingBottom => style.padding.bottom = source.padding.bottom,
+                    PropertyId::PaddingLeft => style.padding.left = source.padding.left,
+                    PropertyId::BorderTopStyle => style.border_style.top = source.border_style.top,
+                    PropertyId::BorderRightStyle => {
+                        style.border_style.right = source.border_style.right;
+                    }
+                    PropertyId::BorderBottomStyle => {
+                        style.border_style.bottom = source.border_style.bottom;
+                    }
+                    PropertyId::BorderLeftStyle => {
+                        style.border_style.left = source.border_style.left;
+                    }
+                    PropertyId::BorderTopWidth => style.border_width.top = source.border_width.top,
+                    PropertyId::BorderRightWidth => {
+                        style.border_width.right = source.border_width.right;
+                    }
+                    PropertyId::BorderBottomWidth => {
+                        style.border_width.bottom = source.border_width.bottom;
+                    }
+                    PropertyId::BorderLeftWidth => {
+                        style.border_width.left = source.border_width.left;
+                    }
+                    PropertyId::BorderTopColor => style.border_color.top = source.border_color.top,
+                    PropertyId::BorderRightColor => {
+                        style.border_color.right = source.border_color.right;
+                    }
+                    PropertyId::BorderBottomColor => {
+                        style.border_color.bottom = source.border_color.bottom;
+                    }
+                    PropertyId::BorderLeftColor => {
+                        style.border_color.left = source.border_color.left;
+                    }
                 }
             }
             // 声明值与属性不匹配只可能来自程序错误；保持 initial 值
@@ -331,6 +529,24 @@ fn resolve_all(
         }
     }
     style
+}
+
+/// border-*-width 的 computed 值：style 为 none/hidden 时为 0
+/// （CSS 2.1 §8.5.4）。
+fn used_border_width(value: BorderWidthValue, border_style: BorderStyle) -> f32 {
+    if border_style.visible() {
+        value.px()
+    } else {
+        0.0
+    }
+}
+
+/// border-*-color 的 computed 值：currentcolor 按本元素 color 解析。
+fn resolve_border_color(value: BorderColorValue, color: Rgba) -> Rgba {
+    match value {
+        BorderColorValue::Rgba(rgba) => rgba,
+        BorderColorValue::CurrentColor => color,
+    }
 }
 
 /// `font-size` 计算值（CSS Fonts 4 §2.5：长度/百分比相对父元素计算字号）。
@@ -713,5 +929,89 @@ mod tests {
         );
         // :where(p.x) 特异度为 0，p (0,0,1) 按源顺序在后仍胜出
         assert_eq!(style.color, Rgba::opaque(255, 0, 0));
+    }
+
+    #[test]
+    fn border_width_folds_style_and_currentcolor_resolves() {
+        // style 缺省为 none → computed 宽度 0（CSS 2.1 §8.5.4）
+        let style = style_of("<p>x</p>", &["p { border: 4px }"], "p");
+        assert_eq!(style.border_width, Edges::splat(0.0));
+        assert_eq!(style.border_style, Edges::splat(BorderStyle::None));
+
+        // style 可见 → 宽度生效；currentcolor 按本元素 color 解析
+        let style = style_of(
+            "<p>x</p>",
+            &[
+                "p { border: 2px solid; color: red; border-top-color: currentcolor; border-left-color: green }",
+            ],
+            "p",
+        );
+        assert_eq!(style.border_width, Edges::splat(2.0));
+        assert_eq!(style.border_style.top, BorderStyle::Solid);
+        assert_eq!(
+            style.border_color.top,
+            Rgba::opaque(255, 0, 0),
+            "currentcolor"
+        );
+        assert_eq!(style.border_color.left, Rgba::opaque(0, 128, 0));
+        assert_eq!(
+            style.border_color.bottom,
+            Rgba::opaque(255, 0, 0),
+            "border 简写缺省 color = currentcolor"
+        );
+    }
+
+    #[test]
+    fn line_height_computes_percent_and_em_to_absolute() {
+        let style = style_of(
+            "<p>x</p>",
+            &["p { font-size: 20px; line-height: 150% }"],
+            "p",
+        );
+        assert_eq!(style.line_height, LineHeightValue::Length(30.0));
+
+        let style = style_of(
+            "<p>x</p>",
+            &["p { font-size: 20px; line-height: 1.2em }"],
+            "p",
+        );
+        assert_eq!(style.line_height, LineHeightValue::Length(24.0));
+
+        // 数值保持数值：无单位数值按数值继承
+        let document = build_document(
+            "<div style=\"font-size: 10px; line-height: 2\"><p style=\"font-size: 20px\">x</p></div>",
+        );
+        let parsed = Stylesheet::parse("");
+        let div = find_first_by_name(&document, "div").expect("div");
+        let div_style = cascade(&document, div, &[&parsed], None);
+        let p = find_first_by_name(&document, "p").expect("p");
+        let p_style = cascade(&document, p, &[&parsed], Some(&div_style));
+        assert_eq!(div_style.line_height, LineHeightValue::Number(2.0));
+        assert_eq!(
+            p_style.line_height,
+            LineHeightValue::Number(2.0),
+            "数值 line-height 以数值继承，不随父字号折算"
+        );
+    }
+
+    #[test]
+    fn box_model_properties_reach_computed_style() {
+        let style = style_of(
+            "<p style=\"margin: 10px 20%; padding: 5px; width: 300px; height: 50%\">x</p>",
+            &[],
+            "p",
+        );
+        assert_eq!(
+            style.margin,
+            Edges {
+                top: MarginValue::Length(10.0),
+                right: MarginValue::Percent(0.2),
+                bottom: MarginValue::Length(10.0),
+                left: MarginValue::Percent(0.2),
+            }
+        );
+        assert_eq!(style.padding, Edges::splat(PaddingValue::Length(5.0)));
+        assert_eq!(style.width, SizeValue::Length(300.0));
+        assert_eq!(style.height, SizeValue::Percent(0.5));
     }
 }

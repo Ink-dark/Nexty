@@ -73,6 +73,52 @@ pub enum PropertyId {
     FontFamily,
     /// `text-align`。
     TextAlign,
+    /// `line-height`。
+    LineHeight,
+    /// `width`。
+    Width,
+    /// `height`。
+    Height,
+    /// `margin-top`。
+    MarginTop,
+    /// `margin-right`。
+    MarginRight,
+    /// `margin-bottom`。
+    MarginBottom,
+    /// `margin-left`。
+    MarginLeft,
+    /// `padding-top`。
+    PaddingTop,
+    /// `padding-right`。
+    PaddingRight,
+    /// `padding-bottom`。
+    PaddingBottom,
+    /// `padding-left`。
+    PaddingLeft,
+    /// `border-top-style`。
+    BorderTopStyle,
+    /// `border-right-style`。
+    BorderRightStyle,
+    /// `border-bottom-style`。
+    BorderBottomStyle,
+    /// `border-left-style`。
+    BorderLeftStyle,
+    /// `border-top-width`。
+    BorderTopWidth,
+    /// `border-right-width`。
+    BorderRightWidth,
+    /// `border-bottom-width`。
+    BorderBottomWidth,
+    /// `border-left-width`。
+    BorderLeftWidth,
+    /// `border-top-color`。
+    BorderTopColor,
+    /// `border-right-color`。
+    BorderRightColor,
+    /// `border-bottom-color`。
+    BorderBottomColor,
+    /// `border-left-color`。
+    BorderLeftColor,
 }
 
 impl PropertyId {
@@ -88,6 +134,29 @@ impl PropertyId {
             PropertyId::FontStyle => "font-style",
             PropertyId::FontFamily => "font-family",
             PropertyId::TextAlign => "text-align",
+            PropertyId::LineHeight => "line-height",
+            PropertyId::Width => "width",
+            PropertyId::Height => "height",
+            PropertyId::MarginTop => "margin-top",
+            PropertyId::MarginRight => "margin-right",
+            PropertyId::MarginBottom => "margin-bottom",
+            PropertyId::MarginLeft => "margin-left",
+            PropertyId::PaddingTop => "padding-top",
+            PropertyId::PaddingRight => "padding-right",
+            PropertyId::PaddingBottom => "padding-bottom",
+            PropertyId::PaddingLeft => "padding-left",
+            PropertyId::BorderTopStyle => "border-top-style",
+            PropertyId::BorderRightStyle => "border-right-style",
+            PropertyId::BorderBottomStyle => "border-bottom-style",
+            PropertyId::BorderLeftStyle => "border-left-style",
+            PropertyId::BorderTopWidth => "border-top-width",
+            PropertyId::BorderRightWidth => "border-right-width",
+            PropertyId::BorderBottomWidth => "border-bottom-width",
+            PropertyId::BorderLeftWidth => "border-left-width",
+            PropertyId::BorderTopColor => "border-top-color",
+            PropertyId::BorderRightColor => "border-right-color",
+            PropertyId::BorderBottomColor => "border-bottom-color",
+            PropertyId::BorderLeftColor => "border-left-color",
         }
     }
 
@@ -95,18 +164,41 @@ impl PropertyId {
     /// （CSS Syntax：声明名匹配大小写不敏感）。
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
-        [
-            Self::Display,
-            Self::Color,
-            Self::BackgroundColor,
-            Self::FontSize,
-            Self::FontWeight,
-            Self::FontStyle,
-            Self::FontFamily,
-            Self::TextAlign,
-        ]
-        .into_iter()
-        .find(|id| id.as_str().eq_ignore_ascii_case(name))
+        const ALL: [PropertyId; 31] = [
+            PropertyId::Display,
+            PropertyId::Color,
+            PropertyId::BackgroundColor,
+            PropertyId::FontSize,
+            PropertyId::FontWeight,
+            PropertyId::FontStyle,
+            PropertyId::FontFamily,
+            PropertyId::TextAlign,
+            PropertyId::LineHeight,
+            PropertyId::Width,
+            PropertyId::Height,
+            PropertyId::MarginTop,
+            PropertyId::MarginRight,
+            PropertyId::MarginBottom,
+            PropertyId::MarginLeft,
+            PropertyId::PaddingTop,
+            PropertyId::PaddingRight,
+            PropertyId::PaddingBottom,
+            PropertyId::PaddingLeft,
+            PropertyId::BorderTopStyle,
+            PropertyId::BorderRightStyle,
+            PropertyId::BorderBottomStyle,
+            PropertyId::BorderLeftStyle,
+            PropertyId::BorderTopWidth,
+            PropertyId::BorderRightWidth,
+            PropertyId::BorderBottomWidth,
+            PropertyId::BorderLeftWidth,
+            PropertyId::BorderTopColor,
+            PropertyId::BorderRightColor,
+            PropertyId::BorderBottomColor,
+            PropertyId::BorderLeftColor,
+        ];
+        ALL.into_iter()
+            .find(|id| id.as_str().eq_ignore_ascii_case(name))
     }
 }
 
@@ -155,6 +247,20 @@ pub enum PropertyValue {
     FontWeight(FontWeightValue),
     /// `font-family` 字体族列表。
     FontFamily(Vec<FontFamilyValue>),
+    /// `line-height` 值。
+    LineHeight(LineHeightValue),
+    /// `width` / `height` 值。
+    Size(SizeValue),
+    /// margin 值（四边共用）。
+    Margin(MarginValue),
+    /// padding 值（四边共用）。
+    Padding(PaddingValue),
+    /// border-*-width 值。
+    BorderWidth(BorderWidthValue),
+    /// border-*-style 关键字。
+    BorderStyle(BorderStyle),
+    /// border-*-color 值。
+    BorderColor(BorderColorValue),
 }
 
 /// `display` 的单关键字值
@@ -324,6 +430,145 @@ pub enum FontFamilyValue {
     Family(String),
 }
 
+/// `line-height` 值
+/// （[CSS 2.1 §10.8.1](https://www.w3.org/TR/CSS21/visudet.html#line-height)）。
+///
+/// 数值保持数值（以自身数值继承，子元素按自身 font-size 求值）；
+/// 百分比与 em 在 computed 阶段按元素自身 font-size 折算（cascade 模块）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LineHeightValue {
+    /// `normal`（initial，约 1.2，具体由 UA 决定）。
+    Normal,
+    /// 无单位数值（可为 0，不可为负）。
+    Number(f32),
+    /// 绝对长度（已折算为 CSS px）。
+    Length(f32),
+    /// 相对自身 font-size 的 em。
+    Em(f32),
+    /// 百分比（以小数存储，`150%` → `1.5`；computed 阶段乘 font-size）。
+    Percent(f32),
+}
+
+/// `width` / `height` 值
+/// （[CSS 2.1 §10.2](https://www.w3.org/TR/CSS21/visudet.html#the-width-property)、
+/// [§10.5](https://www.w3.org/TR/CSS21/visudet.html#the-height-property)）。
+///
+/// 百分比由 layout 相对包含块宽度解析；负值非法（声明无效）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SizeValue {
+    /// `auto`（initial）。
+    Auto,
+    /// 绝对长度（CSS px）。
+    Length(f32),
+    /// 百分比（以小数存储）。
+    Percent(f32),
+}
+
+/// `margin-*` 值
+/// （[CSS 2.1 §8.3](https://www.w3.org/TR/CSS21/box.html#margin-properties)）。
+///
+/// 可为负；百分比由 layout 相对包含块宽度解析。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MarginValue {
+    /// 绝对长度（CSS px，可负）。
+    Length(f32),
+    /// 百分比（以小数存储）。
+    Percent(f32),
+    /// `auto`（initial；块级布局中解析为 0 或剩余空间）。
+    Auto,
+}
+
+/// `padding-*` 值
+/// （[CSS 2.1 §8.4](https://www.w3.org/TR/CSS21/box.html#padding-properties)）。
+///
+/// 不接受 auto，负值非法；百分比由 layout 相对包含块宽度解析。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PaddingValue {
+    /// 绝对长度（CSS px，非负）。
+    Length(f32),
+    /// 百分比（以小数存储）。
+    Percent(f32),
+}
+
+/// `border-*-width` 值
+/// （[CSS 2.1 §8.5.4](https://www.w3.org/TR/CSS21/box.html#border-width-properties)）。
+///
+/// 关键字在解析期折算（thin 1px / medium 3px / thick 5px，与浏览器默认一致）；
+/// computed 阶段 style 为 none/hidden 时归零（cascade 模块）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BorderWidthValue {
+    /// 绝对长度（CSS px，非负）。
+    Length(f32),
+    /// `thin`（1px）。
+    Thin,
+    /// `medium`（initial，3px）。
+    Medium,
+    /// `thick`（5px）。
+    Thick,
+}
+
+impl BorderWidthValue {
+    /// 关键字/长度 → CSS px。
+    #[must_use]
+    pub fn px(self) -> f32 {
+        match self {
+            BorderWidthValue::Length(px) => px,
+            BorderWidthValue::Thin => 1.0,
+            BorderWidthValue::Medium => 3.0,
+            BorderWidthValue::Thick => 5.0,
+        }
+    }
+}
+
+/// `border-*-style` 关键字
+/// （[CSS 2.1 §8.5.3](https://www.w3.org/TR/CSS21/box.html#border-style-properties)）。
+///
+/// 全部 10 个关键字都按规范接受；绘制端当前只区分 none/hidden 与可见边框
+/// （`solid` 语义），其余样式的绘制待 paint 层扩展。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorderStyle {
+    /// `none`（initial）。
+    None,
+    /// `hidden`。
+    Hidden,
+    /// `solid`。
+    Solid,
+    /// `dashed`。
+    Dashed,
+    /// `dotted`。
+    Dotted,
+    /// `double`。
+    Double,
+    /// `groove`。
+    Groove,
+    /// `ridge`。
+    Ridge,
+    /// `inset`。
+    Inset,
+    /// `outset`。
+    Outset,
+}
+
+impl BorderStyle {
+    /// 是否画出可见边框（none/hidden 之外）。
+    #[must_use]
+    pub fn visible(self) -> bool {
+        !matches!(self, BorderStyle::None | BorderStyle::Hidden)
+    }
+}
+
+/// `border-*-color` 值
+/// （[CSS 2.1 §8.5.2](https://www.w3.org/TR/CSS21/box.html#border-color-properties)）。
+///
+/// `currentcolor` 在 computed 阶段按本元素 `color` 解析（cascade 模块）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BorderColorValue {
+    /// 具体颜色。
+    Rgba(Rgba),
+    /// `currentcolor`。
+    CurrentColor,
+}
+
 /// 把声明值解析为 [`DeclaredValue`]：先识别 CSS-wide 关键字，再按属性语法解析。
 ///
 /// `input` 已由调用方限定在本条声明的值范围内（分号 / 块尾之前）。
@@ -351,7 +596,7 @@ pub(crate) fn parse_declared_value(
 }
 
 /// 解析 CSS-wide 关键字（ASCII case-insensitive）。
-fn parse_css_wide_keyword(input: &mut Parser<'_>) -> Result<CssWideKeyword, ()> {
+pub(crate) fn parse_css_wide_keyword(input: &mut Parser<'_>) -> Result<CssWideKeyword, ()> {
     let Token::Ident(name) = input.next().map_err(|_| ())? else {
         return Err(());
     };
@@ -379,7 +624,178 @@ fn parse_property_value(property: PropertyId, input: &mut Parser<'_>) -> Result<
         PropertyId::FontWeight => parse_font_weight(input).map(PropertyValue::FontWeight),
         PropertyId::FontFamily => parse_font_family(input).map(PropertyValue::FontFamily),
         PropertyId::BackgroundColor => parse_color(input).map(PropertyValue::Color),
+        PropertyId::LineHeight => parse_line_height(input).map(PropertyValue::LineHeight),
+        PropertyId::Width | PropertyId::Height => parse_size(input).map(PropertyValue::Size),
+        PropertyId::MarginTop
+        | PropertyId::MarginRight
+        | PropertyId::MarginBottom
+        | PropertyId::MarginLeft => parse_margin(input).map(PropertyValue::Margin),
+        PropertyId::PaddingTop
+        | PropertyId::PaddingRight
+        | PropertyId::PaddingBottom
+        | PropertyId::PaddingLeft => parse_padding(input).map(PropertyValue::Padding),
+        PropertyId::BorderTopWidth
+        | PropertyId::BorderRightWidth
+        | PropertyId::BorderBottomWidth
+        | PropertyId::BorderLeftWidth => parse_border_width(input).map(PropertyValue::BorderWidth),
+        PropertyId::BorderTopStyle
+        | PropertyId::BorderRightStyle
+        | PropertyId::BorderBottomStyle
+        | PropertyId::BorderLeftStyle => parse_border_style(input).map(PropertyValue::BorderStyle),
+        PropertyId::BorderTopColor
+        | PropertyId::BorderRightColor
+        | PropertyId::BorderBottomColor
+        | PropertyId::BorderLeftColor => parse_border_color(input).map(PropertyValue::BorderColor),
     }
+}
+
+/// `line-height`：normal | <number [0,∞]> | <length> | <percentage>
+/// （CSS 2.1 §10.8.1）。
+fn parse_line_height(input: &mut Parser<'_>) -> Result<LineHeightValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("normal") => Ok(LineHeightValue::Normal),
+        Token::Number { value, .. } => {
+            if *value >= 0.0 {
+                Ok(LineHeightValue::Number(*value))
+            } else {
+                Err(())
+            }
+        }
+        Token::Percentage { unit_value, .. } => Ok(LineHeightValue::Percent(*unit_value)),
+        Token::Dimension { value, unit, .. } => {
+            if unit.eq_ignore_ascii_case("em") {
+                Ok(LineHeightValue::Em(*value))
+            } else {
+                length_to_px(*value, unit)
+                    .map(LineHeightValue::Length)
+                    .ok_or(())
+            }
+        }
+        _ => Err(()),
+    }
+}
+
+/// `width` / `height`：<length> | <percentage> | auto，负值非法。
+fn parse_size(input: &mut Parser<'_>) -> Result<SizeValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("auto") => Ok(SizeValue::Auto),
+        Token::Number { value: 0.0, .. } => Ok(SizeValue::Length(0.0)),
+        Token::Percentage { unit_value, .. } => Ok(SizeValue::Percent(*unit_value)),
+        Token::Dimension { value, unit, .. } => {
+            if *value < 0.0 {
+                return Err(());
+            }
+            length_to_px(*value, unit).map(SizeValue::Length).ok_or(())
+        }
+        _ => Err(()),
+    }
+}
+
+/// `margin-*`：<length> | <percentage> | auto，长度可负。
+fn parse_margin(input: &mut Parser<'_>) -> Result<MarginValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("auto") => Ok(MarginValue::Auto),
+        Token::Number { value: 0.0, .. } => Ok(MarginValue::Length(0.0)),
+        Token::Percentage { unit_value, .. } => Ok(MarginValue::Percent(*unit_value)),
+        Token::Dimension { value, unit, .. } => length_to_px(*value, unit)
+            .map(MarginValue::Length)
+            .ok_or(()),
+        _ => Err(()),
+    }
+}
+
+/// `padding-*`：<length> | <percentage>，不接受 auto、负值非法。
+fn parse_padding(input: &mut Parser<'_>) -> Result<PaddingValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Number { value: 0.0, .. } => Ok(PaddingValue::Length(0.0)),
+        Token::Percentage { unit_value, .. } => Ok(PaddingValue::Percent(*unit_value)),
+        Token::Dimension { value, unit, .. } => {
+            if *value < 0.0 {
+                return Err(());
+            }
+            length_to_px(*value, unit)
+                .map(PaddingValue::Length)
+                .ok_or(())
+        }
+        _ => Err(()),
+    }
+}
+
+/// `border-*-width`：<line-width>（<length [0,∞]> | thin | medium | thick）。
+fn parse_border_width(input: &mut Parser<'_>) -> Result<BorderWidthValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("thin") => Ok(BorderWidthValue::Thin),
+        Token::Ident(name) if name.eq_ignore_ascii_case("medium") => Ok(BorderWidthValue::Medium),
+        Token::Ident(name) if name.eq_ignore_ascii_case("thick") => Ok(BorderWidthValue::Thick),
+        Token::Number { value: 0.0, .. } => Ok(BorderWidthValue::Length(0.0)),
+        Token::Dimension { value, unit, .. } => {
+            if *value < 0.0 {
+                return Err(());
+            }
+            length_to_px(*value, unit)
+                .map(BorderWidthValue::Length)
+                .ok_or(())
+        }
+        _ => Err(()),
+    }
+}
+
+/// `border-*-style`：<line-style>（10 个关键字）。
+fn parse_border_style(input: &mut Parser<'_>) -> Result<BorderStyle, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    const STYLES: [(&str, BorderStyle); 10] = [
+        ("none", BorderStyle::None),
+        ("hidden", BorderStyle::Hidden),
+        ("solid", BorderStyle::Solid),
+        ("dashed", BorderStyle::Dashed),
+        ("dotted", BorderStyle::Dotted),
+        ("double", BorderStyle::Double),
+        ("groove", BorderStyle::Groove),
+        ("ridge", BorderStyle::Ridge),
+        ("inset", BorderStyle::Inset),
+        ("outset", BorderStyle::Outset),
+    ];
+    STYLES
+        .into_iter()
+        .find(|(keyword, _)| keyword.eq_ignore_ascii_case(name))
+        .map(|(_, style)| style)
+        .ok_or(())
+}
+
+/// `border-*-color`：<color> | currentcolor。
+fn parse_border_color(input: &mut Parser<'_>) -> Result<BorderColorValue, ()> {
+    if let Ok(rgba) = input.try_parse(parse_color) {
+        return Ok(BorderColorValue::Rgba(rgba));
+    }
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("currentcolor") => {
+            Ok(BorderColorValue::CurrentColor)
+        }
+        _ => Err(()),
+    }
+}
+
+/// 以下为简写展开（parser 模块）复用的单值解析入口。
+pub(crate) fn parse_margin_value(input: &mut Parser<'_>) -> Result<MarginValue, ()> {
+    parse_margin(input)
+}
+
+pub(crate) fn parse_padding_value(input: &mut Parser<'_>) -> Result<PaddingValue, ()> {
+    parse_padding(input)
+}
+
+pub(crate) fn parse_border_width_value(input: &mut Parser<'_>) -> Result<BorderWidthValue, ()> {
+    parse_border_width(input)
+}
+
+pub(crate) fn parse_border_style_value(input: &mut Parser<'_>) -> Result<BorderStyle, ()> {
+    parse_border_style(input)
+}
+
+pub(crate) fn parse_border_color_value(input: &mut Parser<'_>) -> Result<BorderColorValue, ()> {
+    parse_border_color(input)
 }
 
 fn parse_display(input: &mut Parser<'_>) -> Result<DisplayValue, ()> {
