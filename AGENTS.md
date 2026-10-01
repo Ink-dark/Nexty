@@ -8,13 +8,9 @@ MusKitty 的**不造轮子**分支。MusKitty 从零手写浏览器核心模块�
 
 行为 ground truth 仍是 WHATWG 规范与 WPT 测试套件。Chromium 源码仅作参考。
 
-当前状态：仓库刚初始化，workspace 骨架为空（`members = []`）。分层与 crate 选型已定（见 [docs/decisions/2026-10-01-crate-selection.md](docs/decisions/2026-10-01-crate-selection.md)），骨架 crate 尚未创建。
+当前状态：8 个骨架 facade crate 已创建并在根 `Cargo.toml` 注册，外部依赖已接线，`cargo check --workspace` 零 warning；依赖门禁（`cargo deny check`）与第三方依赖清单（`cargo about`）已跑通。各层的内部实现尚未落地。分层与 crate 选型见 [docs/decisions/2026-10-01-crate-selection.md](docs/decisions/2026-10-01-crate-selection.md)。
 
 ## Build & Test Commands
-
-> 注意：当前 `members` 为空，virtual workspace 下 `cargo check/test` 会报
-> "The manifest is virtual, and the workspace has no members"。以下命令在
-> `members` 里加入第一个 crate 后才可用。
 
 workspace 根目录（`Ink-dark/Nexty`）：
 
@@ -43,12 +39,13 @@ cargo clippy --all-targets -- -D warnings
 
 ```
 Nexty/                                  # 主仓库 (Ink-dark/Nexty)，workspace 协调中心
-├── Cargo.toml                          # members = []（骨架，按下方分层逐步创建）
+├── Cargo.toml                          # workspace 成员：8 个 facade crate
 ├── AGENTS.md                           # 硬约束指南（本文件）
-├── deny.toml                           # cargo-deny 许可证白名单（待创建）
+├── deny.toml                           # cargo-deny 依赖门禁（许可证白名单 + advisory 放行清单）
+├── about.hbs                           # cargo-about 依赖清单模板
 ├── README.md                           # 项目 README
 ├── .gitignore
-├── crates/                             # workspace member：一层一个 facade crate（待创建）
+├── crates/                             # workspace member：一层一个 facade crate
 │   ├── nexty-html/                     #   html5ever 封装 → 自有 DOM 的 TreeSink
 │   ├── nexty-dom/                      #   自研 arena DOM；后续 JSRT 绑定与 JS runner 同处
 │   ├── nexty-css/                      #   cssparser + selectors 封装 + 自研 cascade
@@ -60,7 +57,7 @@ Nexty/                                  # 主仓库 (Ink-dark/Nexty)，workspace
 └── docs/
     ├── decisions/                      # 架构决策记录（ADR）：依赖选型、自研决策
     ├── plans/                          # 阶段计划文档
-    └── dependencies.html               # cargo-about 生成的第三方依赖清单（待生成）
+    └── dependencies.html               # cargo-about 生成的第三方依赖清单
 ```
 
 ## Crate 选型
@@ -93,7 +90,7 @@ Nexty/                                  # 主仓库 (Ink-dark/Nexty)，workspace
 - Rust stable，**仓库内代码严禁 unsafe**：本仓库自研代码一律不得出现 unsafe 块 / unsafe fn / unsafe impl，无例外、无 FFI 豁免。每个 crate 在 `lib.rs` 顶部用 `#![forbid(unsafe_code)]` 固化该约束。第三方 crate 内部的 unsafe 不由我们改写（`forbid` 也不作用于依赖），但选型时必须查其 unsafe 用量与边界
 - **依赖类型不得外泄**：每个 crate 的公共 API 只暴露自身抽象类型。依赖 crate（html5ever / cssparser / selectors / parley / vello_cpu / vello_hybrid / reqwest …）的类型不得出现在任何 `pub` 导出中——含 pub fn 签名、pub struct/enum 的 pub 字段、pub trait 的方法签名、`pub use` re-export。跨界传递依赖类型时，包一层自己的类型再暴露
 - **不造轮子优先**：已有成熟 crate 能覆盖的能力，直接依赖，不自己实现。参考优先级：**WHATWG 规范 > WPT 测试套件 > 成熟 crate > 自行实现**。**例外**：DOM / Cascade / 盒级布局三层已决策自研，理由与边界见选型 ADR，不得据此把自研扩大到其他层
-- **许可证政策**：白名单 MIT / Apache-2.0 / BSD / ISC / MPL-2.0 / LGPL，禁 GPL / AGPL。`cargo-deny` 做硬门禁（含传递依赖），`cargo-about` 生成的第三方依赖清单入库。引入或升级依赖前必须确认传递依赖未引入白名单外的许可证
+- **许可证政策**：白名单 MIT / Apache-2.0 / BSD / ISC / MPL-2.0 / LGPL / Zlib / CC0-1.0 / Unicode-3.0 / CDLA-Permissive-2.0，禁 GPL / AGPL。后 4 个是已选 crate 栈（wgpu / icu4x / reqwest）无法回避的宽松、非 copyleft 传递依赖，逐条理由见 `deny.toml`。`cargo-deny` 做硬门禁（含传递依赖），`cargo-about` 生成的第三方依赖清单入库。引入或升级依赖前必须确认传递依赖未引入白名单外的许可证
 - **隔离**：每层一个 facade crate，外部 crate 只允许出现在该层 crate 内；对外能力先定 trait（`NetworkFetcher` / `TextShaper` / `Rasterizer` 等），具体后端作为可替换实现
 - **渲染隔离**：渲染在独立线程执行，panic 由 `catch_unwind` 兜住并上报，不得让渲染失败拖垮主进程。因此 workspace 与各 crate 一律不得设置 `panic = "abort"`（会禁用 unwind，使兜底失效）。渲染后端对未支持特性是 panic 而非返回错误，此风险按已知限制对待
 - **JSRT 可插拔**：JS 运行时作为可插拔层，选型暂缓。DOM 与 JS runner 必须同处（可变树、可共享引用，为绑定预留），JS 运行时类型不得渗入 DOM 公共 API

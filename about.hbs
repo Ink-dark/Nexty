@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Nexty 第三方依赖清单</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 2rem auto; max-width: 60rem; line-height: 1.6; color: #222; }
+  h1 { border-bottom: 2px solid #333; padding-bottom: .3rem; }
+  h2 { margin-top: 2rem; border-bottom: 1px solid #ccc; padding-bottom: .2rem; font-size: 1.15rem; }
+  h2 code { font-size: .85rem; color: #666; font-weight: normal; }
+  ul { margin: .4rem 0 0; padding-left: 1.4rem; }
+  li { margin: .15rem 0; }
+  .ver { color: #666; font-size: .9em; }
+  pre { white-space: pre-wrap; background: #f6f6f6; padding: 1rem; font-size: .8rem; border-radius: 4px; overflow-x: auto; }
+  .note { color: #666; font-size: .9rem; }
+  table { border-collapse: collapse; width: 100%; font-size: .92rem; }
+  th, td { border: 1px solid #ddd; padding: .35rem .6rem; text-align: left; }
+  th { background: #f2f2f2; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<h1>Nexty 第三方依赖清单</h1>
+<p class="note">
+  由 <code>cargo about generate about.hbs -o docs/dependencies.html</code> 生成，请勿手工编辑。
+  引入或升级依赖后必须重新生成并提交（AGENTS.md「许可证政策」）。
+  许可证白名单由 <code>deny.toml</code> 与 <code>cargo deny check</code> 强制。
+</p>
+
+<h2>许可证概览</h2>
+<table>
+  <thead>
+    <tr><th>许可证</th><th>名称</th><th>依赖数</th></tr>
+  </thead>
+  <tbody>
+    {{#each overview}}
+    <tr>
+      <td><code>{{id}}</code></td>
+      <td>{{name}}</td>
+      <td class="num">{{count}}</td>
+    </tr>
+    {{/each}}
+  </tbody>
+</table>
+
+<h2>许可证全文</h2>
+<p class="note">
+  同一 SPDX 标识可能因各 crate 附带的许可证正文不同而分成多段列出（cargo-about 按「标识 + 正文」分组），
+  故下方出现多个同名许可证属正常现象。
+</p>
+
+{{#each licenses}}
+<section>
+  <h2 id="{{id}}-{{@index}}">{{name}} <code>{{id}}</code></h2>
+  <ul>
+    {{#each used_by}}
+    <li>
+      <strong>{{crate.name}}</strong> <span class="ver">{{crate.version}}</span>
+      {{#if crate.repository}} — <a href="{{crate.repository}}">{{crate.repository}}</a>{{/if}}
+    </li>
+    {{/each}}
+  </ul>
+  <details>
+    <summary>许可证全文</summary>
+    <pre>{{text}}</pre>
+  </details>
+</section>
+{{/each}}
+</body>
+</html>

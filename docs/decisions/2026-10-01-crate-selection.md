@@ -68,15 +68,42 @@ MusKitty 从零手写浏览器核心模块（HTML/CSS/Layout/Render/Network 全�
 
 **应对**：渲染在独立线程执行，panic 由 `catch_unwind` 兜住并上报。因此 workspace 与各 crate 不得设置 `panic = "abort"`（会禁用 unwind，使兜底失效）。该约束已写入 AGENTS.md 硬规则「渲染隔离」。
 
+### 依赖版本对齐
+
+建骨架接线依赖时发现：`vello_hybrid` 0.2.0 依赖 **wgpu 29**，而 `wgpu` 在 crates.io 上的最新版是 **30**。若 chrome 层直接取最新版，工作区会同时存在两份 wgpu，且两者类型互不兼容——`vello_hybrid` 无法接受 wgpu 30 的 `Device`/`Surface`。
+
+**约束**：`nexty-chrome` 的 `wgpu` 必须与 `vello_hybrid` 所用版本对齐（当前 29），升级 wgpu 前先确认 `vello_hybrid` 是否跟进。`deny.toml` 里 `multiple-versions = "warn"` 用于兜底发现同类问题。
+
+接线后全树共 463 个包（含 wgpu 的多后端与 reqwest 的 TLS 栈），依赖树体积的顾虑在这一步得到验证。
+
 ### 许可证政策
 
-- 白名单：MIT / Apache-2.0 / BSD / ISC / MPL-2.0 / LGPL
+- 白名单：MIT / Apache-2.0 / BSD / ISC / MPL-2.0 / LGPL / Zlib / CC0-1.0 / Unicode-3.0 / CDLA-Permissive-2.0
 - 禁止：GPL / AGPL
 - MPL-2.0 是文件级弱 copyleft，Servo 的 `cssparser` / `selectors` 与 `lightningcss` 均为该许可，不放开则 CSS 侧只能自研
 - 门禁：`cargo-deny` 扫传递依赖做 CI 硬门禁（白名单见 `deny.toml`）
 - 清单：`cargo-about` 生成 `docs/dependencies.html` 入库，引入或升级依赖后必须重新生成
 
 主要顾虑是**传递依赖可能引入不可控许可证**，故门禁必须覆盖传递依赖而非只查直接依赖。
+
+### 依赖门禁执行结果（2026-10-01）
+
+首次 `cargo deny check` 结果为 `advisories FAILED, bans ok, licenses FAILED, sources ok`，抓到两类问题，均在 `deny.toml` 内解决：
+
+**许可证缺口（4 个，全部为宽松、非 copyleft，且无法回避）**
+
+| 许可证 | 来源 crate | 传递路径 | 结论 |
+| --- | --- | --- | --- |
+| `Zlib` | foldhash、slotmap | wgpu-hal ← wgpu；slotmap 走 Linux 路径 | 加入白名单 |
+| `CC0-1.0` | hexf-parse | naga ← wgpu-core | 加入白名单 |
+| `Unicode-3.0` | litemap / tinystr / zerovec / yoke / writeable 等 | icu4x ← url→idna、parley→icu_segmenter | 加入白名单 |
+| `CDLA-Permissive-2.0` | webpki-root-certs | rustls-platform-verifier ← reqwest | 加入白名单 |
+
+这 4 个都不含 copyleft 传染性，与「禁 GPL / AGPL」的政策意图一致；且都是已定 crate 栈（wgpu / icu4x / reqwest）的必需传递依赖，替换成本等于替换核心选型，故按政策放宽处理，AGENTS.md 的白名单同步更新。
+
+**安全 advisory（1 条，非漏洞）**
+
+`ttf-parser 0.25.1` 被 RUSTSEC-2026-0192 标记为 unmaintained。路径：`winit → sctk-adwaita → ab_glyph → owned_ttf_parser → ttf-parser`，仅用于 Linux/Wayland 窗口装饰；上游标注无安全升级版本（替代品 `skrifa`，winit 尚未切换）。判定为「unmaintained 而非漏洞」，在 `deny.toml` 的 `[advisories] ignore` 内按 ID 放行并注明理由——**漏洞仍然一律阻断，只有这一类非漏洞 advisory 可被显式放行**。
 
 ### 隔离策略：facade crate + trait 抽象后端
 
@@ -97,4 +124,4 @@ MusKitty 从零手写浏览器核心模块（HTML/CSS/Layout/Render/Network 全�
 - 渲染层要额外承担两件事：一是为 `RenderContext` / `Scene` 两套同形 API 写适配层；二是维护隔离渲染线程与 `catch_unwind` 兜底。同时 workspace 与各 crate 永久不得设置 `panic = "abort"`
 - 渲染后端的上游风险最高（pre-1.0、改名进行中、6 个月 3 次破坏性变更），`nexty-paint` 的 facade 边界因此是最需要严格守住的一层
 - DOM / Cascade / Layout 三层自研意味着这三层不享受「不造轮子」红利，是主要的自研投入所在；AGENTS.md 已将其列为「不造轮子」规则的显式例外，且不得据此扩大到其他层
-- 各层 facade crate 尚未创建，workspace `members` 仍为空
+- 8 个骨架 facade crate 已创建并接线依赖，`cargo check --workspace` 零 warning；各层内部实现尚未落地

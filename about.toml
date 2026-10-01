@@ -1,0 +1,29 @@
+# cargo-about 配置。许可证白名单与 deny.toml 的 [licenses] allow 保持一致
+# （政策见 AGENTS.md「许可证政策」）。
+#
+# 用法：cargo about generate about.hbs -o docs/dependencies.html
+#
+# 注意：cargo-about 0.9.x 的配置是**扁平**的——白名单键为顶层 `accepted`
+# （不是 [licenses] allow），且该键必填；未提供时全部依赖判为不合格。
+# 这份列表需与 deny.toml 的 allow 同步维护。
+
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Zlib",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "LGPL-2.1-only",
+    "LGPL-2.1-or-later",
+    "LGPL-3.0-only",
+    "LGPL-3.0-or-later",
+]
+
+# 本仓库自身的 crate 不列入第三方依赖清单
+[private]
+ignore = true

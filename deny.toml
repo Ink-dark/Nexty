@@ -1,0 +1,61 @@
+# cargo-deny 配置。许可证白名单见 AGENTS.md「许可证政策」。
+#
+# 门禁必须覆盖传递依赖：直接依赖合规不代表传递依赖合规，这正是本仓库
+# 引入 cargo-deny 的原因（见 docs/decisions/2026-10-01-crate-selection.md）。
+
+[graph]
+# 不限定目标平台。限定会让门禁漏检非本机平台的依赖许可证。
+targets = []
+
+[advisories]
+version = 2
+# 已知漏洞一律阻断，不放行。仅放行下面这条 unmaintained（非漏洞）。
+ignore = [
+    # RUSTSEC-2026-0192: `ttf-parser` 已停止维护（unmaintained，非漏洞）。
+    # 路径：winit → sctk-adwaita → ab_glyph → owned_ttf_parser → ttf-parser，
+    # 仅在 Linux/Wayland 窗口装饰中用到；上游标注无安全升级版本
+    # （替代品 skrifa，但 winit 尚未切换），我们无法在不改 winit 的前提下移除。
+    "RUSTSEC-2026-0192",
+]
+
+[licenses]
+version = 2
+# 白名单：MIT / Apache-2.0 / BSD / ISC / MPL-2.0 / LGPL；禁 GPL / AGPL。
+# 下列 4 个许可证同为宽松、非 copyleft，且是已选 crate 栈的必需传递依赖，
+# 无法在不替换 wgpu / parley / reqwest 的前提下移除：
+#   Zlib                 —— foldhash、slotmap（wgpu 生态）
+#   CC0-1.0              —— hexf-parse（naga ← wgpu）
+#   Unicode-3.0          —— icu4x 全家（url→idna、parley→icu_segmenter）
+#   CDLA-Permissive-2.0  —— webpki-root-certs（rustls ← reqwest 根证书数据）
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Zlib",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "LGPL-2.1-only",
+    "LGPL-2.1-or-later",
+    "LGPL-3.0-only",
+    "LGPL-3.0-or-later",
+]
+confidence-threshold = 0.8
+
+[bans]
+# 同一 crate 出现多个版本时告警但不阻断。
+# 背景：vello_hybrid 依赖 wgpu 29，chrome 若直接用 wgpu 30 会出现两份 wgpu
+# 且类型互不兼容，故 chrome 的 wgpu 需对齐到 vello_hybrid 所用版本。
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# 本机通过 source replacement 走 rsproxy 镜像，锁文件中记录的仍是规范地址
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
