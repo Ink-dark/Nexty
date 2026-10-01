@@ -8,7 +8,16 @@ MusKitty 的**不造轮子**分支。MusKitty 从零手写浏览器核心模块�
 
 行为 ground truth 仍是 WHATWG 规范与 WPT 测试套件。Chromium 源码仅作参考。
 
-当前状态：8 个骨架 facade crate 已创建并在根 `Cargo.toml` 注册，外部依赖已接线，`cargo check --workspace` 零 warning；依赖门禁（`cargo deny check`）与第三方依赖清单（`cargo about`）已跑通。各层的内部实现尚未落地。分层与 crate 选型见 [docs/decisions/2026-10-01-crate-selection.md](docs/decisions/2026-10-01-crate-selection.md)。
+当前状态：8 个 facade crate 已在根 `Cargo.toml` 注册，外部依赖已接线，`cargo check --workspace` 零 warning；依赖门禁（`cargo deny check`）与第三方依赖清单（`cargo about`）已跑通。
+
+已落地两层：
+
+- `nexty-dom`（v0.1.1）——自研 arena DOM：节点数据层、树变更算法（pre-insert/insert/remove/replace/clone/normalize）与文档模式控制。
+- `nexty-html`（v0.1.1）——html5ever 的 `TreeSink` 桥接到 arena DOM，提供 `parse_document` 与 `parse_fragment`（含片段上下文命名空间）。
+
+`nexty-html` 带 WPT tree-construction 比对 harness：语料钉在 `web-platform-tests/wpt` commit `5cd8e3fa`，当前 **1854/1959 通过**。剩余 105 条已逐条入基线，分两类：**88 条语料过时**——`processing-instructions.dat` 等期望产出 PI 节点，而现行 WHATWG §13.2.5 已无处理指令词法状态（`<?…>` 在 tag open state 走 bogus comment），html5ever 的产出与规范一致；**17 条非语料问题**——11 条 html5ever 树构建未跟进规范（`in select` 模式、`<selectedcontent>` 克隆、`<template>` 的 frameset-ok/form 指针语义），6 条需 JSRT 的 scripted 用例。分词器不换：MusKitty 分词器的处理指令状态实现的是规范已删除的特性，评估与否决理由见 [docs/decisions/2026-10-01-muskitty-tokenizer-rejected.md](docs/decisions/2026-10-01-muskitty-tokenizer-rejected.md)。比对方式与基线见 `crates/nexty-html/tests/tree_construction.rs`。
+
+其余层（css / layout / text / paint / network / chrome）的内部实现尚未落地。分层与 crate 选型见 [docs/decisions/2026-10-01-crate-selection.md](docs/decisions/2026-10-01-crate-selection.md)。
 
 ## Build & Test Commands
 
