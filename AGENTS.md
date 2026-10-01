@@ -8,7 +8,7 @@ MusKitty 的**不造轮子**分支。MusKitty 从零手写浏览器核心模块�
 
 行为 ground truth 仍是 WHATWG 规范与 WPT 测试套件。Chromium 源码仅作参考。
 
-当前状态：仓库刚初始化，workspace 骨架为空（`members = []`），模块划分尚未确定。
+当前状态：仓库刚初始化，workspace 骨架为空（`members = []`）。分层与 crate 选型已定（见 [docs/decisions/2026-10-01-crate-selection.md](docs/decisions/2026-10-01-crate-selection.md)），骨架 crate 尚未创建。
 
 ## Build & Test Commands
 
@@ -23,6 +23,10 @@ cargo check --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
+
+# 依赖门禁与许可证清单（引入/升级任何依赖后必跑）
+cargo deny check                         # 白名单见根目录 deny.toml，扫传递依赖
+cargo about generate about.hbs -o docs/dependencies.html   # 重新生成第三方依赖清单
 
 # 单个 crate 目录下（例如 crates/nexty-xxx/）
 cargo check                             # 检查该 crate（必须零 warning）
@@ -39,25 +43,63 @@ cargo clippy --all-targets -- -D warnings
 
 ```
 Nexty/                                  # 主仓库 (Ink-dark/Nexty)，workspace 协调中心
-├── Cargo.toml                          # members = []（空骨架，后续按需添加）
+├── Cargo.toml                          # members = []（骨架，按下方分层逐步创建）
 ├── AGENTS.md                           # 硬约束指南（本文件）
+├── deny.toml                           # cargo-deny 许可证白名单（待创建）
 ├── README.md                           # 项目 README
 ├── .gitignore
-├── crates/                             # workspace member 目录（当前为空）
+├── crates/                             # workspace member：一层一个 facade crate（待创建）
+│   ├── nexty-html/                     #   html5ever 封装 → 自有 DOM 的 TreeSink
+│   ├── nexty-dom/                      #   自研 arena DOM；后续 JSRT 绑定与 JS runner 同处
+│   ├── nexty-css/                      #   cssparser + selectors 封装 + 自研 cascade
+│   ├── nexty-layout/                   #   自研盒级布局
+│   ├── nexty-text/                     #   parley + swash + fontique 封装
+│   ├── nexty-paint/                    #   vello_cpu + vello_hybrid 双后端封装（隔离渲染线程）
+│   ├── nexty-network/                  #   reqwest 封装（NetworkFetcher trait）
+│   └── nexty-chrome/                   #   winit 窗口 + 地址栏 + 导航
 └── docs/
     ├── decisions/                      # 架构决策记录（ADR）：依赖选型、自研决策
-    └── plans/                          # 阶段计划文档
+    ├── plans/                          # 阶段计划文档
+    └── dependencies.html               # cargo-about 生成的第三方依赖清单（待生成）
 ```
+
+## Crate 选型
+
+提问筛选结果（决策记录与逐层理由：[docs/decisions/2026-10-01-crate-selection.md](docs/decisions/2026-10-01-crate-selection.md)）。
+
+| 层 | 选型 | 许可证 | 状态 |
+| --- | --- | --- | --- |
+| HTML 解析 | `html5ever` | MIT/Apache-2.0 | 已定 |
+| DOM | 自研 arena DOM | — | 已定（与 JSRT 绑定同处） |
+| CSS 解析 / 选择器 | `cssparser` + `selectors` | MPL-2.0 | 已定 |
+| Cascade | 自研 | — | 已定 |
+| 盒级布局 | 自研 | — | 已定 |
+| 文本整形 / 字体 | `parley` + `swash` + `fontique` | Apache-2.0/MIT | 已定 |
+| 绘制 / 光栅 | `vello_cpu` + `vello_hybrid` | Apache-2.0/MIT | 已定（双后端，API 同形不同名，facade 需适配层） |
+| 窗口 / 输入 | `winit` + `wgpu` | Apache-2.0/MIT | 已定 |
+| 网络 | `reqwest` | MIT/Apache-2.0 | 已定 |
+| URL | `url` | MIT/Apache-2.0 | 候选，用到再引 |
+| bidi / 复杂脚本 | `unicode-bidi` + 按需 `icu` | MIT/Apache-2.0 | 候选，用到再引 |
+| 日志 / 错误 | `tracing` + `thiserror` | MIT/Apache-2.0 | 候选，用到再引 |
+| JS 运行时 | 可插拔 JSRT 层 | — | 暂缓选型 |
+
+外部依赖只允许出现在对应层的 facade crate 内；对外能力先定 trait（`NetworkFetcher` / `TextShaper` / `Rasterizer` 等），具体后端作为可替换实现。依赖类型一律不得进入 pub 导出（见 Hard Rules）。
+
+渲染后端两个实现是**同形不同名**的 API：`vello_cpu` 用 `RenderContext`，`vello_hybrid` 用 `Scene`（`Resources` / `Pixmap` / `GlyphRunBuilder` / `RenderSettings` 同名同形但非同一类型），facade 需要一层适配。两者对未支持特性都是 panic 而非返回错误，故渲染走隔离线程 + `catch_unwind`。
 
 ## Hard Rules
 
 ### Technical
 - Rust stable，**仓库内代码严禁 unsafe**：本仓库自研代码一律不得出现 unsafe 块 / unsafe fn / unsafe impl，无例外、无 FFI 豁免。每个 crate 在 `lib.rs` 顶部用 `#![forbid(unsafe_code)]` 固化该约束。第三方 crate 内部的 unsafe 不由我们改写（`forbid` 也不作用于依赖），但选型时必须查其 unsafe 用量与边界
-- **依赖类型不得外泄**：每个 crate 的公共 API 只暴露自身抽象类型。依赖 crate（html5ever / cssparser / taffy / …）的类型不得出现在任何 `pub` 导出中——含 pub fn 签名、pub struct/enum 的 pub 字段、pub trait 的方法签名、`pub use` re-export。跨界传递依赖类型时，包一层自己的类型再暴露
-- **不造轮子优先**：已有成熟 crate 能覆盖的能力，直接依赖，不自己实现。参考优先级：**WHATWG 规范 > WPT 测试套件 > 成熟 crate > 自行实现**
-- 引入依赖前先查：维护活跃度、许可证兼容性（Apache-2.0 / MIT）、unsafe 用量、依赖树体积、是否贴合 spec 行为
+- **依赖类型不得外泄**：每个 crate 的公共 API 只暴露自身抽象类型。依赖 crate（html5ever / cssparser / selectors / parley / vello_cpu / vello_hybrid / reqwest …）的类型不得出现在任何 `pub` 导出中——含 pub fn 签名、pub struct/enum 的 pub 字段、pub trait 的方法签名、`pub use` re-export。跨界传递依赖类型时，包一层自己的类型再暴露
+- **不造轮子优先**：已有成熟 crate 能覆盖的能力，直接依赖，不自己实现。参考优先级：**WHATWG 规范 > WPT 测试套件 > 成熟 crate > 自行实现**。**例外**：DOM / Cascade / 盒级布局三层已决策自研，理由与边界见选型 ADR，不得据此把自研扩大到其他层
+- **许可证政策**：白名单 MIT / Apache-2.0 / BSD / ISC / MPL-2.0 / LGPL，禁 GPL / AGPL。`cargo-deny` 做硬门禁（含传递依赖），`cargo-about` 生成的第三方依赖清单入库。引入或升级依赖前必须确认传递依赖未引入白名单外的许可证
+- **隔离**：每层一个 facade crate，外部 crate 只允许出现在该层 crate 内；对外能力先定 trait（`NetworkFetcher` / `TextShaper` / `Rasterizer` 等），具体后端作为可替换实现
+- **渲染隔离**：渲染在独立线程执行，panic 由 `catch_unwind` 兜住并上报，不得让渲染失败拖垮主进程。因此 workspace 与各 crate 一律不得设置 `panic = "abort"`（会禁用 unwind，使兜底失效）。渲染后端对未支持特性是 panic 而非返回错误，此风险按已知限制对待
+- **JSRT 可插拔**：JS 运行时作为可插拔层，选型暂缓。DOM 与 JS runner 必须同处（可变树、可共享引用，为绑定预留），JS 运行时类型不得渗入 DOM 公共 API
+- 引入依赖前先查：维护活跃度、许可证（见上）、unsafe 用量、依赖树体积、是否贴合 spec 行为
 - 每个新依赖在 `docs/decisions/` 记一条 ADR，写清"为什么用它、为什么不是别的、边界在哪"
-- 自研仅限两种情况：① 没有可用轮子；② 现有轮子行为不符合 spec。两者都必须在 ADR 里写明"现有 crate 为什么不够用"
+- 自研仅限三种情况：① 没有可用轮子；② 现有轮子行为不符合 spec；③ 选型 ADR 已明确决策自研（DOM / Cascade / 盒级布局）。任一情况都必须在 ADR 里写明"现有 crate 为什么不够用"与自研边界
 - 自研代码保持最小：只实现 spec 要求、轮子缺失的那部分，不顺手重写周边
 - 每个模块独立 crate，测试覆盖率 ≥ 80%
 - 公共 API 必须有 doc comment，引用规范条款
