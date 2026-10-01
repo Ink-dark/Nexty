@@ -125,3 +125,8 @@ MusKitty 从零手写浏览器核心模块（HTML/CSS/Layout/Render/Network 全�
 - 渲染后端的上游风险最高（pre-1.0、改名进行中、6 个月 3 次破坏性变更），`nexty-paint` 的 facade 边界因此是最需要严格守住的一层
 - DOM / Cascade / Layout 三层自研意味着这三层不享受「不造轮子」红利，是主要的自研投入所在；AGENTS.md 已将其列为「不造轮子」规则的显式例外，且不得据此扩大到其他层
 - 8 个骨架 facade crate 已创建并接线依赖，`cargo check --workspace` 零 warning；各层内部实现尚未落地
+## 修正记录（2026-10-01，落地 nexty-text / nexty-paint 时）
+
+- **swash 退出**：选型时假设文本整形栈为 `parley + swash + fontique`。落地时核实：parley 0.11 的整形后端是 `harfrust`（HarfBuzz 整形算法的 Rust 实现，纯 Rust、Apache-2.0），字体选择用 `fontique`，swash 不参与。`nexty-text` 只依赖 parley，swash 移出依赖树。
+- **vello_hybrid 缓接**：GPU 后端需要 wgpu device/surface，只有 chrome 层能提供。本轮 `nexty-paint` 仅落地 `vello_cpu` 后端并摘除 vello_hybrid 依赖，`Rasterizer` trait 保留为双后端接缝；接入时按上文约束对齐 wgpu 版本（当前 vello_hybrid 0.2 → wgpu 29）。
+- **nexty-text 的 `FontFamily` 处理**：CSS 字体族列表的解析（族名 / generic 关键字 / 回退顺序）直接交给 parley 的 `FontFamily::Source`，本层不重复解析。

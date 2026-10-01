@@ -10,15 +10,18 @@ MusKitty 的**不造轮子**分支。MusKitty 从零手写浏览器核心模块�
 
 当前状态：8 个 facade crate 已在根 `Cargo.toml` 注册，外部依赖已接线，`cargo check --workspace` 零 warning；依赖门禁（`cargo deny check`）与第三方依赖清单（`cargo about`）已跑通。
 
-已落地三层：
+已落地六层：
 
 - `nexty-dom`（v0.1.1）——自研 arena DOM：节点数据层、树变更算法（pre-insert/insert/remove/replace/clone/normalize）与文档模式控制。
 - `nexty-html`（v0.1.1）——html5ever 的 `TreeSink` 桥接到 arena DOM，提供 `parse_document` 与 `parse_fragment`（含片段上下文命名空间）。
 - `nexty-css`（v0.1.1）——cssparser/selectors 封装 + 自研 cascade：属性值解析（hex/rgb()/hsl()/命名色、font-size/weight、font-family）、选择器匹配（Selectors 4，`:is()`/`:where()`/`:has()`/`:nth-child(of)`，HTML 大小写规则）、样式表解析（CSS Syntax §5 错误恢复：无效选择器丢整条规则、无效声明单条恢复、未知属性与 at-rule 跳过）、cascade（importance → 内联样式 → 特异度 → 源顺序）与 computed style（继承/initial、`em`/`%`/绝对尺寸关键字表、`bolder`/`lighter` 映射表、CSS-wide 关键字）。最小属性集 8 个（display/color/background-color/font-size/font-weight/font-style/font-family/text-align）；`var()`、`@media` 求值、伪元素等见 `crates/nexty-css` 模块文档的偏差清单。
+- `nexty-network`（v0.1.1）——reqwest blocking 实现 `NetworkFetcher`：GET/HEAD、错误映射（URL 解析/协议 → `InvalidUrl`、超时 → `Timeout`、其余 → `Transport`）；回环离线测试覆盖全部错误路径。
+- `nexty-text`（v0.1.1）——parley 实现 `TextShaper`：fontique 选字（CSS 字体族列表语义 + 回退）、harfrust 整形，CSS px 单位；单行整形（white-space 折叠归 layout 层）。注意：parley 0.11 的整形后端是 harfrust 而非 ADR 所列 swash，swash 已移出依赖树。
+- `nexty-paint`（v0.1.1）——vello_cpu 实现 `Rasterizer`（指令集当前仅 FillRect，src-over + 覆盖率抗锯齿；facade 输出非预乘 RGBA8）。GPU 后端 `vello_hybrid` 依赖 wgpu surface 由 chrome 层提供后接入，`Rasterizer` trait 即双后端接缝；渲染隔离（独立线程 + `catch_unwind`）由 chrome 层持有。
 
 `nexty-html` 带 WPT tree-construction 比对 harness：语料钉在 `web-platform-tests/wpt` commit `5cd8e3fa`，当前 **1854/1959 通过**。剩余 105 条已逐条入基线，分两类：**88 条语料过时**——`processing-instructions.dat` 等期望产出 PI 节点，而现行 WHATWG §13.2.5 已无处理指令词法状态（`<?…>` 在 tag open state 走 bogus comment），html5ever 的产出与规范一致；**17 条非语料问题**——11 条 html5ever 树构建未跟进规范（`in select` 模式、`<selectedcontent>` 克隆、`<template>` 的 frameset-ok/form 指针语义），6 条需 JSRT 的 scripted 用例。分词器不换：MusKitty 分词器的处理指令状态实现的是规范已删除的特性，评估与否决理由见 [docs/decisions/2026-10-01-muskitty-tokenizer-rejected.md](docs/decisions/2026-10-01-muskitty-tokenizer-rejected.md)。比对方式与基线见 `crates/nexty-html/tests/tree_construction.rs`。
 
-其余层（layout / text / paint / network / chrome）的内部实现尚未落地。分层与 crate 选型见 [docs/decisions/2026-10-01-crate-selection.md](docs/decisions/2026-10-01-crate-selection.md)。
+其余层（layout / chrome）的内部实现尚未落地；`nexty-layout` 依赖的 text / css 层已就位。分层与 crate 选型见 [docs/decisions/2026-10-01-crate-selection.md](docs/decisions/2026-10-01-crate-selection.md)。
 
 ## Build & Test Commands
 
@@ -81,8 +84,8 @@ Nexty/                                  # 主仓库 (Ink-dark/Nexty)，workspace
 | CSS 解析 / 选择器 | `cssparser` + `selectors` | MPL-2.0 | 已定 |
 | Cascade | 自研 | — | 已定 |
 | 盒级布局 | 自研 | — | 已定 |
-| 文本整形 / 字体 | `parley` + `swash` + `fontique` | Apache-2.0/MIT | 已定 |
-| 绘制 / 光栅 | `vello_cpu` + `vello_hybrid` | Apache-2.0/MIT | 已定（双后端，API 同形不同名，facade 需适配层） |
+| 文本整形 / 字体 | `parley`（内置 fontique 选字 + harfrust 整形） | Apache-2.0/MIT | 已定（swash 自 parley 0.11 起不参与整形，已移出依赖树） |
+| 绘制 / 光栅 | `vello_cpu`（已落地）+ `vello_hybrid`（待 chrome 接入） | Apache-2.0/MIT | 已定（双后端，API 同形不同名，facade 需适配层） |
 | 窗口 / 输入 | `winit` + `wgpu` | Apache-2.0/MIT | 已定 |
 | 网络 | `reqwest` | MIT/Apache-2.0 | 已定 |
 | URL | `url` | MIT/Apache-2.0 | 候选，用到再引 |
