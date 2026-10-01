@@ -8,6 +8,5 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-fontique = "0.11.1"
+# parley 内部经 fontique 选字、harfrust 整形；swash 自 parley 0.11 起不再参与
 parley = "0.11.1"
-swash = "0.2.10"
