@@ -1,0 +1,26 @@
+# 统一换行符为 LF：仓库内与工作区一致。
+# 本机 core.autocrlf=true 会把检出文件转成 CRLF，导致提交时出现整文件 diff，
+# 这里用 eol=lf 覆盖该行为。
+* text=auto eol=lf
+
+# 二进制资源不做行尾转换与 diff 文本化
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.pdf binary
+
+# 测试期望输出比对时按文本处理
+*.html text
+*.css text
+*.js text
+*.json text
+*.toml text
+*.md text
+*.rs text
