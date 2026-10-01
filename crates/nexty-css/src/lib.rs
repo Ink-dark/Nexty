@@ -6,7 +6,23 @@
 //!
 //! 行为 ground truth：CSS Syntax、Selectors、CSS Cascade 规范。
 //!
-//! 当前为骨架：公开 API 尚未定义。cascade 行为由规范约束，需先读对应章节再动手
-//! （AGENTS.md Behavior #1）。
+//! 已落地：属性值模型与逐属性解析（`value`）、选择器解析与 arena DOM 匹配
+//! （`selector`）、样式表与声明块解析（`parser`）、自研 cascade 与 computed
+//! style（`cascade`）。
 
 #![forbid(unsafe_code)]
+
+mod cascade;
+mod parser;
+mod selector;
+#[cfg(test)]
+mod test_support;
+mod value;
+
+pub use cascade::{ComputedStyle, cascade, compute_document_styles};
+pub use parser::{Declaration, StyleRule, Stylesheet, parse_inline_style};
+pub use selector::{SelectorError, matches_selector};
+pub use value::{
+    AbsoluteSize, CssWideKeyword, DeclaredValue, DisplayValue, FontFamilyValue, FontSizeValue,
+    FontStyleValue, FontWeightValue, PropertyId, PropertyValue, Rgba, TextAlignValue,
+};
