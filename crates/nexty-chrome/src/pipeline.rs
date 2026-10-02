@@ -40,11 +40,19 @@ pub fn layout_page(page: &Page, shaper: &dyn TextShaper, viewport_width: f32) ->
     nexty_layout::layout_document(&page.document, shaper, &page.styles, viewport_width)
 }
 
-/// 把片段树转译为显示列表。
+/// 把片段树转译为显示列表，原点在视口左上角。
 #[must_use]
 pub fn build_scene(root: &Fragment) -> Scene {
+    build_scene_at(root, 0.0, 0.0)
+}
+
+/// 把片段树转译为显示列表，并整体平移到 `(origin_x, origin_y)`。
+///
+/// 用于给页面内容留出顶部 UI（如地址栏）占用的区域。
+#[must_use]
+pub fn build_scene_at(root: &Fragment, origin_x: f32, origin_y: f32) -> Scene {
     let mut scene = Scene::default();
-    emit(root, 0.0, 0.0, &mut scene);
+    emit(root, origin_x, origin_y, &mut scene);
     scene
 }
 

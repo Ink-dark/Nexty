@@ -20,7 +20,7 @@ use winit::window::{Window, WindowId};
 
 use crate::pipeline::{self, Page};
 use crate::render::RenderThread;
-use crate::ui::{AddressBar, UiEvent};
+use crate::ui::{AddressBar, BAR_HEIGHT, UiEvent};
 
 /// 应用错误。
 #[derive(Debug)]
@@ -111,6 +111,9 @@ impl BrowserApp {
 
     /// 窗口创建后的初始化：GPU、渲染线程、默认页。
     fn initialize(&mut self, window: Arc<Window>) {
+        // 窗口句柄必须先存下来：redraw / resize / 事件处理都依赖它，
+        // 缺失会让 redraw 直接 return，窗口永远停在未呈现的空白 surface。
+        self.window = Some(window.clone());
         let gpu = match Gpu::new(window.clone()) {
             Ok(gpu) => gpu,
             Err(message) => {
@@ -123,13 +126,46 @@ impl BrowserApp {
             nexty_paint::VelloCpuRasterizer::new(),
         )));
         self.fetcher = Some(Arc::new(ReqwestFetcher::new().expect("network fetcher")));
-        self.navigate("about:blank");
+        self.show_blank();
         window.request_redraw();
+    }
+
+    /// 显示空白页（`about:blank` 等内部 scheme 走这里，不经网络）。
+    fn show_blank(&mut self) {
+        self.bar.set_url("about:blank");
+        self.set_page(pipeline::load_page("", ""));
+    }
+
+    /// 把已解析页面按当前视口布局成显示列表。
+    fn set_page(&mut self, page: Page) {
+        let viewport_width = self
+            .window
+            .as_ref()
+            .map(|window| window.inner_size().width as f32)
+            .unwrap_or(800.0);
+        let root = pipeline::layout_page(&page, &self.shaper, viewport_width);
+        // 页面内容从地址栏下方开始，避免被 UI 覆盖
+        self.scene = root.map(|root| pipeline::build_scene_at(&root, 0.0, BAR_HEIGHT));
+        self.page = Some(page);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
     }
 
     /// 导航：立即更新地址栏并后台抓取。
     fn navigate(&mut self, url: &str) {
         self.bar.set_url(url.to_owned());
+
+        // 内部 scheme（about:blank 等）不由网络抓取，直接生成本地空白页。
+        // 交给 NetworkFetcher 会被协议白名单判为 InvalidUrl，白屏。
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            self.show_blank();
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+            return;
+        }
+
         let Some(fetcher) = self.fetcher.clone() else {
             return;
         };
@@ -161,22 +197,15 @@ impl BrowserApp {
     fn page_loaded(&mut self, url: String, result: Result<String, String>) {
         match result {
             Ok(html) => {
-                let page = pipeline::load_page(&html, "");
-                let viewport_width = self
-                    .window
-                    .as_ref()
-                    .map(|window| window.inner_size().width as f32)
-                    .unwrap_or(800.0);
-                let root = pipeline::layout_page(&page, &self.shaper, viewport_width);
-                self.scene = root.map(|root| pipeline::build_scene(&root));
-                self.page = Some(page);
+                self.set_page(pipeline::load_page(&html, ""));
                 self.bar.set_url(url);
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
             }
             Err(error) => {
                 eprintln!("load {url} failed: {error}");
+                // 失败也要出错误页：只打日志会让画面停在上一帧或空白，
+                // 用户看不到任何反馈。
+                let html = format!("<body><h1>加载失败</h1><p>{url}</p><p>{error}</p></body>");
+                self.set_page(pipeline::load_page(&html, ""));
             }
         }
     }
@@ -200,6 +229,20 @@ impl BrowserApp {
 
         // 页面 + 地址栏合成显示列表
         let mut scene = self.scene.clone().unwrap_or_default();
+        // 画布底色：pipeline 的画布保持透明，直接 blit 会把透明像素交给
+        // surface（alpha_mode Auto），在部分后端表现为黑屏/花屏。先铺不透明白底。
+        scene.commands.insert(
+            0,
+            nexty_paint::Command::FillRect {
+                rect: nexty_paint::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: viewport.width as f32,
+                    height: viewport.height as f32,
+                },
+                color: nexty_paint::Color::opaque(0xff, 0xff, 0xff),
+            },
+        );
         self.bar
             .draw(&self.shaper, &mut scene, viewport.width as f32);
 
