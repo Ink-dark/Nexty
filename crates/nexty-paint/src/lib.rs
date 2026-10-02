@@ -1054,4 +1054,75 @@ mod tests {
         assert_pixel_near(&pixmap, 1, 1, [0, 200, 0, 255]);
         assert_pixel_near(&pixmap, 3, 3, [0, 200, 0, 255]);
     }
+
+    /// gif / webp 是 paint 显式开启的 feature，必须与 png/jpeg 一样有解码
+    /// 测试——否则「声明支持」与「实际可用」可能脱节。
+    #[test]
+    fn decode_gif_yields_rgba() {
+        let mut buffer = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            3,
+            2,
+            image::Rgba([12, 34, 56, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut buffer),
+            image::ImageFormat::Gif,
+        )
+        .expect("encode gif");
+        let decoded = decode(&buffer).expect("decode gif");
+        assert_eq!((decoded.width, decoded.height), (3, 2));
+        assert_eq!(decoded.pixel(0, 0), Some([12, 34, 56, 255]));
+    }
+
+    #[test]
+    fn decode_webp_yields_rgba() {
+        let mut buffer = Vec::new();
+        // WebP 有损，断言尺寸与「不透明」而非精确颜色
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            4,
+            4,
+            image::Rgba([200, 100, 50, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut buffer),
+            image::ImageFormat::WebP,
+        )
+        .expect("encode webp");
+        let decoded = decode(&buffer).expect("decode webp");
+        assert_eq!((decoded.width, decoded.height), (4, 4));
+        let pixel = decoded.pixel(2, 2).expect("pixel");
+        assert_eq!(pixel[3], 255, "alpha 应不透明");
+        // 颜色在有损压缩误差范围内
+        assert!(
+            i32::from(pixel[0]).abs_diff(200) <= 12
+                && i32::from(pixel[1]).abs_diff(100) <= 12
+                && i32::from(pixel[2]).abs_diff(50) <= 12,
+            "webp 颜色应在误差内，实际 {pixel:?}"
+        );
+    }
+
+    /// 四种声明支持的格式都要能被嗅探解码——feature 与实现不得脱节。
+    #[test]
+    fn all_declared_formats_decode() {
+        let source = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([30, 60, 90, 255]),
+        ));
+        for format in [
+            image::ImageFormat::Png,
+            image::ImageFormat::Jpeg,
+            image::ImageFormat::Gif,
+            image::ImageFormat::WebP,
+        ] {
+            let mut buffer = Vec::new();
+            source
+                .write_to(&mut std::io::Cursor::new(&mut buffer), format)
+                .expect("encode");
+            let decoded =
+                decode(&buffer).unwrap_or_else(|error| panic!("{format:?} 应可解码: {error:?}"));
+            assert_eq!((decoded.width, decoded.height), (2, 2), "{format:?} 尺寸");
+        }
+    }
 }
