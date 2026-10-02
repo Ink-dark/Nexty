@@ -143,8 +143,16 @@ impl AddressBar {
         };
         let max_width = input.width - 2.0 * TEXT_PADDING;
         let mut text = self.url.clone();
+        // 每轮缩短一个字符直到放得下，用 `loop` 而非 `while let`：终止条件是
+        // 「宽度达标或文本为空」，不是「Option 为 None」。
+        #[allow(clippy::while_let_loop)]
         loop {
-            let shaped = shaper.shape(&text, &style).expect("address bar text");
+            // 整形失败（系统字体缺失等）不能 panic：draw 在主线程执行，
+            // 渲染线程的 catch_unwind 兜底覆盖不到这里。降级为不画文本，
+            // 地址栏的背景条与输入框仍正常显示。
+            let Ok(shaped) = shaper.shape(&text, &style) else {
+                break;
+            };
             if shaped.width <= max_width || text.is_empty() {
                 if !shaped.glyphs.is_empty() {
                     scene.commands.push(Command::DrawText {
@@ -266,5 +274,49 @@ mod tests {
             Some(Command::DrawText { glyphs, .. }) => assert!(!glyphs.is_empty()),
             _ => unreachable!(),
         }
+    }
+
+    /// 整形失败的 shaper：验证 draw 降级为「不画文本」而非 panic。
+    struct FailingShaper;
+
+    impl nexty_text::TextShaper for FailingShaper {
+        fn shape(
+            &self,
+            _text: &str,
+            _style: &nexty_text::TextStyle,
+        ) -> Result<nexty_text::ShapedText, nexty_text::TextError> {
+            Err(nexty_text::TextError::FontUnavailable)
+        }
+
+        fn metrics(
+            &self,
+            _style: &nexty_text::TextStyle,
+        ) -> Result<nexty_text::FontMetrics, nexty_text::TextError> {
+            Err(nexty_text::TextError::FontUnavailable)
+        }
+    }
+
+    /// draw 在主线程执行，整形失败不能 panic——须降级：地址栏背景与输入框
+    /// 照常绘制，只是不产出文本指令。
+    #[test]
+    fn draw_degrades_gracefully_when_shaping_fails() {
+        let bar = AddressBar::new("https://example.test/some/path");
+        let mut scene = Scene::default();
+        bar.draw(&FailingShaper, &mut scene, 400.0);
+
+        // 背景条与输入框仍绘制
+        let fills = scene
+            .commands
+            .iter()
+            .filter(|command| matches!(command, Command::FillRect { .. }))
+            .count();
+        assert!(fills >= 2, "背景条 + 输入框白底仍应绘制");
+        // 但没有文本指令
+        let texts = scene
+            .commands
+            .iter()
+            .filter(|command| matches!(command, Command::DrawText { .. }))
+            .count();
+        assert_eq!(texts, 0, "整形失败时不应产出文本指令");
     }
 }

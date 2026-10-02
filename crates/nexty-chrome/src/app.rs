@@ -125,6 +125,8 @@ impl BrowserApp {
         self.renderer = Some(RenderThread::spawn(Arc::new(
             nexty_paint::VelloCpuRasterizer::new(),
         )));
+        // 启动路径用 fail-fast：TLS 后端不可用时浏览器本就无法工作，
+        // 带着半初始化的状态继续跑不如立刻退出（渲染路径才需要降级）。
         self.fetcher = Some(Arc::new(ReqwestFetcher::new().expect("network fetcher")));
         self.show_blank();
         window.request_redraw();
@@ -267,7 +269,7 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
         }
         let attributes = Window::default_attributes()
             .with_title("Nexty")
-            .with_inner_size(winit::dpi::LogicalSize::new(960.0, 640.0));
+            .with_inner_size(winit::dpi::LogicalSize::new(1000.0, 640.0));
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -489,20 +491,18 @@ impl Gpu {
                 texture_clone
             }
         };
-        self.queue.write_texture(
-            texture.as_image_copy(),
-            &pixmap.data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * width),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
+        // WebGPU 要求 bytes_per_row 为 256 的倍数。Pixmap 是紧凑行优先
+        // （4 * width），宽度非 64 的倍数时（如 800 → 3200）不满足对齐，
+        // write_texture 会校验失败并 panic 主进程。故先把行尾padding 到
+        // 256 的倍数再上传。
+        let unpadded = 4 * width;
+        let padded = unpadded.div_ceil(256) * 256;
+        if padded == unpadded {
+            self.upload_aligned(&texture, &pixmap.data, unpadded, width, height);
+        } else {
+            let staging = pad_rows(&pixmap.data, width, height, padded);
+            self.upload_aligned(&texture, &staging, padded, width, height);
+        }
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = self
@@ -577,6 +577,34 @@ impl Gpu {
         frame.present();
     }
 
+    /// 按给定的行跨度把像素上传到纹理。
+    ///
+    /// `bytes_per_row` 必须是 256 的倍数（WebGPU 硬要求），调用方负责
+    /// padding。见 [`pad_rows`]。
+    fn upload_aligned(
+        &self,
+        texture: &wgpu::Texture,
+        data: &[u8],
+        bytes_per_row: u32,
+        width: u32,
+        height: u32,
+    ) {
+        self.queue.write_texture(
+            texture.as_image_copy(),
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
     /// 渲染失败时的兜底清屏。
     fn clear(&mut self, _window: &Window, color: [f64; 4]) {
         let frame = match self.surface.get_current_texture() {
@@ -616,6 +644,32 @@ impl Gpu {
         self.queue.submit([encoder.finish()]);
         frame.present();
     }
+}
+
+/// 把紧凑行优先的像素数据按行padding 到 256 字节对齐。
+///
+/// WebGPU 的 `write_texture` 要求 `bytes_per_row` 为 256 的倍数，而 Pixmap
+/// 的行跨度是 `4 * width`。本函数为每行尾部补零，使行跨度变为
+/// `padded`。padding 字节的内容无关紧要（着色器只读实际宽度内的像素），
+/// 但必须是**每行独立补齐**而非只在末尾补一次。
+fn pad_rows(data: &[u8], width: u32, height: u32, padded: u32) -> Vec<u8> {
+    let unpadded = 4 * width;
+    let mut out = Vec::with_capacity(padded as usize * height as usize);
+    for y in 0..height as usize {
+        let start = y * unpadded as usize;
+        let end = start + unpadded as usize;
+        // 数据不足时补零而非 panic：Pixmap 契约保证长度，但越界不该崩主进程
+        if start < data.len() {
+            let available = (end - start).min(data.len() - start);
+            out.extend_from_slice(&data[start..start + available]);
+            out.resize(out.len() + (unpadded as usize - available), 0);
+        } else {
+            out.resize(out.len() + unpadded as usize, 0);
+        }
+        // 行尾补到 256 对齐
+        out.resize(y * padded as usize + padded as usize, 0);
+    }
+    out
 }
 
 fn blit_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
@@ -692,7 +746,7 @@ fn fs_main_bgra(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32
 
 #[cfg(test)]
 mod tests {
-    use super::FULLSCREEN_TRIANGLE;
+    use super::{FULLSCREEN_TRIANGLE, pad_rows};
 
     /// 点是否在三角形内（叉积符号一致法）。
     fn in_triangle(points: [[f32; 2]; 3], p: [f32; 2]) -> bool {
@@ -726,5 +780,71 @@ mod tests {
                 "三角形未覆盖 {point:?}"
             );
         }
+    }
+
+    /// 每行 padding 后长度必须是 256 的倍数，且像素内容不变。
+    #[test]
+    fn pad_rows_aligns_each_row_to_256_bytes() {
+        for width in [1u32, 63, 64, 100, 200, 800, 960, 1000, 1366] {
+            let height = 3u32;
+            let unpadded = 4 * width;
+            let padded = unpadded.div_ceil(256) * 256;
+            // 关键前提：padded 必须是 256 的倍数（否则修复无意义）
+            assert_eq!(
+                padded % 256,
+                0,
+                "width={width} 的 padded 行跨度应为 256倍数"
+            );
+
+            // 构造每行首字节递增的像素，便于验证行序不错乱
+            let mut data = vec![0u8; (unpadded * height) as usize];
+            for y in 0..height as usize {
+                for x in 0..width as usize {
+                    let i = y * unpadded as usize + x * 4;
+                    data[i] = (y * 10) as u8;
+                    data[i + 1] = x as u8;
+                }
+            }
+
+            let padded_data = pad_rows(&data, width, height, padded);
+            assert_eq!(
+                padded_data.len(),
+                (padded * height) as usize,
+                "width={width} 的 padding 后总长度"
+            );
+
+            // 逐行校验：本行像素必须与原始一致，下一行起点正确
+            for y in 0..height as usize {
+                let dst = y * padded as usize;
+                for x in 0..width as usize {
+                    assert_eq!(
+                        padded_data[dst + x * 4],
+                        (y * 10) as u8,
+                        "width={width} 行{y} 列{x} 的 R通道"
+                    );
+                    assert_eq!(
+                        padded_data[dst + x * 4 + 1],
+                        x as u8,
+                        "width={width} 行{y} 列{x} 的 G 通道"
+                    );
+                }
+                // 行尾padding 应为 0
+                if padded > unpadded {
+                    assert!(
+                        padded_data[dst + unpadded as usize..dst + padded as usize]
+                            .iter()
+                            .all(|byte| *byte == 0),
+                        "width={width} 行{y} 的 padding 应为 0"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pad_rows_tolerates_short_input() {
+        // 数据长度不足：补零而非 panic
+        let padded = pad_rows(&[1, 2, 3], 800, 3, 3328);
+        assert_eq!(padded.len(), 3328 * 3);
     }
 }
