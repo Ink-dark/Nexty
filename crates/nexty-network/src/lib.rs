@@ -66,6 +66,41 @@ pub enum NetworkError {
     Timeout,
 }
 
+/// 以 `base` 为基准解析 `target`，返回绝对 URL。
+///
+/// 子资源（外链样式表、图片、表单 action…）在文档里以相对形式出现，需按
+/// 文档 URL 解析成绝对地址才能抓取。语义遵循 WHATWG URL 标准的基本 URL
+/// 解析：绝对 URL 原样返回，协议相对（`//host/x`）继承 base 的协议，
+/// `/x`、`x`、`../x`、`./x` 按路径语义解析，`?q` / `#f` 替换 base 的
+/// query / fragment。空串解析为 base 自身。
+///
+/// base 非法或解析失败 → [`NetworkError::InvalidUrl`]。**不校验协议**：
+/// `file:` 等非网络 scheme 也能解析出来，由调用方决定是否发起抓取（`fetch`
+/// 会再过一遍协议白名单）。opaque scheme（`about:` / `data:`）按 WHATWG 规范
+/// 无法作为相对解析的 base，仅空 target（返回自身）可用。
+///
+/// ```
+/// # use nexty_network::resolve;
+/// let base = "https://example.test/dir/page.html";
+/// assert_eq!(resolve(base, "/a.png").unwrap(), "https://example.test/a.png");
+/// assert_eq!(resolve(base, "../b.css").unwrap(), "https://example.test/b.css");
+/// ```
+///
+/// # Errors
+///
+/// base 无法解析，或 target 与 base 合起来仍不是合法 URL 时返回
+/// [`NetworkError::InvalidUrl`]。
+pub fn resolve(base: &str, target: &str) -> Result<String, NetworkError> {
+    let base = reqwest::Url::parse(base).map_err(|_| NetworkError::InvalidUrl)?;
+    // 空 target 解析为 base 自身。opaque scheme（about: / data:）的
+    // `join("")` 会失败（无 hierarchical path 可继承），这里显式短路。
+    if target.is_empty() {
+        return Ok(base.into());
+    }
+    let resolved = base.join(target).map_err(|_| NetworkError::InvalidUrl)?;
+    Ok(resolved.into())
+}
+
 /// [`NetworkFetcher`] 的 reqwest 实现。
 ///
 /// 重定向跟随使用 reqwest 默认策略（最多 10 次）；TLS 使用 reqwest 默认的
@@ -279,6 +314,88 @@ mod tests {
             })
             .expect_err("unsupported scheme");
         assert_eq!(error, NetworkError::InvalidUrl);
+    }
+
+    /// 相对路径按 URL 标准解析（WHATWG basic URL parsing）。
+    #[test]
+    fn resolve_handles_relative_paths() {
+        let base = "https://example.test/dir/page.html";
+        let cases = [
+            // 绝对路径从协议根开始
+            ("/a.png", "https://example.test/a.png"),
+            // 同级相对路径
+            ("b.css", "https://example.test/dir/b.css"),
+            ("./c.js", "https://example.test/dir/c.js"),
+            // 父目录上跳
+            ("../d.png", "https://example.test/d.png"),
+            ("../../e.png", "https://example.test/e.png"),
+            // 末段为目录的 base（以 / 结尾）不应吃掉最后一段
+            ("f.png", "https://example.test/dir/f.png"),
+            // query / fragment 替换
+            ("?q=1", "https://example.test/dir/page.html?q=1"),
+            ("#frag", "https://example.test/dir/page.html#frag"),
+            // 空串解析为 base 自身
+            ("", "https://example.test/dir/page.html"),
+            // 绝对 URL 原样返回
+            ("https://other.test/x.png", "https://other.test/x.png"),
+        ];
+        for (target, expected) in cases {
+            assert_eq!(
+                resolve(base, target).ok().as_deref(),
+                Some(expected),
+                "resolve({base:?}, {target:?})"
+            );
+        }
+    }
+
+    /// 协议相对 URL 继承 base 的协议。
+    #[test]
+    fn resolve_inherits_scheme_for_network_path_reference() {
+        assert_eq!(
+            resolve("https://example.test/a/b", "//cdn.test/x.png")
+                .ok()
+                .as_deref(),
+            Some("https://cdn.test/x.png")
+        );
+        // base 为 http 时同样继承 http
+        assert_eq!(
+            resolve("http://example.test/a/b", "//cdn.test/x.png")
+                .ok()
+                .as_deref(),
+            Some("http://cdn.test/x.png")
+        );
+    }
+
+    /// 非 http base 的行为：可解析的（hierarchical scheme）照常解析，
+    /// opaque scheme（`about:` / `data:` 等）按 WHATWG 规范不支持相对路径。
+    #[test]
+    fn resolve_handles_non_http_base() {
+        // file: 是 hierarchical scheme，相对路径正常解析
+        assert_eq!(
+            resolve("file:///tmp/x.html", "img/a.png").ok().as_deref(),
+            Some("file:///tmp/img/a.png")
+        );
+        // about: 无法作为 base 解析成相对地址 → InvalidUrl（规范行为）
+        assert_eq!(
+            resolve("about:blank", "a.png"),
+            Err(NetworkError::InvalidUrl)
+        );
+        // 但 about: 的子资源本就不该经网络，相对引用无意义
+        assert_eq!(
+            resolve("about:blank", "").ok().as_deref(),
+            Some("about:blank")
+        );
+    }
+
+    /// base 非法 → InvalidUrl。
+    #[test]
+    fn resolve_rejects_invalid_base() {
+        assert_eq!(resolve("not a url", "a.png"), Err(NetworkError::InvalidUrl));
+        // base 是相对 URL 时也无法作为基准
+        assert_eq!(
+            resolve("/dir/page.html", "a.png"),
+            Err(NetworkError::InvalidUrl)
+        );
     }
 
     #[test]
