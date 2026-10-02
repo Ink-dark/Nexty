@@ -44,7 +44,8 @@ jobs:
             libtss2-dev libxkbcommon-dev libwayland-dev libxcb1-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxrandr-dev libdbus-1-dev libdrm-dev libgbm-dev \
-            libegl1-mesa-dev libgles2-mesa-dev vulkan-tools libvulkan-dev
+            libegl1-mesa-dev libgles2-mesa-dev libfontconfig1-dev \
+            vulkan-tools libvulkan-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -70,7 +71,8 @@ jobs:
             libtss2-dev libxkbcommon-dev libwayland-dev libxcb1-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxrandr-dev libdbus-1-dev libdrm-dev libgbm-dev \
-            libegl1-mesa-dev libgles2-mesa-dev vulkan-tools libvulkan-dev
+            libegl1-mesa-dev libgles2-mesa-dev libfontconfig1-dev \
+            vulkan-tools libvulkan-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
@@ -106,7 +108,7 @@ jobs:
 
   # ---------- 最低支持版本校验（MSRV = workspace rust-version）----------
   msrv:
-    name: MSRV (1.89)
+    name: MSRV (1.90)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -118,7 +120,8 @@ jobs:
             libtss2-dev libxkbcommon-dev libwayland-dev libxcb1-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxrandr-dev libdbus-1-dev libdrm-dev libgbm-dev \
-            libegl1-mesa-dev libgles2-mesa-dev vulkan-tools libvulkan-dev
-      - uses: dtolnay/rust-toolchain@1.89
+            libegl1-mesa-dev libgles2-mesa-dev libfontconfig1-dev \
+            vulkan-tools libvulkan-dev
+      - uses: dtolnay/rust-toolchain@1.90
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace

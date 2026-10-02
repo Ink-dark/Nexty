@@ -57,7 +57,8 @@ jobs:
             libtss2-dev libxkbcommon-dev libwayland-dev libxcb1-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxrandr-dev libdbus-1-dev libdrm-dev libgbm-dev \
-            libegl1-mesa-dev libgles2-mesa-dev vulkan-tools libvulkan-dev
+            libegl1-mesa-dev libgles2-mesa-dev libfontconfig1-dev \
+            vulkan-tools libvulkan-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
