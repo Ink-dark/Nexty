@@ -79,6 +79,18 @@ pub enum PropertyId {
     Width,
     /// `height`。
     Height,
+    /// `min-width`。
+    MinWidth,
+    /// `max-width`。
+    MaxWidth,
+    /// `min-height`。
+    MinHeight,
+    /// `max-height`。
+    MaxHeight,
+    /// `box-sizing`。
+    BoxSizing,
+    /// `overflow`。
+    Overflow,
     /// `margin-top`。
     MarginTop,
     /// `margin-right`。
@@ -137,6 +149,12 @@ impl PropertyId {
             PropertyId::LineHeight => "line-height",
             PropertyId::Width => "width",
             PropertyId::Height => "height",
+            PropertyId::MinWidth => "min-width",
+            PropertyId::MaxWidth => "max-width",
+            PropertyId::MinHeight => "min-height",
+            PropertyId::MaxHeight => "max-height",
+            PropertyId::BoxSizing => "box-sizing",
+            PropertyId::Overflow => "overflow",
             PropertyId::MarginTop => "margin-top",
             PropertyId::MarginRight => "margin-right",
             PropertyId::MarginBottom => "margin-bottom",
@@ -164,7 +182,7 @@ impl PropertyId {
     /// （CSS Syntax：声明名匹配大小写不敏感）。
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
-        const ALL: [PropertyId; 31] = [
+        const ALL: [PropertyId; 37] = [
             PropertyId::Display,
             PropertyId::Color,
             PropertyId::BackgroundColor,
@@ -176,6 +194,12 @@ impl PropertyId {
             PropertyId::LineHeight,
             PropertyId::Width,
             PropertyId::Height,
+            PropertyId::MinWidth,
+            PropertyId::MaxWidth,
+            PropertyId::MinHeight,
+            PropertyId::MaxHeight,
+            PropertyId::BoxSizing,
+            PropertyId::Overflow,
             PropertyId::MarginTop,
             PropertyId::MarginRight,
             PropertyId::MarginBottom,
@@ -249,8 +273,13 @@ pub enum PropertyValue {
     FontFamily(Vec<FontFamilyValue>),
     /// `line-height` 值。
     LineHeight(LineHeightValue),
-    /// `width` / `height` 值。
+    /// `width` / `height` 值（min-width / max-width / min-height / max-height
+    /// 复用同一语法）。
     Size(SizeValue),
+    /// `box-sizing` 关键字。
+    BoxSizing(BoxSizingValue),
+    /// `overflow` 关键字。
+    Overflow(OverflowValue),
     /// margin 值（四边共用）。
     Margin(MarginValue),
     /// padding 值（四边共用）。
@@ -464,6 +493,29 @@ pub enum SizeValue {
     Percent(f32),
 }
 
+/// `box-sizing` 值
+/// （[CSS Sizing 4 §5.3](https://drafts.csswg.org/css-sizing-4/#box-sizing)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoxSizingValue {
+    /// `content-box`（initial）：width/height 指内容盒。
+    ContentBox,
+    /// `border-box`：width/height 指边框盒。
+    BorderBox,
+}
+
+/// `overflow` 值
+/// （[CSS Overflow 3 §3](https://drafts.csswg.org/css-overflow-3/#overflow-control)）。
+///
+/// 本层只建模 visible / hidden 的裁剪标记；`auto` / `scroll` / `clip`
+/// 暂按无效声明丢弃（回退 initial `visible`，见模块偏差）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverflowValue {
+    /// `visible`（initial）：内容溢出可见。
+    Visible,
+    /// `hidden`：内容裁剪标记（裁剪实现待 paint/layout 接入）。
+    Hidden,
+}
+
 /// `margin-*` 值
 /// （[CSS 2.1 §8.3](https://www.w3.org/TR/CSS21/box.html#margin-properties)）。
 ///
@@ -625,7 +677,14 @@ fn parse_property_value(property: PropertyId, input: &mut Parser<'_>) -> Result<
         PropertyId::FontFamily => parse_font_family(input).map(PropertyValue::FontFamily),
         PropertyId::BackgroundColor => parse_color(input).map(PropertyValue::Color),
         PropertyId::LineHeight => parse_line_height(input).map(PropertyValue::LineHeight),
-        PropertyId::Width | PropertyId::Height => parse_size(input).map(PropertyValue::Size),
+        PropertyId::Width
+        | PropertyId::Height
+        | PropertyId::MinWidth
+        | PropertyId::MaxWidth
+        | PropertyId::MinHeight
+        | PropertyId::MaxHeight => parse_size(input).map(PropertyValue::Size),
+        PropertyId::BoxSizing => parse_box_sizing(input).map(PropertyValue::BoxSizing),
+        PropertyId::Overflow => parse_overflow(input).map(PropertyValue::Overflow),
         PropertyId::MarginTop
         | PropertyId::MarginRight
         | PropertyId::MarginBottom
@@ -687,6 +746,28 @@ fn parse_size(input: &mut Parser<'_>) -> Result<SizeValue, ()> {
             }
             length_to_px(*value, unit).map(SizeValue::Length).ok_or(())
         }
+        _ => Err(()),
+    }
+}
+
+/// `box-sizing`：content-box | border-box（ASCII case-insensitive）。
+fn parse_box_sizing(input: &mut Parser<'_>) -> Result<BoxSizingValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("content-box") => {
+            Ok(BoxSizingValue::ContentBox)
+        }
+        Token::Ident(name) if name.eq_ignore_ascii_case("border-box") => {
+            Ok(BoxSizingValue::BorderBox)
+        }
+        _ => Err(()),
+    }
+}
+
+/// `overflow`：visible | hidden（偏差：auto/scroll/clip 暂按无效丢弃）。
+fn parse_overflow(input: &mut Parser<'_>) -> Result<OverflowValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("visible") => Ok(OverflowValue::Visible),
+        Token::Ident(name) if name.eq_ignore_ascii_case("hidden") => Ok(OverflowValue::Hidden),
         _ => Err(()),
     }
 }
@@ -1547,6 +1628,51 @@ mod tests {
         assert_eq!(PropertyId::from_name("color"), Some(PropertyId::Color));
         assert_eq!(PropertyId::from_name("grid-area"), None);
         assert_eq!(PropertyId::FontSize.as_str(), "font-size");
+    }
+
+    #[test]
+    fn box_sizing_overflow_and_min_max_parse() {
+        assert_eq!(
+            parse_one(PropertyId::BoxSizing, "border-box"),
+            PropertyValue::BoxSizing(BoxSizingValue::BorderBox)
+        );
+        assert_eq!(
+            parse_one(PropertyId::BoxSizing, "CONTENT-BOX"),
+            PropertyValue::BoxSizing(BoxSizingValue::ContentBox)
+        );
+        parse_err(PropertyId::BoxSizing, "padding-box");
+
+        assert_eq!(
+            parse_one(PropertyId::Overflow, "hidden"),
+            PropertyValue::Overflow(OverflowValue::Hidden)
+        );
+        assert_eq!(
+            parse_one(PropertyId::Overflow, "visible"),
+            PropertyValue::Overflow(OverflowValue::Visible)
+        );
+        // 偏差：auto/scroll/clip 暂不建模，按无效声明丢弃
+        parse_err(PropertyId::Overflow, "auto");
+        parse_err(PropertyId::Overflow, "scroll");
+        parse_err(PropertyId::Overflow, "clip");
+
+        assert_eq!(
+            parse_one(PropertyId::MinWidth, "40px"),
+            PropertyValue::Size(SizeValue::Length(40.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::MaxWidth, "50%"),
+            PropertyValue::Size(SizeValue::Percent(0.5))
+        );
+        assert_eq!(
+            parse_one(PropertyId::MinHeight, "auto"),
+            PropertyValue::Size(SizeValue::Auto)
+        );
+        assert_eq!(
+            parse_one(PropertyId::MaxHeight, "0"),
+            PropertyValue::Size(SizeValue::Length(0.0))
+        );
+        // 负尺寸非法
+        parse_err(PropertyId::MaxWidth, "-10px");
     }
 
     #[test]

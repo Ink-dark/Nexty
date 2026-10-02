@@ -25,7 +25,8 @@ pub use parser::{Declaration, StyleRule, Stylesheet, parse_inline_style};
 pub use selector::{SelectorError, matches_selector};
 pub use ua::html_ua_stylesheet;
 pub use value::{
-    AbsoluteSize, BorderColorValue, BorderStyle, BorderWidthValue, CssWideKeyword, DeclaredValue,
-    DisplayValue, FontFamilyValue, FontSizeValue, FontStyleValue, FontWeightValue, LineHeightValue,
-    MarginValue, PaddingValue, PropertyId, PropertyValue, Rgba, SizeValue, TextAlignValue,
+    AbsoluteSize, BorderColorValue, BorderStyle, BorderWidthValue, BoxSizingValue, CssWideKeyword,
+    DeclaredValue, DisplayValue, FontFamilyValue, FontSizeValue, FontStyleValue, FontWeightValue,
+    LineHeightValue, MarginValue, OverflowValue, PaddingValue, PropertyId, PropertyValue, Rgba,
+    SizeValue, TextAlignValue,
 };

@@ -17,9 +17,10 @@ use nexty_dom::{Document, NodeId, NodeKind};
 use crate::parser::{Declaration, Stylesheet, parse_inline_style};
 use crate::selector::match_element_selectors;
 use crate::value::{
-    AbsoluteSize, BorderColorValue, BorderStyle, BorderWidthValue, CssWideKeyword, DeclaredValue,
-    DisplayValue, FontFamilyValue, FontSizeValue, FontStyleValue, FontWeightValue, LineHeightValue,
-    MarginValue, PaddingValue, PropertyId, PropertyValue, Rgba, SizeValue, TextAlignValue,
+    AbsoluteSize, BorderColorValue, BorderStyle, BorderWidthValue, BoxSizingValue, CssWideKeyword,
+    DeclaredValue, DisplayValue, FontFamilyValue, FontSizeValue, FontStyleValue, FontWeightValue,
+    LineHeightValue, MarginValue, OverflowValue, PaddingValue, PropertyId, PropertyValue, Rgba,
+    SizeValue, TextAlignValue,
 };
 
 /// 本层 UA 的 medium 字号基准（CSS Fonts 4 §2.5：initial 值由 UA 决定，
@@ -52,6 +53,18 @@ pub struct ComputedStyle {
     pub width: SizeValue,
     /// `height`（百分比由 layout 解析）。
     pub height: SizeValue,
+    /// `min-width`（CSS 2.1 §10.4）。
+    pub min_width: SizeValue,
+    /// `max-width`（CSS 2.1 §10.4）。
+    pub max_width: SizeValue,
+    /// `min-height`（CSS 2.1 §10.7）。
+    pub min_height: SizeValue,
+    /// `max-height`（CSS 2.1 §10.7）。
+    pub max_height: SizeValue,
+    /// `box-sizing`（CSS Sizing 4 §5.3）。
+    pub box_sizing: BoxSizingValue,
+    /// `overflow`（CSS Overflow 3 §3；仅裁剪标记，裁剪未实现）。
+    pub overflow: OverflowValue,
     /// 四边 margin（百分比与 auto 由 layout 解析）。
     pub margin: Edges<MarginValue>,
     /// 四边 padding（百分比由 layout 解析）。
@@ -110,6 +123,12 @@ impl ComputedStyle {
             line_height: LineHeightValue::Normal,
             width: SizeValue::Auto,
             height: SizeValue::Auto,
+            min_width: SizeValue::Auto,
+            max_width: SizeValue::Auto,
+            min_height: SizeValue::Auto,
+            max_height: SizeValue::Auto,
+            box_sizing: BoxSizingValue::ContentBox,
+            overflow: OverflowValue::Visible,
             margin: Edges::splat(MarginValue::Length(0.0)),
             padding: Edges::splat(PaddingValue::Length(0.0)),
             border_width: Edges::splat(0.0),
@@ -141,7 +160,7 @@ impl PropertyId {
 /// 顺序承载计算依赖：`FontSize` 先于 `LineHeight`（百分比按自身字号折算）、
 /// `Color` 先于 border 颜色（currentcolor）、border style 先于 width
 /// （none/hidden 时宽度归零）。
-const PROPERTY_ORDER: [PropertyId; 31] = [
+const PROPERTY_ORDER: [PropertyId; 37] = [
     PropertyId::Display,
     PropertyId::Color,
     PropertyId::BackgroundColor,
@@ -153,6 +172,12 @@ const PROPERTY_ORDER: [PropertyId; 31] = [
     PropertyId::LineHeight,
     PropertyId::Width,
     PropertyId::Height,
+    PropertyId::MinWidth,
+    PropertyId::MaxWidth,
+    PropertyId::MinHeight,
+    PropertyId::MaxHeight,
+    PropertyId::BoxSizing,
+    PropertyId::Overflow,
     PropertyId::MarginTop,
     PropertyId::MarginRight,
     PropertyId::MarginBottom,
@@ -485,6 +510,24 @@ fn resolve_all(
             (PropertyId::Height, Decision::Use(PropertyValue::Size(value))) => {
                 style.height = *value;
             }
+            (PropertyId::MinWidth, Decision::Use(PropertyValue::Size(value))) => {
+                style.min_width = *value;
+            }
+            (PropertyId::MaxWidth, Decision::Use(PropertyValue::Size(value))) => {
+                style.max_width = *value;
+            }
+            (PropertyId::MinHeight, Decision::Use(PropertyValue::Size(value))) => {
+                style.min_height = *value;
+            }
+            (PropertyId::MaxHeight, Decision::Use(PropertyValue::Size(value))) => {
+                style.max_height = *value;
+            }
+            (PropertyId::BoxSizing, Decision::Use(PropertyValue::BoxSizing(value))) => {
+                style.box_sizing = *value;
+            }
+            (PropertyId::Overflow, Decision::Use(PropertyValue::Overflow(value))) => {
+                style.overflow = *value;
+            }
             (PropertyId::MarginTop, Decision::Use(PropertyValue::Margin(value))) => {
                 style.margin.top = *value;
             }
@@ -563,6 +606,12 @@ fn resolve_all(
                     PropertyId::LineHeight => style.line_height = source.line_height,
                     PropertyId::Width => style.width = source.width,
                     PropertyId::Height => style.height = source.height,
+                    PropertyId::MinWidth => style.min_width = source.min_width,
+                    PropertyId::MaxWidth => style.max_width = source.max_width,
+                    PropertyId::MinHeight => style.min_height = source.min_height,
+                    PropertyId::MaxHeight => style.max_height = source.max_height,
+                    PropertyId::BoxSizing => style.box_sizing = source.box_sizing,
+                    PropertyId::Overflow => style.overflow = source.overflow,
                     PropertyId::MarginTop => style.margin.top = source.margin.top,
                     PropertyId::MarginRight => style.margin.right = source.margin.right,
                     PropertyId::MarginBottom => style.margin.bottom = source.margin.bottom,
