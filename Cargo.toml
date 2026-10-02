@@ -21,3 +21,7 @@ license = "Apache-2.0"
 repository = "https://github.com/Ink-dark/Nexty"
 # 取依赖中最高 MSRV（vello_cpu / vello_hybrid 为 1.88）
 rust-version = "1.89"
+
+# 发布制品：剥离符号以减小体积（Release 流水线据此产出更小二进制）
+[profile.release]
+strip = true
