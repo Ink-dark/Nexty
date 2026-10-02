@@ -129,6 +129,7 @@ fn render_thread_round_trips() {
             },
             color: Color::opaque(255, 0, 0),
         }],
+        images: Vec::new(),
     };
     let pixmap = thread
         .render(
