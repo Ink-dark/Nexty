@@ -1,7 +1,7 @@
-[package]
+﻿[package]
 name = "nexty-html"
 description = "Nexty HTML 解析层：html5ever 到自有 DOM 的桥接"
-version = "0.1.2"
+version = "0.1.3"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

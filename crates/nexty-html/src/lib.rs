@@ -244,6 +244,53 @@ fn attribute_value<'a>(data: &'a ElementData, name: &str) -> Option<&'a str> {
         .map(|attr| attr.value.as_str())
 }
 
+/// 文档中收集到的一个图片资源。
+///
+/// 带元素节点 id：同一 src 可出现在多个 `<img>` 上（抓取按 src 去重，
+/// 布局与绘制按 node 归位），节点身份不可丢。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageResource {
+    /// `<img>` 元素节点。
+    pub node: NodeId,
+    /// `src` 属性原值（可能是相对 URL，由上层解析）。
+    pub src: String,
+}
+
+/// 按树序收集文档中的 `<img src=…>` 清单。
+///
+/// 只收集不抓取、不解码：URL 解析与字节获取由上层（network / chrome 层）
+/// 负责。规则：
+///
+/// - 只认 HTML 命名空间的 `img`；`src` 缺失或为空串的跳过。
+/// - `srcset` / `<picture>` / `<source>` 暂不建模，只看 `src`（偏差）。
+#[must_use]
+pub fn collect_image_resources(document: &Document) -> Vec<ImageResource> {
+    let mut resources = Vec::new();
+    collect_images_from(document, document.root(), &mut resources);
+    resources
+}
+
+/// 以先序遍历收集子树里的 `<img>`。
+fn collect_images_from(document: &Document, node: NodeId, resources: &mut Vec<ImageResource>) {
+    for child in document.children(node) {
+        let Some(NodeKind::Element(data)) = document.node(child) else {
+            continue;
+        };
+        if data.namespace == Namespace::Html && data.name == "img" {
+            if let Some(src) = attribute_value(data, "src")
+                && !src.is_empty()
+            {
+                resources.push(ImageResource {
+                    node: child,
+                    src: src.to_string(),
+                });
+            }
+        } else {
+            collect_images_from(document, child, resources);
+        }
+    }
+}
+
 /// 自有解析选项 → 上游解析选项。
 fn to_html_options(options: ParseOptions) -> html5ever::ParseOpts {
     html5ever::ParseOpts {
@@ -827,5 +874,29 @@ mod tests {
             collect_style_resources(&document),
             vec![StyleResource::Inline { css: String::new() }]
         );
+    }
+
+    #[test]
+    fn image_resources_carry_node_and_tree_order() {
+        let document = parse(
+            "<body><img src=\"a.png\"><img src=\"\" alt=\"empty skipped\">\
+             <div><img src=\"b.png\"></div></body>",
+        );
+        let resources = collect_image_resources(&document);
+        assert_eq!(resources.len(), 2);
+        assert_eq!(resources[0].src, "a.png");
+        assert_eq!(
+            element_data(&document, resources[0].node).name,
+            "img",
+            "node 指向 img 元素"
+        );
+        assert_eq!(resources[1].src, "b.png");
+        assert_ne!(resources[0].node, resources[1].node);
+    }
+
+    #[test]
+    fn image_without_src_is_skipped() {
+        let document = parse("<body><img alt=\"no src\"></body>");
+        assert!(collect_image_resources(&document).is_empty());
     }
 }
