@@ -146,6 +146,96 @@ fn block_level_image_lays_out_as_replaced_box() {
     assert!(img.lines.is_empty() && img.children.is_empty());
 }
 
+// ---- T6：box-sizing / min-max（CSS Sizing §5.3、CSS 2.1 §10.4/§10.7） ----
+
+/// box-sizing: border-box 下 width 含 padding + border（边框盒 = 指定宽）。
+#[test]
+fn border_box_width_includes_padding_and_border() {
+    let (document, root) = layout(
+        "<body><div style=\"width: 100px; padding: 10px; border: 5px solid red; height: 40px\"></div></body>",
+        "div { box-sizing: content-box }",
+        400.0,
+    );
+    // content-box：边框盒 = 100 + 2*10 + 2*5 = 130
+    let div = find(&document, &root, "div").expect("div fragment");
+    assert!(approx(div.border_box.width, 130.0));
+
+    let (document, root) = layout(
+        "<body><div style=\"width: 100px; padding: 10px; border: 5px solid red; height: 40px\"></div></body>",
+        "div { box-sizing: border-box }",
+        400.0,
+    );
+    // border-box：边框盒 = 100，内容盒 = 100 - 20 - 10 = 70
+    let div = find(&document, &root, "div").expect("div fragment");
+    assert!(approx(div.border_box.width, 100.0));
+    assert!(approx(
+        div.border_box.width - div.border.left - div.padding.left - div.border.right - div.padding.right,
+        70.0
+    ));
+    // height 同理：边框盒 = 40，内容高 = 40 - 10 = 30
+    assert!(approx(div.border_box.height, 40.0));
+}
+
+/// max-width 收窄盒宽；min-width 抬宽；min 优先于 max。
+#[test]
+fn min_max_width_clamp_used_width() {
+    // 指定宽 300 → max-width 100 收窄
+    let (document, root) = layout(
+        "<body><div style=\"width: 300px; max-width: 100px\"></div></body>",
+        "",
+        400.0,
+    );
+    let div = find(&document, &root, "div").expect("div fragment");
+    assert!(approx(div.border_box.width, 100.0));
+
+    // auto 宽度同样受 max 约束
+    let (document, root) = layout(
+        "<body><div style=\"max-width: 120px\"></div></body>",
+        "",
+        400.0,
+    );
+    let div = find(&document, &root, "div").expect("div fragment");
+    assert!(approx(div.border_box.width, 120.0));
+
+    // 指定宽 50 → min-width 150 抬宽
+    let (document, root) = layout(
+        "<body><div style=\"width: 50px; min-width: 150px\"></div></body>",
+        "",
+        400.0,
+    );
+    let div = find(&document, &root, "div").expect("div fragment");
+    assert!(approx(div.border_box.width, 150.0));
+
+    // min > max：min 优先
+    let (document, root) = layout(
+        "<body><div style=\"width: 80px; min-width: 160px; max-width: 100px\"></div></body>",
+        "",
+        400.0,
+    );
+    let div = find(&document, &root, "div").expect("div fragment");
+    assert!(approx(div.border_box.width, 160.0));
+}
+
+/// max-height 收窄、min-height 抬高内容高。
+#[test]
+fn min_max_height_clamp_used_height() {
+    let (document, root) = layout(
+        "<body><div style=\"height: 200px; max-height: 80px\"></div></body>",
+        "",
+        400.0,
+    );
+    let div = find(&document, &root, "div").expect("div fragment");
+    assert!(approx(div.border_box.height, 80.0));
+
+    let (document, root) = layout(
+        "<body><div style=\"height: 10px; min-height: 60px\"></div></body>",
+        "",
+        400.0,
+    );
+    let div = find(&document, &root, "div").expect("div fragment");
+    assert!(approx(div.border_box.height, 60.0));
+}
+
 #[test]
 fn blocks_stack_and_fill_containing_width() {
     let (document, root) = layout(

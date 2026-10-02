@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use nexty_css::{ComputedStyle, DisplayValue, MarginValue, PaddingValue, SizeValue};
+use nexty_css::{BoxSizingValue, ComputedStyle, DisplayValue, MarginValue, PaddingValue, SizeValue};
 use nexty_dom::{Document, Namespace, NodeId, NodeKind};
 use nexty_text::TextShaper;
 
@@ -265,13 +265,28 @@ pub(crate) fn layout_block_box(
     let border = to_layout_edges(style.border_width);
     let padding = resolve_padding(style.padding, containing_width);
     let horizontal_fixed = border.left + padding.left + border.right + padding.right;
+    let vertical_fixed = border.top + padding.top + border.bottom + padding.bottom;
+    // CSS Sizing §5.3：border-box 把 width/height/min/max 的参照盒从内容盒
+    // 换成边框盒——统一折算到内容盒空间后再走既有解析
+    let border_box_sizing = style.box_sizing == BoxSizingValue::BorderBox;
 
-    // ---- 宽度解析（§10.3.3，ltr） ----
-    let (margin_left, _margin_right, content_width) = resolve_width(
+    // ---- 宽度解析（§10.3.3，ltr）+ min/max 收束（§10.4） ----
+    let width = content_space_size(
         style.width,
+        border_box_sizing,
+        horizontal_fixed,
+        containing_width,
+    );
+    let (margin_left, _margin_right, content_width) = resolve_width(
+        width,
         containing_width,
         &style.margin,
         horizontal_fixed,
+    );
+    let content_width = clamp_to_min_max(
+        content_width,
+        used_size(style.min_width, border_box_sizing, horizontal_fixed, containing_width),
+        used_max(style.max_width, border_box_sizing, horizontal_fixed, containing_width),
     );
 
     // ---- 子内容分组（§9.2.1.1） ----
@@ -281,7 +296,13 @@ pub(crate) fn layout_block_box(
         .any(|group| matches!(group, ChildGroup::Block(..)));
 
     // ---- 高度（§10.5） ----
-    let specified_height = resolve_height(style.height, containing_height);
+    let height = content_space_size(
+        style.height,
+        border_box_sizing,
+        vertical_fixed,
+        containing_height.unwrap_or(0.0),
+    );
+    let specified_height = resolve_height(height, containing_height);
 
     // ---- margin 折叠前提 ----
     let top_separated = border.top > 0.0 || padding.top > 0.0;
@@ -416,7 +437,7 @@ pub(crate) fn layout_block_box(
         && !has_line_boxes
         && (!has_block_children || all_children_self_collapsing);
 
-    // ---- 内容高度（§10.6.3） ----
+    // ---- 内容高度（§10.6.3）+ min/max-height 收束（§10.7） ----
     let content_height = match specified_height {
         Some(height) => height,
         None => {
@@ -433,6 +454,21 @@ pub(crate) fn layout_block_box(
             }
         }
     };
+    let content_height = clamp_to_min_max(
+        content_height,
+        used_size(
+            style.min_height,
+            border_box_sizing,
+            vertical_fixed,
+            containing_height.unwrap_or(0.0),
+        ),
+        used_max(
+            style.max_height,
+            border_box_sizing,
+            vertical_fixed,
+            containing_height.unwrap_or(0.0),
+        ),
+    );
 
     let fragment = Fragment {
         node,
@@ -527,5 +563,49 @@ fn resolve_height(height: SizeValue, containing_height: Option<f32>) -> Option<f
         SizeValue::Auto => None,
         SizeValue::Length(px) => Some(px),
         SizeValue::Percent(fraction) => containing_height.map(|containing| fraction * containing),
+    }
+}
+
+/// box-sizing 折算：border-box 把边框盒空间的尺寸换算到内容盒空间
+/// （减去 border+padding，下限 0）；content-box 原样返回。
+fn content_space_size(
+    value: SizeValue,
+    border_box: bool,
+    fixed: f32,
+    containing: f32,
+) -> SizeValue {
+    match (border_box, value) {
+        (true, SizeValue::Length(px)) => SizeValue::Length((px - fixed).max(0.0)),
+        (true, SizeValue::Percent(fraction)) => {
+            SizeValue::Length((fraction * containing - fixed).max(0.0))
+        }
+        _ => value,
+    }
+}
+
+/// min-* 的 used value（border-box 空间折算到内容盒；auto 视作 0）。
+fn used_size(value: SizeValue, border_box: bool, fixed: f32, containing: f32) -> f32 {
+    match content_space_size(value, border_box, fixed, containing) {
+        SizeValue::Auto => 0.0,
+        SizeValue::Length(px) => px,
+        SizeValue::Percent(fraction) => fraction * containing,
+    }
+}
+
+/// max-* 的 used value（border-box 空间折算；auto 表示无上限）。
+fn used_max(value: SizeValue, border_box: bool, fixed: f32, containing: f32) -> Option<f32> {
+    match content_space_size(value, border_box, fixed, containing) {
+        SizeValue::Auto => None,
+        SizeValue::Length(px) => Some(px),
+        SizeValue::Percent(fraction) => Some(fraction * containing),
+    }
+}
+
+/// §10.4 / §10.7：先抬到 min，再压到 max；min 优先（min > max 时取 min）。
+fn clamp_to_min_max(value: f32, lower: f32, upper: Option<f32>) -> f32 {
+    let value = value.max(lower);
+    match upper {
+        Some(upper) => value.min(upper.max(lower)),
+        None => value,
     }
 }
