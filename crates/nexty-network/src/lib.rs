@@ -46,7 +46,10 @@ pub struct Response {
 /// 抓取后端。
 ///
 /// 实现方负责 TLS、重定向与连接池等细节，只对外暴露本 crate 的类型。
-pub trait NetworkFetcher {
+///
+/// `Send + Sync`：子资源抓取在 chrome 层并发执行（每资源一线程），
+/// fetcher 会被多线程共享引用，故把线程安全定为 trait 的组成要求。
+pub trait NetworkFetcher: Send + Sync {
     /// 执行一次请求。
     ///
     /// # Errors
