@@ -9,3 +9,8 @@ crates/*/target
 # --- AI 编码代理的本机会话设置（含本机路径，不入库）---
 .zcode/
 .claude/settings.local.json
+
+# --- Windows 保留设备名 ---
+# 在 Git Bash 里用 `2>NUL` 重定向会创建一个名为 NUL 的真实文件（Windows API
+# 无法删除它，回收站也不接受）。该文件是命令输出的意外产物，不入库。
+/NUL

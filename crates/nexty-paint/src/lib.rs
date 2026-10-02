@@ -5,8 +5,13 @@
 //! [`Rasterizer`] trait 即双后端接缝。决策与调研见
 //! `docs/decisions/2026-10-01-crate-selection.md`。
 //!
-//! 指令集保持最小（当前仅 [`Command::FillRect`]），后续消费方（layout）需要
-//! 什么指令再扩展什么。
+//! 指令集：`FillRect` / `StrokeRect` / `DrawText` / `DrawImage`，
+//! 后续消费方（layout）需要什么指令再扩展什么。
+//!
+//! 上游：`vello_cpu`（CPU 光栅，sparse strips）+ `image`（图片解码）。
+//! **解码归属**：解码器只在 [`decode`] 内出现，产出自有类型 [`Image`]，
+//! 上游类型不外泄（AGENTS.md 硬规则）。只解码不做编码与图像处理——
+//! 裁剪缩放由 layout 算矩形、paint 按矩形采样表达。
 //!
 //! 上游类型一律不得出现在本 crate 的 pub 导出中（AGENTS.md 硬规则）。
 //!
@@ -18,6 +23,49 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// 图片解码错误。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodeError {
+    /// 字节不是受支持的图片格式，或格式数据损坏。
+    ///
+    /// 上游解码器的错误类型不得外泄，故折叠为单一变体：调用方（chrome 层）
+    /// 对解码失败的处理是「跳过该资源」，不需要区分具体原因。
+    InvalidImage,
+    /// 图像尺寸为0 或超出可渲染范围。
+    SizeUnsupported,
+}
+
+/// 从字节流解码一幅图片（格式由内容嗅探，不依赖扩展名）。
+///
+/// 支持 PNG / JPEG / GIF / WebP（编译期 feature 决定）。产出非预乘 RGBA8，
+/// 供 [`Command::DrawImage`] 消费。
+///
+/// # Errors
+///
+/// 字节无法识别为受支持格式、格式数据损坏、或尺寸不可渲染时返回 [`DecodeError`]。
+///
+/// 上游 `image` 系列的错误一律映射为 [`DecodeError::InvalidImage`]，不引入
+/// `image::error::ImageError`——依赖类型不得出现在 pub 导出中。
+pub fn decode(bytes: &[u8]) -> Result<Image, DecodeError> {
+    // 尺寸上限与光栅目标一致（vello 的渲染目标为 u16 像素），
+    // 避免解出一幅无法绘制的巨图。
+    const MAX_DIMENSION: u32 = 65535;
+
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| DecodeError::InvalidImage)?;
+    let decoded = reader.decode().map_err(|_| DecodeError::InvalidImage)?;
+
+    let (width, height) = (decoded.width(), decoded.height());
+    if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(DecodeError::SizeUnsupported);
+    }
+
+    // 统一转RGBA8（灰度 / 调色板 / RGB 均在此归一），行优先连续排列。
+    let rgba = decoded.into_rgba8();
+    Ok(Image::new(width, height, rgba.into_raw()))
+}
 
 /// 像素尺寸。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -881,5 +929,129 @@ mod tests {
         assert_eq!(image.pixel(1, 1), Some([1, 2, 3, 4]));
         assert_eq!(image.pixel(2, 0), None);
         assert_eq!(image.pixel(0, 2), None);
+    }
+
+    /// 生成一张指定颜色的 PNG 字节（用 image 编码，覆盖我们声明支持的格式）。
+    fn encode_png(width: u32, height: u32, color: [u8; 4]) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            width,
+            height,
+            image::Rgba(color),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut buffer),
+            image::ImageFormat::Png,
+        )
+        .expect("encode png");
+        buffer
+    }
+
+    #[test]
+    fn decode_png_yields_rgba8() {
+        let bytes = encode_png(3, 2, [10, 20, 30, 255]);
+        let image = decode(&bytes).expect("decode png");
+        assert_eq!((image.width, image.height), (3, 2));
+        assert_eq!(image.data.len(), 3 * 2 * 4);
+        // 所有像素都是同一个颜色
+        for y in 0..2u32 {
+            for x in 0..3u32 {
+                assert_eq!(image.pixel(x, y), Some([10, 20, 30, 255]));
+            }
+        }
+    }
+
+    #[test]
+    fn decode_normalizes_rgb_and_grayscale_to_rgba() {
+        // RGB（无 alpha）解码后 alpha 应为 255
+        let mut buffer = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            2,
+            2,
+            image::Rgb([200, 100, 50]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut buffer),
+            image::ImageFormat::Png,
+        )
+        .expect("encode png");
+        let image = decode(&buffer).expect("decode rgb png");
+        assert_eq!(image.pixel(0, 0), Some([200, 100, 50, 255]));
+
+        // 灰度图应复制到 RGB 三通道
+        let mut buffer = Vec::new();
+        image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(2, 2, image::Luma([128])))
+            .write_to(
+                &mut std::io::Cursor::new(&mut buffer),
+                image::ImageFormat::Png,
+            )
+            .expect("encode png");
+        let image = decode(&buffer).expect("decode luma png");
+        assert_eq!(image.pixel(1, 1), Some([128, 128, 128, 255]));
+    }
+
+    #[test]
+    fn decode_preserves_alpha() {
+        let bytes = encode_png(1, 1, [1, 2, 3, 128]);
+        let image = decode(&bytes).expect("decode");
+        assert_eq!(image.pixel(0, 0), Some([1, 2, 3, 128]));
+    }
+
+    #[test]
+    fn decode_detects_format_by_content_not_extension() {
+        // 字节里没有文件名线索，格式靠魔数嗅探
+        let png = encode_png(2, 2, [9, 9, 9, 255]);
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(2, 2, image::Rgb([9, 9, 9])))
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg),
+                image::ImageFormat::Jpeg,
+            )
+            .expect("encode jpeg");
+        // JPEG 魔噪点使像素不完全无损，只断言尺寸与类型
+        assert_eq!(decode(&png).expect("png").width, 2);
+        assert_eq!(decode(&jpeg).expect("jpeg").width, 2);
+    }
+
+    #[test]
+    fn decode_rejects_non_image_bytes() {
+        // HTML 文档不是图片
+        let error = decode(b"<!DOCTYPE html><html><body>hi</body></html>").expect_err("not image");
+        assert_eq!(error, DecodeError::InvalidImage);
+        // 空字节
+        assert_eq!(decode(&[]).expect_err("empty"), DecodeError::InvalidImage);
+    }
+
+    #[test]
+    fn decode_rejects_corrupt_image_data() {
+        let mut bytes = encode_png(4, 4, [7, 7, 7, 255]);
+        // 破坏压缩数据（保留魔数，使格式嗅探通过但解码失败）
+        let tail = bytes.len();
+        for byte in bytes.iter_mut().skip(tail / 2).take(16) {
+            *byte ^= 0xff;
+        }
+        assert_eq!(
+            decode(&bytes).expect_err("corrupt"),
+            DecodeError::InvalidImage
+        );
+    }
+
+    #[test]
+    fn decoded_image_feeds_draw_image() {
+        // 端到端：解码 → 资源池 → 光栅
+        let bytes = encode_png(2, 2, [0, 200, 0, 255]);
+        let image = decode(&bytes).expect("decode");
+        let scene = Scene {
+            commands: vec![Command::DrawImage {
+                rect: rect(0.0, 0.0, 4.0, 4.0),
+                image: 0,
+            }],
+            images: vec![image],
+        };
+        let pixmap = VelloCpuRasterizer::new()
+            .rasterize(&scene, size(6, 6))
+            .expect("rasterize");
+        assert_pixel_near(&pixmap, 1, 1, [0, 200, 0, 255]);
+        assert_pixel_near(&pixmap, 3, 3, [0, 200, 0, 255]);
     }
 }
