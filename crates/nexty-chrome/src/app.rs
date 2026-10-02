@@ -390,7 +390,7 @@ impl Gpu {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("nexty-blit"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+            source: wgpu::ShaderSource::Wgsl(blit_shader().into()),
         });
         let bind_group_layout = blit_bind_group_layout(&device);
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -642,31 +642,89 @@ fn blit_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
-/// 全屏三角形 + 像素直读 blit。`fs_main_bgra` 在 BGRA surface 上交换 R/B。
-const SHADER: &str = "
+/// 全屏三角形顶点（NDC）。
+///
+/// 必须是**大**三角形：斜边要越过 `(1.0, 1.0)`，整体包住 NDC 方形
+/// `[-1, 1]²`。用刚好等于方形的三角形会切掉对角，屏幕上表现为一块斜切的
+/// 未绘制区域（该区域保留上次内容或呈黑色）。
+const FULLSCREEN_TRIANGLE: [[f32; 2]; 3] = [[-1.0, -1.0], [3.0, -1.0], [-1.0, 3.0]];
+
+/// blit 着色器源码。
+///
+/// 顶点位置由 [`FULLSCREEN_TRIANGLE`] 生成，避免手写坐标时把大三角形
+/// 缩成小三角形。片元用 `textureLoad` 像素直读（1:1，不采样），坐标按
+/// 纹理尺寸 clamp，越界时取边缘像素而不是返回未定义值。
+fn blit_shader() -> String {
+    let [a, b, c] = FULLSCREEN_TRIANGLE;
+    format!(
+        "
 @vertex
-fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {{
     var positions = array<vec2<f32>, 3>(
-        vec2<f32>(-1.0, -3.0),
-        vec2<f32>(-1.0, 1.0),
-        vec2<f32>(3.0, -1.0),
+        vec2<f32>({}, {}),
+        vec2<f32>({}, {}),
+        vec2<f32>({}, {}),
     );
     return vec4<f32>(positions[index], 0.0, 1.0);
-}
+}}
 
 @group(0) @binding(0) var page_texture: texture_2d<f32>;
 @group(0) @binding(1) var page_sampler: sampler;
 
 @fragment
-fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
-    let coords = vec2<i32>(position.xy);
+fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {{
+    let dims = vec2<i32>(textureDimensions(page_texture, 0));
+    let coords = clamp(vec2<i32>(position.xy), vec2<i32>(0), dims - vec2<i32>(1));
     return textureLoad(page_texture, coords, 0);
-}
+}}
 
 @fragment
-fn fs_main_bgra(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
-    let coords = vec2<i32>(position.xy);
+fn fs_main_bgra(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {{
+    let dims = vec2<i32>(textureDimensions(page_texture, 0));
+    let coords = clamp(vec2<i32>(position.xy), vec2<i32>(0), dims - vec2<i32>(1));
     let color = textureLoad(page_texture, coords, 0);
     return vec4<f32>(color.b, color.g, color.r, color.a);
+}}
+",
+        a[0], a[1], b[0], b[1], c[0], c[1],
+    )
 }
-";
+
+#[cfg(test)]
+mod tests {
+    use super::FULLSCREEN_TRIANGLE;
+
+    /// 点是否在三角形内（叉积符号一致法）。
+    fn in_triangle(points: [[f32; 2]; 3], p: [f32; 2]) -> bool {
+        let sign = |a: [f32; 2], b: [f32; 2]| {
+            (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
+        };
+        let [p0, p1, p2] = points;
+        let (d0, d1, d2) = (sign(p0, p1), sign(p1, p2), sign(p2, p0));
+        let has_neg = d0 < 0.0 || d1 < 0.0 || d2 < 0.0;
+        let has_pos = d0 > 0.0 || d1 > 0.0 || d2 > 0.0;
+        !(has_neg && has_pos)
+    }
+
+    /// 全屏三角形必须覆盖 NDC 方形的四个角——漏掉任一角就是斜切黑块。
+    #[test]
+    fn fullscreen_triangle_covers_all_ndc_corners() {
+        for corner in [[-1.0, -1.0], [1.0, -1.0], [-1.0, 1.0], [1.0, 1.0]] {
+            assert!(
+                in_triangle(FULLSCREEN_TRIANGLE, corner),
+                "三角形未覆盖 NDC 角{corner:?}，会把该区域漏成未绘制"
+            );
+        }
+    }
+
+    /// 三角形还须覆盖 NDC 中心与各边中点，确保没有撕裂带。
+    #[test]
+    fn fullscreen_triangle_covers_center_and_edge_midpoints() {
+        for point in [[0.0, 0.0], [0.0, -1.0], [0.0, 1.0], [-1.0, 0.0], [1.0, 0.0]] {
+            assert!(
+                in_triangle(FULLSCREEN_TRIANGLE, point),
+                "三角形未覆盖 {point:?}"
+            );
+        }
+    }
+}
