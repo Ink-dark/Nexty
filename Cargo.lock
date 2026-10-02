@@ -1687,7 +1687,7 @@ version = "0.1.1"
 
 [[package]]
 name = "nexty-html"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "html5ever",
  "nexty-dom",

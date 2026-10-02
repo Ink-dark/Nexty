@@ -10,6 +10,9 @@
 //! 公共 API 只有 [`parse_document`] 与 [`parse_fragment`]：输入 UTF-8 字符串，
 //! 输出 [`Document`]。`TreeSink` 实现类型不对外暴露，`QualName` / `Attribute` /
 //! `StrTendril` 等上游类型均在本层内转换为自有类型。
+//!
+//! 另提供 [`collect_style_resources`]：把 `<link rel=stylesheet>` 与 `<style>`
+//! 按树序收集为资源清单（只收集不解析），供上层抓取外链 CSS 后按源顺序级联。
 
 #![forbid(unsafe_code)]
 
@@ -152,6 +155,93 @@ fn extract_fragment(document: &mut Document) -> NodeId {
         document.remove_node(html_root);
     }
     fragment
+}
+
+/// 从文档树按树序收集的样式表资源。
+///
+/// 只收集不解析：外链的抓取与文本的解析由上层（network / css 层）负责。
+/// 偏差：`media` / `type` 属性与 alternate 样式表集暂不建模，凡
+/// `rel` 含 `stylesheet` token 的 `<link>` 一律收集。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StyleResource {
+    /// `<link rel=stylesheet href=…>` 声明的外链样式表，字节需另行抓取。
+    External {
+        /// `href` 属性原值（可能是相对 URL，由上层解析）。
+        href: String,
+    },
+    /// `<style>` 元素的文本内容，可直接交给 CSS 层解析。
+    Inline {
+        /// 元素内全部文本的拼接（可能为空串）。
+        css: String,
+    },
+}
+
+/// 按树序收集文档中的样式表资源清单。
+///
+/// 遍历整棵树，`<link rel=stylesheet>` 与 `<style>` 按文档出现顺序交错产出
+/// ——级联优先级即此顺序（CSS Cascade：源顺序靠后者胜出）。规则：
+///
+/// - 只认 HTML 命名空间的 `link` / `style`；外来元素（SVG 等）里的同名元素不算。
+/// - `rel` 是 ASCII 大小写不敏感、空白分隔的 token 列表，含 `stylesheet`
+///   token 即命中（WHATWG HTML §4.6.6 link types）。
+/// - `href` 缺失或为空串的 `<link>` 跳过（WHATWG HTML §4.6.6：空 href 不抓取）。
+/// - `<style>` 的内容是全部子文本节点的拼接；空元素产出空串。
+/// - `<template>` 内容游离于主树之外，天然不会被收集到。
+#[must_use]
+pub fn collect_style_resources(document: &Document) -> Vec<StyleResource> {
+    let mut resources = Vec::new();
+    collect_from(document, document.root(), &mut resources);
+    resources
+}
+
+/// 以先序遍历收集子树里的样式表资源。
+fn collect_from(document: &Document, node: NodeId, resources: &mut Vec<StyleResource>) {
+    for child in document.children(node) {
+        let Some(NodeKind::Element(data)) = document.node(child) else {
+            continue;
+        };
+        if data.namespace != Namespace::Html {
+            continue;
+        }
+        match data.name.as_str() {
+            "link" => {
+                if is_stylesheet_link(data)
+                    && let Some(href) = attribute_value(data, "href")
+                    && !href.is_empty()
+                {
+                    resources.push(StyleResource::External {
+                        href: href.to_string(),
+                    });
+                }
+            }
+            "style" => {
+                let mut css = String::new();
+                for text in document.children(child) {
+                    if let Some(NodeKind::Text(content)) = document.node(text) {
+                        css.push_str(content);
+                    }
+                }
+                resources.push(StyleResource::Inline { css });
+            }
+            _ => collect_from(document, child, resources),
+        }
+    }
+}
+
+/// `rel` 属性是否含 `stylesheet` token（ASCII 大小写不敏感）。
+fn is_stylesheet_link(data: &ElementData) -> bool {
+    attribute_value(data, "rel").is_some_and(|rel| {
+        rel.split_ascii_whitespace()
+            .any(|token| token.eq_ignore_ascii_case("stylesheet"))
+    })
+}
+
+/// 取 HTML 元素的指定属性值。
+fn attribute_value<'a>(data: &'a ElementData, name: &str) -> Option<&'a str> {
+    data.attributes
+        .iter()
+        .find(|attr| attr.name == name)
+        .map(|attr| attr.value.as_str())
 }
 
 /// 自有解析选项 → 上游解析选项。
@@ -667,5 +757,75 @@ mod tests {
             ParseOptions::default(),
         );
         assert!(find_element(&enabled, enabled.root(), "div").is_none());
+    }
+
+    #[test]
+    fn style_resources_keep_tree_order() {
+        let document = parse(
+            "<head><style>p { color: red }</style>\
+             <link rel=stylesheet href=a.css><link rel=preload href=b.js></head>\
+             <body><style>div { color: blue }</style></body>",
+        );
+        assert_eq!(
+            collect_style_resources(&document),
+            vec![
+                StyleResource::Inline {
+                    css: "p { color: red }".into()
+                },
+                StyleResource::External {
+                    href: "a.css".into()
+                },
+                StyleResource::Inline {
+                    css: "div { color: blue }".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn stylesheet_rel_matches_case_insensitive_token_list() {
+        let document = parse(
+            "<head>\
+             <link rel=\"STYLESHEET\" href=a.css>\
+             <link rel=\"alternate stylesheet\" href=b.css>\
+             <link rel=preload href=c.css>\
+             </head>",
+        );
+        let resources = collect_style_resources(&document);
+        let hrefs: Vec<&str> = resources
+            .iter()
+            .filter_map(|resource| match resource {
+                StyleResource::External { href } => Some(href.as_str()),
+                StyleResource::Inline { .. } => None,
+            })
+            .collect();
+        assert_eq!(hrefs, vec!["a.css", "b.css"]);
+    }
+
+    #[test]
+    fn link_without_usable_href_is_skipped() {
+        let document = parse("<head><link rel=stylesheet><link rel=stylesheet href=\"\"></head>");
+        assert!(collect_style_resources(&document).is_empty());
+    }
+
+    #[test]
+    fn foreign_namespace_style_is_not_collected() {
+        let document = parse("<svg><style>circle { fill: red }</style></svg>");
+        assert!(collect_style_resources(&document).is_empty());
+    }
+
+    #[test]
+    fn style_in_template_is_not_collected() {
+        let document = parse("<template><style>p { color: red }</style></template>");
+        assert!(collect_style_resources(&document).is_empty());
+    }
+
+    #[test]
+    fn empty_style_element_yields_empty_css() {
+        let document = parse("<head><style></style></head>");
+        assert_eq!(
+            collect_style_resources(&document),
+            vec![StyleResource::Inline { css: String::new() }]
+        );
     }
 }
