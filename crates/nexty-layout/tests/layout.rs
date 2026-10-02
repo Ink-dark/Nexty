@@ -7,16 +7,27 @@ use nexty_dom::{Document, NodeId, NodeKind};
 use nexty_html::ParseOptions;
 use nexty_layout::{Fragment, LineFragment, layout_document};
 use nexty_text::ParleyTextShaper;
+use std::collections::HashMap;
 
 /// 解析 + 级联（含 UA 默认样式）+ 布局的测试入口。
 ///
 /// 测试统一把 body margin 归零，几何期望值不受 UA 默认 8px 干扰。
 fn layout(html: &str, css: &str, viewport_width: f32) -> (Document, Fragment) {
+    layout_with_images(html, css, HashMap::new(), viewport_width)
+}
+
+/// 带 `image_sizes`（node → 自然尺寸）的布局入口。
+fn layout_with_images(
+    html: &str,
+    css: &str,
+    image_sizes: HashMap<NodeId, (f32, f32)>,
+    viewport_width: f32,
+) -> (Document, Fragment) {
     let document = nexty_html::parse_document(html, ParseOptions::default());
     let sheet = Stylesheet::parse(&format!("body {{ margin: 0 }} {css}"));
     let styles = compute_document_styles(&document, &[&sheet], Some(html_ua_stylesheet()));
     let shaper = ParleyTextShaper::new();
-    let fragment = layout_document(&document, &shaper, &styles, viewport_width)
+    let fragment = layout_document(&document, &shaper, &styles, &image_sizes, viewport_width)
         .expect("document has a root element");
     (document, fragment)
 }
@@ -44,6 +55,95 @@ fn body<'a>(document: &Document, fragment: &'a Fragment) -> &'a Fragment {
 
 fn approx(a: f32, b: f32) -> bool {
     (a - b).abs() < 0.01
+}
+
+#[test]
+fn inline_image_participates_in_line_box() {
+    let (document, root) = layout(
+        "<body>hi <img width=40 height=30 src=a.png> bye</body>",
+        "",
+        400.0,
+    );
+    let body_fragment = body(&document, &root);
+    assert_eq!(body_fragment.lines.len(), 1, "短内容单行");
+    let line = &body_fragment.lines[0];
+    assert_eq!(line.images.len(), 1, "一张图片 run");
+    let image = &line.images[0];
+    assert!(approx(image.width, 40.0));
+    assert!(approx(image.height, 30.0));
+    // 替换元素底边对齐基线：顶缘 = baseline - height
+    assert!(approx(image.y + image.height, line.baseline));
+    // 文本 run 仍在（hi 与 bye）
+    assert_eq!(line.runs.len(), 2, "图片两侧的文本各自成 run");
+    // 图片在文本之后开始
+    assert!(image.x > 0.0);
+}
+
+/// 未带尺寸属性且不在 `image_sizes` 里的图片按默认对象尺寸 300×150。
+#[test]
+fn image_without_size_falls_back_to_default_object_size() {
+    let (document, root) = layout("<body><img src=a.png></body>", "", 800.0);
+    let line = &body(&document, &root).lines[0];
+    assert_eq!(line.images.len(), 1);
+    let image = &line.images[0];
+    assert!(approx(image.width, 300.0));
+    assert!(approx(image.height, 150.0));
+}
+
+/// `image_sizes` 提供自然尺寸：无属性时按自然尺寸显示。
+#[test]
+fn image_natural_size_used_when_no_attributes() {
+    let html = "<body><img src=a.png></body>";
+    let document = nexty_html::parse_document(html, ParseOptions::default());
+    let sheet = nexty_css::Stylesheet::parse("body { margin: 0 }");
+    let styles = compute_document_styles(&document, &[&sheet], Some(html_ua_stylesheet()));
+    // 模拟 chrome 层：解码后把自然尺寸按节点登记
+    let mut image_sizes = HashMap::new();
+    for resource in nexty_html::collect_image_resources(&document) {
+        image_sizes.insert(resource.node, (320.0, 240.0));
+    }
+    let shaper = ParleyTextShaper::new();
+    let root = layout_document(&document, &shaper, &styles, &image_sizes, 800.0).expect("root");
+    let line = &root.children[0].lines[0];
+    assert_eq!(line.images.len(), 1);
+    assert!(approx(line.images[0].width, 320.0));
+    assert!(approx(line.images[0].height, 240.0));
+}
+
+/// 放不下的图片整体换行，不拆分。
+#[test]
+fn image_breaks_to_next_line_when_it_does_not_fit() {
+    let (document, root) = layout(
+        "<body>text <img width=200 height=20 src=a.png> tail</body>",
+        "",
+        240.0,
+    );
+    let lines = &body(&document, &root).lines;
+    // 240 宽下 "text" 后放不下 200 的图片 → 图片换行；tail 再换行
+    assert!(
+        lines.len() >= 2,
+        "图片放不下必须换行，实际行数 {}",
+        lines.len()
+    );
+    assert_eq!(
+        lines.iter().map(|line| line.images.len()).sum::<usize>(),
+        1,
+        "图片只有一个 run，且不被拆分"
+    );
+}
+
+/// 块级 `<img>`（display: block）按替换元素盒布局：尺寸取 HTML 属性。
+#[test]
+fn block_level_image_lays_out_as_replaced_box() {
+    let (document, root) = layout(
+        "<body><img style=\"display: block\" width=100 height=20 src=a.png></body>",
+        "",
+        400.0,
+    );
+    let img = find(&document, &root, "img").expect("img fragment");
+    assert!(approx(img.border_box.width, 100.0));
+    assert!(approx(img.border_box.height, 20.0));
+    assert!(img.lines.is_empty() && img.children.is_empty());
 }
 
 #[test]
@@ -328,7 +428,8 @@ fn blank_document_yields_none() {
     // 真正的 None 场景：没有任何元素的文档
     let empty = Document::new();
     let styles = compute_document_styles(&empty, &[], None);
-    assert!(layout_document(&empty, &shaper, &styles, 100.0).is_none());
+    let image_sizes = HashMap::new();
+    assert!(layout_document(&empty, &shaper, &styles, &image_sizes, 100.0).is_none());
 }
 
 #[test]

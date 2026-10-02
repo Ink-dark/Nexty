@@ -13,17 +13,19 @@
 use std::collections::HashMap;
 
 use nexty_css::{ComputedStyle, DisplayValue, MarginValue, PaddingValue, SizeValue};
-use nexty_dom::{Document, NodeId, NodeKind};
+use nexty_dom::{Document, Namespace, NodeId, NodeKind};
 use nexty_text::TextShaper;
 
 use crate::fragment::{Edges, Fragment, Rect};
-use crate::inline::{build_lines, collect_inline_words};
+use crate::inline::{InlineItem, InlineRun, build_lines, image_box_size};
 
 /// 布局上下文。
 pub(crate) struct Context<'a> {
     pub document: &'a Document,
     pub shaper: &'a dyn TextShaper,
     pub styles: &'a HashMap<NodeId, ComputedStyle>,
+    /// 已解码图片的自然尺寸（node → 像素宽高，CSS px）。
+    pub image_sizes: &'a HashMap<NodeId, (f32, f32)>,
 }
 
 /// 一个块的布局结果：片段 + 参与 margin 折叠的边界值。
@@ -110,6 +112,15 @@ fn to_layout_edges(edges: nexty_css::Edges<f32>) -> Edges {
     }
 }
 
+/// `node` 是否为 HTML 命名空间的 `<img>`（替换元素）。
+fn is_image_element(document: &Document, node: NodeId) -> bool {
+    matches!(
+        document.node(node),
+        Some(NodeKind::Element(data))
+            if data.namespace == Namespace::Html && data.name == "img"
+    )
+}
+
 fn resolve_padding(paddings: nexty_css::Edges<PaddingValue>, containing_width: f32) -> Edges {
     Edges {
         top: used_padding(paddings.top, containing_width),
@@ -123,8 +134,8 @@ fn resolve_padding(paddings: nexty_css::Edges<PaddingValue>, containing_width: f
 pub(crate) enum ChildGroup {
     /// 块级元素子盒。
     Block(NodeId, ComputedStyle),
-    /// 一段连续的行内级内容（词序列）。
-    Inline(Vec<crate::inline::Word>),
+    /// 一段连续的行内级内容（词/原子图片序列）。
+    Inline(Vec<InlineItem>),
 }
 
 fn group_children(ctx: &Context<'_>, node: NodeId) -> Vec<ChildGroup> {
@@ -134,52 +145,72 @@ fn group_children(ctx: &Context<'_>, node: NodeId) -> Vec<ChildGroup> {
 }
 
 fn collect_groups(ctx: &Context<'_>, node: NodeId, groups: &mut Vec<ChildGroup>) {
+    let style = ctx
+        .styles
+        .get(&node)
+        .cloned()
+        .unwrap_or_else(ComputedStyle::initial);
+    // 行内内容按树序一次性收集（InlineRun 跨子节点保持空白折叠状态），
+    // 遇块级子盒时把当前行内流刷成一组——匿名块只承接真正的混排边界
+    let mut run: Option<InlineRun<'_>> = None;
     for child in ctx.document.children(node) {
         match ctx.document.node(child) {
+            Some(NodeKind::Text(text)) => {
+                // 文本属于行内内容，样式取父元素
+                run.get_or_insert_with(|| {
+                    InlineRun::new(ctx.document, ctx.styles, ctx.image_sizes)
+                })
+                .push_text(text, node, &style);
+            }
             Some(NodeKind::Element(_)) => {
                 let Some(child_style) = ctx.styles.get(&child) else {
                     continue;
                 };
                 match child_style.display {
                     DisplayValue::None => {}
-                    // display: contents：盒子移除，子内容提升到当前层
-                    DisplayValue::Contents => collect_groups(ctx, child, groups),
+                    // display: contents：盒子移除，行内/块级内容都提升到当前层
+                    DisplayValue::Contents => {
+                        if let Some(finished) = run.take() {
+                            push_items(groups, finished.finish());
+                        }
+                        collect_groups(ctx, child, groups);
+                    }
                     DisplayValue::Inline
                     | DisplayValue::InlineBlock
                     | DisplayValue::InlineFlex
                     | DisplayValue::InlineGrid
                     | DisplayValue::InlineTable => {
-                        let words =
-                            collect_inline_words(ctx.document, ctx.styles, child, child_style);
-                        push_words(groups, words);
+                        run.get_or_insert_with(|| {
+                            InlineRun::new(ctx.document, ctx.styles, ctx.image_sizes)
+                        })
+                        .push_element(child, child_style);
                     }
-                    _ => groups.push(ChildGroup::Block(child, child_style.clone())),
+                    _ => {
+                        // 块级子盒切断行内流
+                        if let Some(finished) = run.take() {
+                            push_items(groups, finished.finish());
+                        }
+                        groups.push(ChildGroup::Block(child, child_style.clone()));
+                    }
                 }
-            }
-            Some(NodeKind::Text(_)) => {
-                // 文本属于行内内容，样式取父元素
-                let style = ctx
-                    .styles
-                    .get(&node)
-                    .cloned()
-                    .unwrap_or_else(ComputedStyle::initial);
-                let words = collect_inline_words(ctx.document, ctx.styles, node, &style);
-                push_words(groups, words);
             }
             // 注释与处理指令不产生盒
             _ => {}
         }
     }
+    if let Some(finished) = run.take() {
+        push_items(groups, finished.finish());
+    }
 }
 
-/// 把词追加到行内分组；空白词序列不产生空匿名块。
-fn push_words(groups: &mut Vec<ChildGroup>, words: Vec<crate::inline::Word>) {
-    if words.is_empty() {
+/// 把行内项追加到行内分组；空白序列不产生空匿名块。
+fn push_items(groups: &mut Vec<ChildGroup>, items: Vec<InlineItem>) {
+    if items.is_empty() {
         return;
     }
     match groups.last_mut() {
-        Some(ChildGroup::Inline(existing)) => existing.extend(words),
-        _ => groups.push(ChildGroup::Inline(words)),
+        Some(ChildGroup::Inline(existing)) => existing.extend(items),
+        _ => groups.push(ChildGroup::Inline(items)),
     }
 }
 
@@ -199,6 +230,37 @@ pub(crate) fn layout_block_box(
     containing_height: Option<f32>,
     is_root: bool,
 ) -> BlockBox {
+    // ---- 块级替换元素（块级 `<img>`）：§10.3.2 的最小近似 ----
+    // 内容尺寸来自图片盒尺寸（属性/自然尺寸/默认对象尺寸），CSS width/height
+    // 暂不参与；margin auto 视作 0（不做居中，偏差）。
+    if is_image_element(ctx.document, node) {
+        let border = to_layout_edges(style.border_width);
+        let padding = resolve_padding(style.padding, containing_width);
+        let margins = resolve_edges(style.margin, containing_width);
+        let (image_width, image_height) = image_box_size(ctx.document, node, ctx.image_sizes);
+        let fragment = Fragment {
+            node,
+            anonymous: false,
+            border_box: Rect {
+                x: margins.left,
+                y: 0.0,
+                width: image_width + border.left + padding.left + border.right + padding.right,
+                height: image_height + border.top + padding.top + border.bottom + padding.bottom,
+            },
+            border,
+            padding,
+            style: style.clone(),
+            children: Vec::new(),
+            lines: Vec::new(),
+        };
+        return BlockBox {
+            fragment,
+            margin_top: margins.top,
+            margin_bottom: margins.bottom,
+            self_collapsing: false,
+        };
+    }
+
     // ---- 盒模型 used value ----
     let border = to_layout_edges(style.border_width);
     let padding = resolve_padding(style.padding, containing_width);
@@ -276,7 +338,7 @@ pub(crate) fn layout_block_box(
                 last_margin_bottom = result.margin_bottom;
                 children.push(fragment);
             }
-            ChildGroup::Inline(words) => {
+            ChildGroup::Inline(items) => {
                 // 无块级子盒时行内内容由本盒的 own_lines 承接（见下方），
                 // 此处只处理需要匿名块承接的混排情形
                 if !has_block_children {
@@ -284,7 +346,7 @@ pub(crate) fn layout_block_box(
                 }
                 // 匿名块盒（§9.2.1.1）：边框/外边距为 0，样式取父元素；
                 // 绘制端按 anonymous 标志透明处理
-                let anonymous_lines = build_lines(ctx.shaper, words, content_width, style);
+                let anonymous_lines = build_lines(ctx.shaper, items, content_width, style);
                 let height: f32 = anonymous_lines.iter().map(|line| line.height).sum();
                 let border_y = match pending {
                     None => 0.0,
@@ -319,14 +381,14 @@ pub(crate) fn layout_block_box(
     let own_lines = if has_block_children {
         Vec::new()
     } else {
-        let words = groups
+        let items = groups
             .into_iter()
             .flat_map(|group| match group {
                 ChildGroup::Block(..) => Vec::new(),
-                ChildGroup::Inline(words) => words,
+                ChildGroup::Inline(items) => items,
             })
             .collect::<Vec<_>>();
-        build_lines(ctx.shaper, &words, content_width, style)
+        build_lines(ctx.shaper, &items, content_width, style)
     };
     let has_line_boxes = !own_lines.is_empty();
 

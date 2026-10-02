@@ -24,12 +24,14 @@ mod block;
 mod fragment;
 mod inline;
 
-pub use fragment::{Edges, Fragment, LineFragment, Rect, TextRun};
+pub use fragment::{Edges, Fragment, ImageRun, LineFragment, Rect, TextRun};
 
 /// 布局整份文档，返回根元素（`<html>`）的片段树。
 ///
 /// `styles` 是文档树序计算的 computed style（见 nexty-css 的
 /// `compute_document_styles`）；缺失样式的元素按 initial 值处理。
+/// `image_sizes` 提供已解码图片的自然尺寸（`<img>` 节点 → 像素宽高）；
+/// 未收录的图片按 CSS Images §5.1 默认对象尺寸 300×150 处理。
 /// `viewport_width` 是根包含块的内容宽（CSS px）。
 ///
 /// 返回 `None` 表示文档没有元素节点。
@@ -38,6 +40,7 @@ pub fn layout_document(
     document: &Document,
     shaper: &dyn TextShaper,
     styles: &HashMap<NodeId, ComputedStyle>,
+    image_sizes: &HashMap<NodeId, (f32, f32)>,
     viewport_width: f32,
 ) -> Option<Fragment> {
     let root = document
@@ -47,6 +50,7 @@ pub fn layout_document(
         document,
         shaper,
         styles,
+        image_sizes,
     };
     Some(block::layout_root(&ctx, root, viewport_width))
 }

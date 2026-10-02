@@ -65,6 +65,26 @@ pub struct LineFragment {
     pub height: f32,
     /// 行内文本 run（按绘制顺序）。
     pub runs: Vec<TextRun>,
+    /// 行内原子图片（替换元素，按基线对齐：底边落在基线上）。
+    pub images: Vec<ImageRun>,
+}
+
+/// 行内一张图片的落点。
+///
+/// 坐标系与 [`LineFragment`] 一致：x/y 相对所属片段**内容盒**左上角，
+/// y 已按基线对齐折算（`baseline - height`）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ImageRun {
+    /// 图片来源元素（`<img>` 节点）。
+    pub node: NodeId,
+    /// 左缘 x。
+    pub x: f32,
+    /// 顶缘 y。
+    pub y: f32,
+    /// 显示宽。
+    pub width: f32,
+    /// 显示高。
+    pub height: f32,
 }
 
 /// 行内一段同源样式的文本 run。

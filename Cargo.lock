@@ -1695,7 +1695,7 @@ dependencies = [
 
 [[package]]
 name = "nexty-layout"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "nexty-css",
  "nexty-dom",
