@@ -8,6 +8,7 @@
 //! （见 AGENTS.md 硬规则「渲染隔离」）。模块分工：
 //!
 //! - [`pipeline`]：HTML 字符串 → 级联 → 布局 → 片段树 → paint 显示列表；
+//! - [`resources`]：子资源（外链 CSS + 图片）清单解析、并发抓取与解码编排；
 //! - [`render`]：渲染隔离线程（panic 兜底，线程存活可继续服务）；
 //! - [`ui`]：自绘地址栏状态机（纯逻辑，可测试）；
 //! - `app`（私有）：winit 事件循环 + wgpu 呈现胶水——**无法在无头环境
@@ -19,6 +20,7 @@
 
 pub mod pipeline;
 pub mod render;
+pub mod resources;
 pub mod ui;
 
 mod app;

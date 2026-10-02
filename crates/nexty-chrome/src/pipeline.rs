@@ -3,7 +3,8 @@
 //! 行为分工：解析归 nexty-html，级联归 nexty-css（UA + author 双 origin），
 //! 布局归 nexty-layout，本模块负责把片段树转译为 [`nexty_paint::Scene`]：
 //! 背景与 CSS 边框（四条填充带，宽 0 的边跳过）、行内文本 run
-//! （坐标换算到绝对坐标系）；匿名片段不产生背景与边框。
+//! （坐标换算到绝对坐标系）、行内/块级图片（`DrawImage`，像素从页面图片池
+//! 按节点索引）。匿名片段不产生背景与边框。
 //!
 //! 已知偏差：`<html>`/`<body>` 背景不向画布传播（画布保持透明，由呈现层
 //! 决定底色）；片段树不做滚动裁剪。
@@ -14,7 +15,7 @@ use nexty_css::{ComputedStyle, Rgba, Stylesheet, compute_document_styles, html_u
 use nexty_dom::{Document, NodeId};
 use nexty_html::ParseOptions;
 use nexty_layout::Fragment;
-use nexty_paint::{Color, Command, Rect as PaintRect, Scene, Size, TextGlyph};
+use nexty_paint::{Color, Command, Image, Rect as PaintRect, Scene, Size, TextGlyph};
 use nexty_text::TextShaper;
 
 /// 一个已解析、已级联的页面。
@@ -23,40 +24,81 @@ pub struct Page {
     pub document: Document,
     /// 各元素的 computed style。
     pub styles: HashMap<NodeId, ComputedStyle>,
+    /// 已解码图片（`<img>` 节点 → RGBA 图像），构建 Scene 时进入图片池。
+    pub images: HashMap<NodeId, Image>,
 }
 
-/// 解析并级联一份页面（UA 样式表固定为 nexty-css 的 HTML 默认）。
+/// 用已解析文档与作者样式表构建页面（UA 样式表固定为 nexty-css 的 HTML 默认）。
+///
+/// `stylesheets` 按级联优先级排列（CSS Cascade：源顺序靠后者胜出）——
+/// inline `<style>` 与外链样式表按文档出现顺序交错。
+#[must_use]
+pub fn build_page(
+    document: Document,
+    stylesheets: Vec<Stylesheet>,
+    images: HashMap<NodeId, Image>,
+) -> Page {
+    let sheet_refs: Vec<&Stylesheet> = stylesheets.iter().collect();
+    let styles = compute_document_styles(&document, &sheet_refs, Some(html_ua_stylesheet()));
+    Page {
+        document,
+        styles,
+        images,
+    }
+}
+
+/// 解析并级联一份页面（单张作者样式表，无图片——内部页/空白页用）。
 #[must_use]
 pub fn load_page(html: &str, author_css: &str) -> Page {
     let document = nexty_html::parse_document(html, ParseOptions::default());
     let sheet = Stylesheet::parse(author_css);
-    let styles = compute_document_styles(&document, &[&sheet], Some(html_ua_stylesheet()));
-    Page { document, styles }
+    build_page(document, vec![sheet], HashMap::new())
 }
 
 /// 对页面做布局，返回根元素片段。
 #[must_use]
 pub fn layout_page(page: &Page, shaper: &dyn TextShaper, viewport_width: f32) -> Option<Fragment> {
-    nexty_layout::layout_document(&page.document, shaper, &page.styles, viewport_width)
+    // 布局层只要自然尺寸（CSS px = 像素 1:1）
+    let image_sizes: HashMap<NodeId, (f32, f32)> = page
+        .images
+        .iter()
+        .map(|(node, image)| (*node, (image.width as f32, image.height as f32)))
+        .collect();
+    nexty_layout::layout_document(
+        &page.document,
+        shaper,
+        &page.styles,
+        &image_sizes,
+        viewport_width,
+    )
 }
 
 /// 把片段树转译为显示列表，原点在视口左上角。
 #[must_use]
-pub fn build_scene(root: &Fragment) -> Scene {
-    build_scene_at(root, 0.0, 0.0)
+pub fn build_scene(page: &Page, root: &Fragment) -> Scene {
+    build_scene_at(page, root, 0.0, 0.0)
 }
 
 /// 把片段树转译为显示列表，并整体平移到 `(origin_x, origin_y)`。
 ///
-/// 用于给页面内容留出顶部 UI（如地址栏）占用的区域。
+/// 用于给页面内容留出顶部 UI（如地址栏）占用的区域。图片按绘制顺序进入
+/// `Scene.images` 池，`DrawImage` 按下标引用（同一节点多图共享一份像素）。
 #[must_use]
-pub fn build_scene_at(root: &Fragment, origin_x: f32, origin_y: f32) -> Scene {
+pub fn build_scene_at(page: &Page, root: &Fragment, origin_x: f32, origin_y: f32) -> Scene {
     let mut scene = Scene::default();
-    emit(root, origin_x, origin_y, &mut scene);
+    let mut pool: HashMap<NodeId, usize> = HashMap::new();
+    emit(page, root, origin_x, origin_y, &mut scene, &mut pool);
     scene
 }
 
-fn emit(fragment: &Fragment, origin_x: f32, origin_y: f32, scene: &mut Scene) {
+fn emit(
+    page: &Page,
+    fragment: &Fragment,
+    origin_x: f32,
+    origin_y: f32,
+    scene: &mut Scene,
+    pool: &mut HashMap<NodeId, usize>,
+) {
     let x = origin_x + fragment.border_box.x;
     let y = origin_y + fragment.border_box.y;
     let width = fragment.border_box.width;
@@ -118,6 +160,28 @@ fn emit(fragment: &Fragment, origin_x: f32, origin_y: f32, scene: &mut Scene) {
     let content_x = x + fragment.border.left + fragment.padding.left;
     let content_y = y + fragment.border.top + fragment.padding.top;
 
+    // 块级替换元素（`<img>` display:block）：内容盒即图片矩形
+    if is_image_node(&page.document, fragment.node) {
+        draw_image_at(
+            page,
+            fragment.node,
+            content_x,
+            content_y,
+            width
+                - fragment.border.left
+                - fragment.border.right
+                - fragment.padding.left
+                - fragment.padding.right,
+            height
+                - fragment.border.top
+                - fragment.border.bottom
+                - fragment.padding.top
+                - fragment.padding.bottom,
+            scene,
+            pool,
+        );
+    }
+
     for line in &fragment.lines {
         let baseline = content_y + line.baseline;
         for run in &line.runs {
@@ -140,11 +204,69 @@ fn emit(fragment: &Fragment, origin_x: f32, origin_y: f32, scene: &mut Scene) {
                 color: to_color(run.color),
             });
         }
+        // 行内图片：底边对齐基线（布局层已折算 y）
+        for image in &line.images {
+            draw_image_at(
+                page,
+                image.node,
+                content_x + image.x,
+                content_y + image.y,
+                image.width,
+                image.height,
+                scene,
+                pool,
+            );
+        }
     }
 
     for child in &fragment.children {
-        emit(child, content_x, content_y, scene);
+        emit(page, child, content_x, content_y, scene, pool);
     }
+}
+
+/// `node` 是否为 HTML 命名空间的 `<img>`（块级替换路径的判定）。
+fn is_image_node(document: &Document, node: NodeId) -> bool {
+    use nexty_dom::{Namespace, NodeKind};
+    matches!(
+        document.node(node),
+        Some(NodeKind::Element(data))
+            if data.namespace == Namespace::Html && data.name == "img"
+    )
+}
+
+/// 在指定矩形下发一张图片：像素进池（按节点去重），指令按下标引用。
+fn draw_image_at(
+    page: &Page,
+    node: NodeId,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    scene: &mut Scene,
+    pool: &mut HashMap<NodeId, usize>,
+) {
+    // 未解码成功的图片没有像素（抓取失败降级）：矩形跳过，不影响其余内容
+    let Some(source) = page.images.get(&node) else {
+        return;
+    };
+    let index = match pool.get(&node) {
+        Some(index) => *index,
+        None => {
+            let index = scene.images.len();
+            scene.images.push(source.clone());
+            pool.insert(node, index);
+            index
+        }
+    };
+    scene.commands.push(Command::DrawImage {
+        rect: PaintRect {
+            x,
+            y,
+            width,
+            height,
+        },
+        image: index,
+    });
 }
 
 fn push_strip(scene: &mut Scene, x: f32, y: f32, width: f32, height: f32, color: Rgba) {

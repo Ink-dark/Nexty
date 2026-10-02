@@ -43,11 +43,12 @@ impl std::fmt::Display for AppError {
 impl std::error::Error for AppError {}
 
 /// 后台抓取完成后经事件代理送回的载荷。
-#[derive(Debug)]
 enum BackgroundEvent {
+    /// 页面（含子资源：外链 CSS + 解码图片）就绪。
     PageLoaded {
         url: String,
-        result: Result<String, String>,
+        /// 页面构建结果；错误携带用户可读信息。
+        result: Result<Page, String>,
     },
 }
 
@@ -147,7 +148,7 @@ impl BrowserApp {
             .unwrap_or(800.0);
         let root = pipeline::layout_page(&page, &self.shaper, viewport_width);
         // 页面内容从地址栏下方开始，避免被 UI 覆盖
-        self.scene = root.map(|root| pipeline::build_scene_at(&root, 0.0, BAR_HEIGHT));
+        self.scene = root.map(|root| pipeline::build_scene_at(&page, &root, 0.0, BAR_HEIGHT));
         self.page = Some(page);
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -183,9 +184,29 @@ impl BrowserApp {
                     url: target.clone(),
                     method: Method::Get,
                 };
+                // 全部加载在后台线程完成：文档抓取 → 解析 → 子资源并发抓取
+                // → 级联 → 页面就绪。主线程只做布局与呈现。
                 let result = match fetcher.fetch(&request) {
                     Ok(response) if (200..300).contains(&response.status) => {
-                        String::from_utf8(response.body).map_err(|error| error.to_string())
+                        match String::from_utf8(response.body) {
+                            Ok(html) => {
+                                let document = nexty_html::parse_document(
+                                    &html,
+                                    nexty_html::ParseOptions::default(),
+                                );
+                                let resources = crate::resources::fetch_subresources(
+                                    fetcher.as_ref(),
+                                    &url,
+                                    &document,
+                                );
+                                Ok(pipeline::build_page(
+                                    document,
+                                    resources.stylesheets,
+                                    resources.images,
+                                ))
+                            }
+                            Err(error) => Err(error.to_string()),
+                        }
                     }
                     Ok(response) => Err(format!("HTTP {}", response.status)),
                     Err(error) => Err(format!("{error:?}")),
@@ -196,10 +217,10 @@ impl BrowserApp {
     }
 
     /// 抓取完成：重建页面与显示列表。
-    fn page_loaded(&mut self, url: String, result: Result<String, String>) {
+    fn page_loaded(&mut self, url: String, result: Result<Page, String>) {
         match result {
-            Ok(html) => {
-                self.set_page(pipeline::load_page(&html, ""));
+            Ok(page) => {
+                self.set_page(page);
                 self.bar.set_url(url);
             }
             Err(error) => {

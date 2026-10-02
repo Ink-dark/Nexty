@@ -1,7 +1,7 @@
 [package]
 name = "nexty-chrome"
 description = "Nexty 浏览器外壳：窗口、输入、导航与自绘 UI"
-version = "0.1.1"
+version = "0.1.2"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -19,6 +19,10 @@ winit = "0.30.13"
 wgpu = "29"
 # wgpu 的异步初始化在 winit 事件循环外的同步入口完成
 pollster = "0.4"
+
+[dev-dependencies]
+# 仅测试用：构造 PNG 字节喂给资源编排测试（与 nexty-paint 同一依赖）
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 [[bin]]
 name = "nexty"

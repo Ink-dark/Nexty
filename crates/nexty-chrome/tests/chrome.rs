@@ -23,7 +23,7 @@ fn end_to_end_page_renders_background_and_border() {
     );
     let shaper = ParleyTextShaper::new();
     let root = pipeline::layout_page(&page, &shaper, 400.0).expect("root");
-    let scene = pipeline::build_scene(&root);
+    let scene = pipeline::build_scene(&page, &root);
 
     // 显示列表应包含：body 白底、box 蓝底、四条红边、一条文本
     let fills: Vec<_> = scene
@@ -104,7 +104,7 @@ fn anonymous_fragments_draw_no_background_or_border() {
     );
     let shaper = ParleyTextShaper::new();
     let root = pipeline::layout_page(&page, &shaper, 400.0).expect("root");
-    let scene = pipeline::build_scene(&root);
+    let scene = pipeline::build_scene(&page, &root);
 
     // 除 body 背景（若 UA 给了）外，不允许出现匿名背景/边框；
     // 匿名片段的指令只可能是 DrawText
@@ -215,4 +215,236 @@ fn viewport_alias_and_helpers() {
         height: 20,
     };
     assert!(approx(viewport.width as f32, 10.0));
+}
+
+// ---- T5：子资源抓取与页面重组（无头端到端） ----
+
+use nexty_chrome::resources::{self, Subresources};
+use nexty_dom::{Document, NodeId};
+use nexty_html::ParseOptions;
+use nexty_network::{NetworkError, NetworkFetcher, Request, Response};
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
+/// 内存 mock fetcher：URL → body / 状态码；未登记的 URL 返回 404。
+struct MockFetcher {
+    routes: Mutex<BTreeMap<String, Result<Vec<u8>, u16>>>,
+}
+
+impl MockFetcher {
+    fn new() -> Self {
+        Self {
+            routes: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn serve(&self, url: &str, body: &[u8]) {
+        self.routes
+            .lock()
+            .unwrap()
+            .insert(url.to_owned(), Ok(body.to_vec()));
+    }
+
+    fn fail(&self, url: &str, status: u16) {
+        self.routes
+            .lock()
+            .unwrap()
+            .insert(url.to_owned(), Err(status));
+    }
+}
+
+impl NetworkFetcher for MockFetcher {
+    fn fetch(&self, request: &Request) -> Result<Response, NetworkError> {
+        let routes = self.routes.lock().unwrap();
+        match routes.get(&request.url) {
+            Some(Ok(body)) => Ok(Response {
+                status: 200,
+                headers: Vec::new(),
+                body: body.clone(),
+            }),
+            Some(Err(status)) => Ok(Response {
+                status: *status,
+                headers: Vec::new(),
+                body: Vec::new(),
+            }),
+            None => Ok(Response {
+                status: 404,
+                headers: Vec::new(),
+                body: Vec::new(),
+            }),
+        }
+    }
+}
+
+/// 1×1 蓝色 PNG。
+fn tiny_png() -> Vec<u8> {
+    let mut buffer = Vec::new();
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        1,
+        1,
+        image::Rgba([0, 0, 255, 255]),
+    ))
+    .write_to(
+        &mut std::io::Cursor::new(&mut buffer),
+        image::ImageFormat::Png,
+    )
+    .expect("encode png");
+    buffer
+}
+
+/// 加载入口（与 app.rs 后台线程相同的编排序列）。
+fn load_page_with_resources(
+    fetcher: &MockFetcher,
+    base_url: &str,
+    html: &str,
+) -> (Document, Subresources) {
+    let document = nexty_html::parse_document(html, ParseOptions::default());
+    let resources = resources::fetch_subresources(fetcher, base_url, &document);
+    (document, resources)
+}
+
+/// 含外链 CSS + 图片的页面：级联按源顺序，图片按 DrawImage 下发。
+#[test]
+fn subresources_load_and_scene_carries_external_css_and_image() {
+    let fetcher = MockFetcher::new();
+    // 外链表覆盖 inline 表的同名属性：后者应胜出
+    fetcher.serve(
+        "https://page.test/ext.css",
+        b"p { color: blue; border: 2px solid rgb(0 128 0) }",
+    );
+    fetcher.serve("https://page.test/logo.png", &tiny_png());
+    let html = "<head><style>p { color: red }</style>\
+                <link rel=stylesheet href=ext.css></head>\
+                <body><p>hi</p><img src=logo.png width=10 height=10></body>";
+
+    let (_, sub) = load_page_with_resources(&fetcher, "https://page.test/index.html", html);
+    assert_eq!(sub.stylesheets.len(), 2, "inline + 外链按源顺序");
+    assert_eq!(sub.images.len(), 1, "图片已解码");
+
+    // 组装页面 → 布局 → Scene
+    let document = nexty_html::parse_document(html, ParseOptions::default());
+    let page = pipeline::build_page(document, sub.stylesheets, sub.images);
+    let shaper = ParleyTextShaper::new();
+    let root = pipeline::layout_page(&page, &shaper, 400.0).expect("root");
+    let scene = pipeline::build_scene(&page, &root);
+
+    // Scene 指令序列：图片指令 + 图片池 + 文本
+    let images_drawn: Vec<_> = scene
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::DrawImage { rect, image } => Some((*rect, *image)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(images_drawn.len(), 1, "一张图片一条 DrawImage");
+    let (rect, index) = images_drawn[0];
+    assert_eq!(scene.images.len(), 1, "图片池一份像素");
+    assert_eq!(index, 0);
+    assert!(approx(rect.width, 10.0) && approx(rect.height, 10.0));
+    // 图片落点在地址栏下方内容区（y > 0）且在文本之后
+    assert!(rect.y > 0.0);
+    assert!(
+        scene
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::DrawText { .. })),
+        "文本指令仍在"
+    );
+
+    // 级联顺序：外链表的 blue 压过 inline 的 red —— 光栅化像素验证
+    let rasterizer = nexty_paint::VelloCpuRasterizer::new();
+    let pixmap = rasterizer
+        .rasterize(
+            &scene,
+            Viewport {
+                width: 400,
+                height: 300,
+            },
+        )
+        .expect("rasterize");
+    let pixel = pixmap
+        .pixel(rect.x as u32 + 5, rect.y as u32 + 5)
+        .expect("像素在画布内");
+    // vello_cpu 预乘/反预乘往返有 ±1 量化误差
+    assert!(
+        pixel[0] <= 1 && pixel[1] <= 1 && pixel[2] >= 254 && pixel[3] == 255,
+        "1×1 PNG 的蓝色落在目标矩形内，实际 {pixel:?}"
+    );
+}
+
+/// 单个子资源失败不影响其余渲染（降级而非白屏）。
+#[test]
+fn failing_subresources_degrade_without_blocking_render() {
+    let fetcher = MockFetcher::new();
+    fetcher.fail("https://page.test/broken.css", 500);
+    fetcher.fail("https://page.test/lost.png", 404);
+    fetcher.serve("https://page.test/junk.png", b"not an image");
+    let html = "<head><link rel=stylesheet href=broken.css></head>\
+                <body><p>still here</p><img src=lost.png><img src=junk.png></body>";
+
+    let (_, sub) = load_page_with_resources(&fetcher, "https://page.test/index.html", html);
+    assert!(sub.stylesheets.is_empty(), "失败的外链表不参与级联");
+    assert!(sub.images.is_empty(), "失败图片无像素");
+
+    let document = nexty_html::parse_document(html, ParseOptions::default());
+    let page = pipeline::build_page(document, sub.stylesheets, sub.images);
+    let shaper = ParleyTextShaper::new();
+    let root = pipeline::layout_page(&page, &shaper, 400.0).expect("root");
+    let scene = pipeline::build_scene(&page, &root);
+
+    // 文本照常渲染；无图片指令（失败图片不产生 DrawImage）
+    assert!(
+        scene
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::DrawText { .. })),
+        "文本内容不受子资源失败影响"
+    );
+    assert!(
+        !scene
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::DrawImage { .. })),
+        "无像素的图片不下发指令"
+    );
+}
+
+/// 抓取不到自然尺寸的图片：布局回退默认对象尺寸，失败图片无指令。
+#[test]
+fn image_natural_size_flows_from_decoding_into_layout() {
+    // 3×2 蓝色 PNG：无 width/height 属性时按自然尺寸
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        3,
+        2,
+        image::Rgba([10, 20, 30, 255]),
+    ))
+    .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+    .expect("encode");
+    let fetcher = MockFetcher::new();
+    fetcher.serve("https://page.test/n.png", &png);
+    let html = "<body><img src=n.png></body>";
+
+    let (_, sub) = load_page_with_resources(&fetcher, "https://page.test/index.html", html);
+    let document = nexty_html::parse_document(html, ParseOptions::default());
+    let page = pipeline::build_page(document, sub.stylesheets, sub.images);
+    let shaper = ParleyTextShaper::new();
+    let root = pipeline::layout_page(&page, &shaper, 400.0).expect("root");
+    let scene = pipeline::build_scene(&page, &root);
+
+    let drawn: Vec<_> = scene
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::DrawImage { rect, .. } => Some(*rect),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(drawn.len(), 1);
+    assert!(
+        approx(drawn[0].width, 3.0) && approx(drawn[0].height, 2.0),
+        "自然尺寸 3×2 从解码流入布局，实际 {:?}",
+        (drawn[0].width, drawn[0].height)
+    );
 }
