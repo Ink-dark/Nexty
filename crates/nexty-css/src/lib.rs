@@ -21,7 +21,7 @@ mod ua;
 mod value;
 
 pub use cascade::{ComputedStyle, Edges, cascade, compute_document_styles};
-pub use parser::{Declaration, StyleRule, Stylesheet, parse_inline_style};
+pub use parser::{Declaration, MediaViewport, StyleRule, Stylesheet, parse_inline_style};
 pub use selector::{SelectorError, matches_selector};
 pub use ua::html_ua_stylesheet;
 pub use value::{
