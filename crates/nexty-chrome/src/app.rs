@@ -1,0 +1,629 @@
+//! winit + wgpu 呈现：窗口、输入转译与 Pixmap 上屏。
+//!
+//! 本模块是无法在无头环境自动化测试的薄胶水层：窗口创建、surface 配置、
+//! 纹理上传与 blit 呈现。所有可测试逻辑（管线、渲染线程、UI 状态机）
+//! 都在其余模块并有单测覆盖。
+//!
+//! 呈现路径：页面 + 地址栏 → Scene → [`RenderThread`]（隔离线程 +
+//! `catch_unwind`）→ Pixmap → `wgpu` 纹理 → 全屏 `textureLoad` blit →
+//! surface present。像素 1:1 上屏，无缩放采样。
+
+use std::sync::Arc;
+
+use nexty_network::{Method, NetworkFetcher, ReqwestFetcher};
+use nexty_paint::{Pixmap, Scene, Size};
+use winit::application::ApplicationHandler;
+use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::keyboard::{Key, NamedKey};
+use winit::window::{Window, WindowId};
+
+use crate::pipeline::{self, Page};
+use crate::render::RenderThread;
+use crate::ui::{AddressBar, UiEvent};
+
+/// 应用错误。
+#[derive(Debug)]
+pub enum AppError {
+    /// 窗口或事件循环初始化失败。
+    Window(String),
+    /// GPU / surface 初始化失败。
+    Gpu(String),
+}
+
+impl std::fmt::Display for AppError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AppError::Window(message) => write!(f, "window error: {message}"),
+            AppError::Gpu(message) => write!(f, "gpu error: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for AppError {}
+
+/// 后台抓取完成后经事件代理送回的载荷。
+#[derive(Debug)]
+enum BackgroundEvent {
+    PageLoaded {
+        url: String,
+        result: Result<String, String>,
+    },
+}
+
+/// 启动浏览器窗口。阻塞直至窗口关闭。
+///
+/// # Errors
+///
+/// 事件循环或 GPU 初始化失败时返回 [`AppError`]。
+pub fn run() -> Result<(), AppError> {
+    let event_loop = EventLoop::<BackgroundEvent>::with_user_event()
+        .build()
+        .map_err(|error| AppError::Window(error.to_string()))?;
+    let proxy = event_loop.create_proxy();
+    let mut app = BrowserApp::new(proxy);
+    event_loop
+        .run_app(&mut app)
+        .map_err(|error| AppError::Window(error.to_string()))
+}
+
+/// wgpu 资源集合（surface + blit 管线）。
+struct Gpu {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    surface: wgpu::Surface<'static>,
+    surface_format: wgpu::TextureFormat,
+    bind_group_layout: wgpu::BindGroupLayout,
+    pipeline_rgba: wgpu::RenderPipeline,
+    pipeline_bgra: wgpu::RenderPipeline,
+    texture: Option<(wgpu::Texture, [u32; 2])>,
+}
+
+/// 浏览器应用状态。
+struct BrowserApp {
+    proxy: EventLoopProxy<BackgroundEvent>,
+    window: Option<Arc<Window>>,
+    gpu: Option<Gpu>,
+    renderer: Option<RenderThread>,
+    fetcher: Option<Arc<ReqwestFetcher>>,
+    shaper: nexty_text::ParleyTextShaper,
+    bar: AddressBar,
+    page: Option<Page>,
+    scene: Option<Scene>,
+    cursor: (f32, f32),
+}
+
+impl BrowserApp {
+    fn new(proxy: EventLoopProxy<BackgroundEvent>) -> Self {
+        Self {
+            proxy,
+            window: None,
+            gpu: None,
+            renderer: None,
+            fetcher: None,
+            shaper: nexty_text::ParleyTextShaper::new(),
+            bar: AddressBar::new("about:blank"),
+            page: None,
+            scene: None,
+            cursor: (0.0, 0.0),
+        }
+    }
+
+    /// 窗口创建后的初始化：GPU、渲染线程、默认页。
+    fn initialize(&mut self, window: Arc<Window>) {
+        let gpu = match Gpu::new(window.clone()) {
+            Ok(gpu) => gpu,
+            Err(message) => {
+                eprintln!("gpu init failed: {message}");
+                return;
+            }
+        };
+        self.gpu = Some(gpu);
+        self.renderer = Some(RenderThread::spawn(Arc::new(
+            nexty_paint::VelloCpuRasterizer::new(),
+        )));
+        self.fetcher = Some(Arc::new(ReqwestFetcher::new().expect("network fetcher")));
+        self.navigate("about:blank");
+        window.request_redraw();
+    }
+
+    /// 导航：立即更新地址栏并后台抓取。
+    fn navigate(&mut self, url: &str) {
+        self.bar.set_url(url.to_owned());
+        let Some(fetcher) = self.fetcher.clone() else {
+            return;
+        };
+        let Some(proxy) = Some(self.proxy.clone()) else {
+            return;
+        };
+        let url = url.to_owned();
+        let target = url.clone();
+        std::thread::Builder::new()
+            .name("nexty-fetch".to_owned())
+            .spawn(move || {
+                let request = nexty_network::Request {
+                    url: target.clone(),
+                    method: Method::Get,
+                };
+                let result = match fetcher.fetch(&request) {
+                    Ok(response) if (200..300).contains(&response.status) => {
+                        String::from_utf8(response.body).map_err(|error| error.to_string())
+                    }
+                    Ok(response) => Err(format!("HTTP {}", response.status)),
+                    Err(error) => Err(format!("{error:?}")),
+                };
+                let _ = proxy.send_event(BackgroundEvent::PageLoaded { url, result });
+            })
+            .expect("spawn fetch thread");
+    }
+
+    /// 抓取完成：重建页面与显示列表。
+    fn page_loaded(&mut self, url: String, result: Result<String, String>) {
+        match result {
+            Ok(html) => {
+                let page = pipeline::load_page(&html, "");
+                let viewport_width = self
+                    .window
+                    .as_ref()
+                    .map(|window| window.inner_size().width as f32)
+                    .unwrap_or(800.0);
+                let root = pipeline::layout_page(&page, &self.shaper, viewport_width);
+                self.scene = root.map(|root| pipeline::build_scene(&root));
+                self.page = Some(page);
+                self.bar.set_url(url);
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            Err(error) => {
+                eprintln!("load {url} failed: {error}");
+            }
+        }
+    }
+
+    /// 一帧：合成显示列表并渲染上屏。
+    fn redraw(&mut self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let Some(gpu) = &mut self.gpu else {
+            return;
+        };
+        let size = window.inner_size();
+        let viewport = Size {
+            width: size.width,
+            height: size.height,
+        };
+        if viewport.width == 0 || viewport.height == 0 {
+            return;
+        }
+
+        // 页面 + 地址栏合成显示列表
+        let mut scene = self.scene.clone().unwrap_or_default();
+        self.bar
+            .draw(&self.shaper, &mut scene, viewport.width as f32);
+
+        let Some(renderer) = &self.renderer else {
+            return;
+        };
+        match renderer.render(&scene, viewport) {
+            Ok(pixmap) => gpu.present(&pixmap, window),
+            Err(error) => {
+                // 渲染失败不拖垮主进程：清屏为灰色并上报
+                eprintln!("render failed: {error}");
+                gpu.clear(window, [0.6, 0.6, 0.6, 1.0]);
+            }
+        }
+    }
+}
+
+impl ApplicationHandler<BackgroundEvent> for BrowserApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+        let attributes = Window::default_attributes()
+            .with_title("Nexty")
+            .with_inner_size(winit::dpi::LogicalSize::new(960.0, 640.0));
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Arc::new(window),
+            Err(error) => {
+                eprintln!("window creation failed: {error}");
+                event_loop.exit();
+                return;
+            }
+        };
+        self.initialize(window);
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: BackgroundEvent) {
+        let BackgroundEvent::PageLoaded { url, result } = event;
+        self.page_loaded(url, result);
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        match event {
+            WindowEvent::Resized(size) => {
+                if let Some(gpu) = &mut self.gpu {
+                    gpu.resize(size.width, size.height);
+                }
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = (position.x as f32, position.y as f32);
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let (x, y) = self.cursor;
+                let _ = self.bar.handle(UiEvent::Click { x, y });
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if let Some(text) = &event.text {
+                    for character in text.chars() {
+                        let _ = self.bar.handle(UiEvent::Character(character));
+                    }
+                }
+                match event.logical_key {
+                    Key::Named(NamedKey::Backspace) => {
+                        let _ = self.bar.handle(UiEvent::Backspace);
+                    }
+                    Key::Named(NamedKey::Enter) => {
+                        let action = self.bar.handle(UiEvent::Submit);
+                        if let Some(url) = action.navigate {
+                            self.navigate(&url);
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Gpu {
+    /// 初始化 wgpu 资源并配置 surface。
+    fn new(window: Arc<Window>) -> Result<Self, String> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let surface = instance
+            .create_surface(window.clone())
+            .map_err(|error| error.to_string())?;
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::default(),
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+        }))
+        .map_err(|error| error.to_string())?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("nexty-device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::default(),
+            trace: wgpu::Trace::Off,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        }))
+        .map_err(|error| error.to_string())?;
+
+        let capabilities = surface.get_capabilities(&adapter);
+        // 优先 Rgba8Unorm（与 Pixmap 字节序一致），否则 Bgra8Unorm + 着色器换色
+        let surface_format = if capabilities
+            .formats
+            .contains(&wgpu::TextureFormat::Rgba8Unorm)
+        {
+            wgpu::TextureFormat::Rgba8Unorm
+        } else {
+            capabilities.formats[0]
+        };
+        let size = window.inner_size();
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: surface_format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &config);
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("nexty-blit"),
+            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+        });
+        let bind_group_layout = blit_bind_group_layout(&device);
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("nexty-blit-layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+        // 两个变体：直出 RGBA / 换色 BGRA
+        let make_pipeline = |entry: &'static str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("nexty-blit-pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipeline_rgba = make_pipeline("fs_main");
+        let pipeline_bgra = make_pipeline("fs_main_bgra");
+
+        Ok(Self {
+            device,
+            queue,
+            surface,
+            surface_format,
+            bind_group_layout,
+            pipeline_rgba,
+            pipeline_bgra,
+            texture: None,
+        })
+    }
+
+    /// 视口尺寸变化：重配 surface 并丢弃纹理。
+    fn resize(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: self.surface_format,
+            width,
+            height,
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        self.surface.configure(&self.device, &config);
+        self.texture = None;
+    }
+
+    /// 上传 Pixmap 并 blit 到 surface。
+    fn present(&mut self, pixmap: &Pixmap, _window: &Window) {
+        let [width, height] = [pixmap.size.width, pixmap.size.height];
+        if width == 0 || height == 0 {
+            return;
+        }
+        // 尺寸变化时重建纹理
+        let texture = match &self.texture {
+            Some((texture, size)) if *size == [width, height] => texture.clone(),
+            _ => {
+                let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("nexty-page"),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let texture_clone = texture.clone();
+                self.texture = Some((texture, [width, height]));
+                texture_clone
+            }
+        };
+        self.queue.write_texture(
+            texture.as_image_copy(),
+            &pixmap.data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * width),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = self
+            .device
+            .create_sampler(&wgpu::SamplerDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("nexty-blit-bind"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
+        // get_current_texture 返回枚举：成功/亚优取帧，其余跳帧
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            status @ (wgpu::CurrentSurfaceTexture::Timeout
+            | wgpu::CurrentSurfaceTexture::Occluded
+            | wgpu::CurrentSurfaceTexture::Outdated) => {
+                eprintln!("surface skipped: {status:?}");
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                eprintln!("surface acquire validation error");
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                eprintln!("surface lost");
+                return;
+            }
+        };
+        let frame_view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("nexty-frame"),
+            });
+        let pipeline = if self.surface_format == wgpu::TextureFormat::Bgra8Unorm {
+            &self.pipeline_bgra
+        } else {
+            &self.pipeline_rgba
+        };
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("nexty-present"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &frame_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations::default(),
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.queue.submit([encoder.finish()]);
+        frame.present();
+    }
+
+    /// 渲染失败时的兜底清屏。
+    fn clear(&mut self, _window: &Window, color: [f64; 4]) {
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            _ => return,
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("nexty-clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: color[0],
+                            g: color[1],
+                            b: color[2],
+                            a: color[3],
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        self.queue.submit([encoder.finish()]);
+        frame.present();
+    }
+}
+
+fn blit_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("nexty-blit-bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                count: None,
+            },
+        ],
+    })
+}
+
+/// 全屏三角形 + 像素直读 blit。`fs_main_bgra` 在 BGRA surface 上交换 R/B。
+const SHADER: &str = "
+@vertex
+fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -3.0),
+        vec2<f32>(-1.0, 1.0),
+        vec2<f32>(3.0, -1.0),
+    );
+    return vec4<f32>(positions[index], 0.0, 1.0);
+}
+
+@group(0) @binding(0) var page_texture: texture_2d<f32>;
+@group(0) @binding(1) var page_sampler: sampler;
+
+@fragment
+fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    let coords = vec2<i32>(position.xy);
+    return textureLoad(page_texture, coords, 0);
+}
+
+@fragment
+fn fs_main_bgra(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    let coords = vec2<i32>(position.xy);
+    let color = textureLoad(page_texture, coords, 0);
+    return vec4<f32>(color.b, color.g, color.r, color.a);
+}
+";
