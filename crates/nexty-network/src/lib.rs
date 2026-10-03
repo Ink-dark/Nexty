@@ -30,6 +30,10 @@ pub struct Request {
     pub url: String,
     /// 请求方法。
     pub method: Method,
+    /// 额外请求头（按给定顺序逐条应用；同名头由后端决定合并语义）。
+    ///
+    /// `Host`/`Content-Length` 等由后端管理的头不应出现在这里。
+    pub headers: Vec<(String, String)>,
 }
 
 /// 一次响应。
@@ -155,11 +159,11 @@ impl NetworkFetcher for ReqwestFetcher {
             Method::Get => reqwest::Method::GET,
             Method::Head => reqwest::Method::HEAD,
         };
-        let response = self
-            .client
-            .request(method, url)
-            .send()
-            .map_err(map_request_error)?;
+        let mut builder = self.client.request(method, url);
+        for (name, value) in &request.headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+        let response = builder.send().map_err(map_request_error)?;
 
         let status = response.status().as_u16();
         let headers = response
@@ -249,6 +253,7 @@ mod tests {
             .fetch(&Request {
                 url,
                 method: Method::Get,
+                headers: Vec::new(),
             })
             .expect("fetch");
 
@@ -287,6 +292,7 @@ mod tests {
             .fetch(&Request {
                 url: format!("http://127.0.0.1:{port}/"),
                 method: Method::Head,
+                headers: Vec::new(),
             })
             .expect("fetch");
 
@@ -299,12 +305,61 @@ mod tests {
         );
     }
 
+    /// 请求头按给定顺序到达服务端（服务端把目标请求头回显进响应体）。
+    #[test]
+    fn request_headers_reach_the_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0u8; 4096];
+            let read = stream.read(&mut buffer).expect("read");
+            let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+            let echo = |name: &str| {
+                request
+                    .lines()
+                    .skip(1) // 跳过请求行
+                    .take_while(|line| !line.is_empty())
+                    .find(|line| line.to_ascii_lowercase().starts_with(name))
+                    .map_or_else(String::new, ToString::to_string)
+            };
+            let body = format!("{}|{}", echo("x-nexty-marker"), echo("user-agent"));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+
+        let response = fetcher()
+            .fetch(&Request {
+                url: format!("http://127.0.0.1:{port}/"),
+                method: Method::Get,
+                headers: vec![("X-Nexty-Marker".to_owned(), "nexty-header-test".to_owned())],
+            })
+            .expect("fetch");
+
+        let body = String::from_utf8(response.body).expect("utf8");
+        assert!(
+            body.contains("x-nexty-marker: nexty-header-test"),
+            "自定义头未到达服务端: {body}"
+        );
+        assert!(
+            body.to_ascii_lowercase().starts_with("x-nexty-marker"),
+            "请求头顺序应保留: {body}"
+        );
+        server.join().expect("server thread");
+    }
+
     #[test]
     fn invalid_url_maps_to_invalid_url() {
         let error = fetcher()
             .fetch(&Request {
                 url: "not a url".to_owned(),
                 method: Method::Get,
+                headers: Vec::new(),
             })
             .expect_err("invalid url");
         assert_eq!(error, NetworkError::InvalidUrl);
@@ -314,6 +369,7 @@ mod tests {
             .fetch(&Request {
                 url: "ftp://example.test/file".to_owned(),
                 method: Method::Get,
+                headers: Vec::new(),
             })
             .expect_err("unsupported scheme");
         assert_eq!(error, NetworkError::InvalidUrl);
@@ -412,6 +468,7 @@ mod tests {
             .fetch(&Request {
                 url: format!("http://127.0.0.1:{port}/"),
                 method: Method::Get,
+                headers: Vec::new(),
             })
             .expect_err("connection refused");
         assert_eq!(error, NetworkError::Transport);
@@ -426,6 +483,7 @@ mod tests {
             .fetch(&Request {
                 url,
                 method: Method::Get,
+                headers: Vec::new(),
             })
             .expect_err("timeout");
         assert_eq!(error, NetworkError::Timeout);
@@ -441,6 +499,7 @@ mod tests {
                 .fetch(&Request {
                     url: "not a url".to_owned(),
                     method: Method::Get,
+                    headers: Vec::new(),
                 })
                 .is_err()
         );
