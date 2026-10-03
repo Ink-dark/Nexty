@@ -165,18 +165,20 @@ fn emit(
         draw_image_at(
             page,
             fragment.node,
-            content_x,
-            content_y,
-            width
-                - fragment.border.left
-                - fragment.border.right
-                - fragment.padding.left
-                - fragment.padding.right,
-            height
-                - fragment.border.top
-                - fragment.border.bottom
-                - fragment.padding.top
-                - fragment.padding.bottom,
+            PaintRect {
+                x: content_x,
+                y: content_y,
+                width: width
+                    - fragment.border.left
+                    - fragment.border.right
+                    - fragment.padding.left
+                    - fragment.padding.right,
+                height: height
+                    - fragment.border.top
+                    - fragment.border.bottom
+                    - fragment.padding.top
+                    - fragment.padding.bottom,
+            },
             scene,
             pool,
         );
@@ -209,13 +211,20 @@ fn emit(
             draw_image_at(
                 page,
                 image.node,
-                content_x + image.x,
-                content_y + image.y,
-                image.width,
-                image.height,
+                PaintRect {
+                    x: content_x + image.x,
+                    y: content_y + image.y,
+                    width: image.width,
+                    height: image.height,
+                },
                 scene,
                 pool,
             );
+        }
+        // 行内原子盒（inline-block 等）：完整子片段树，x/y 已相对本片段
+        // 内容盒定位，按子片段原样递归
+        for atomic in &line.boxes {
+            emit(page, atomic, content_x, content_y, scene, pool);
         }
     }
 
@@ -238,10 +247,7 @@ fn is_image_node(document: &Document, node: NodeId) -> bool {
 fn draw_image_at(
     page: &Page,
     node: NodeId,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     scene: &mut Scene,
     pool: &mut HashMap<NodeId, usize>,
 ) {
@@ -258,15 +264,9 @@ fn draw_image_at(
             index
         }
     };
-    scene.commands.push(Command::DrawImage {
-        rect: PaintRect {
-            x,
-            y,
-            width,
-            height,
-        },
-        image: index,
-    });
+    scene
+        .commands
+        .push(Command::DrawImage { rect, image: index });
 }
 
 fn push_strip(scene: &mut Scene, x: f32, y: f32, width: f32, height: f32, color: Rgba) {

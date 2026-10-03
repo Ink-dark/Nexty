@@ -116,6 +116,39 @@ fn anonymous_fragments_draw_no_background_or_border() {
     assert!(text_count >= 2, "两段文本各自成行");
 }
 
+/// T8：行内原子盒（inline-block）的内容进入显示列表——背景与内部文本。
+#[test]
+fn inline_block_content_is_emitted_into_scene() {
+    let page = pipeline::load_page(
+        "<body>out <span style=\"display: inline-block; width: 80px; height: 30px; background-color: rgb(0 200 0)\">in</span></body>",
+        "",
+    );
+    let shaper = ParleyTextShaper::new();
+    let root = pipeline::layout_page(&page, &shaper, 400.0).expect("root");
+    let scene = pipeline::build_scene(&page, &root);
+
+    let green: Vec<_> = scene
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::FillRect { rect, color } => Some((*rect, *color)),
+            _ => None,
+        })
+        .filter(|(_, color)| *color == Color::opaque(0, 200, 0))
+        .collect();
+    assert_eq!(green.len(), 1, "inline-block 背景下发");
+    let (rect, _) = green[0];
+    assert!(approx(rect.width, 80.0));
+    assert!(approx(rect.height, 30.0));
+    // 原子盒内部文本也在场景里：外层 out 与盒内 in 各一段 run
+    let text_count = scene
+        .commands
+        .iter()
+        .filter(|command| matches!(command, Command::DrawText { .. }))
+        .count();
+    assert_eq!(text_count, 2, "out 与 in 分别下发");
+}
+
 #[test]
 fn render_thread_round_trips() {
     let thread = RenderThread::spawn(Arc::new(nexty_paint::VelloCpuRasterizer::new()));
@@ -220,7 +253,7 @@ fn viewport_alias_and_helpers() {
 // ---- T5：子资源抓取与页面重组（无头端到端） ----
 
 use nexty_chrome::resources::{self, Subresources};
-use nexty_dom::{Document, NodeId};
+use nexty_dom::Document;
 use nexty_html::ParseOptions;
 use nexty_network::{NetworkError, NetworkFetcher, Request, Response};
 use std::collections::BTreeMap;
