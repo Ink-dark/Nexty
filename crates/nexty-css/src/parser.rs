@@ -166,7 +166,7 @@ impl<'i> AtRuleParser<'i> for StylesheetRuleParser {
         input: &mut Parser<'i>,
     ) -> Result<Self::Prelude, ParseError<Self::Error>> {
         if name.eq_ignore_ascii_case("media") {
-            parse_media_query(input).ok_or_else(|| ParseError::<()>::unexpected_token())
+            parse_media_query(input).ok_or_else(ParseError::<()>::unexpected_token)
         } else {
             Err(ParseError::unexpected_token())
         }

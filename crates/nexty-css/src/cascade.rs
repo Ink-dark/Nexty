@@ -65,6 +65,10 @@ pub struct ComputedStyle {
     pub box_sizing: BoxSizingValue,
     /// `overflow`（CSS Overflow 3 §3；仅裁剪标记，裁剪未实现）。
     pub overflow: OverflowValue,
+    /// `flex-grow`（CSS Flexbox §7.1，initial 0）。
+    pub flex_grow: f32,
+    /// `flex-basis`（CSS Flexbox §7.2，initial auto）。
+    pub flex_basis: SizeValue,
     /// 四边 margin（百分比与 auto 由 layout 解析）。
     pub margin: Edges<MarginValue>,
     /// 四边 padding（百分比由 layout 解析）。
@@ -129,6 +133,8 @@ impl ComputedStyle {
             max_height: SizeValue::Auto,
             box_sizing: BoxSizingValue::ContentBox,
             overflow: OverflowValue::Visible,
+            flex_grow: 0.0,
+            flex_basis: SizeValue::Auto,
             margin: Edges::splat(MarginValue::Length(0.0)),
             padding: Edges::splat(PaddingValue::Length(0.0)),
             border_width: Edges::splat(0.0),
@@ -160,7 +166,7 @@ impl PropertyId {
 /// 顺序承载计算依赖：`FontSize` 先于 `LineHeight`（百分比按自身字号折算）、
 /// `Color` 先于 border 颜色（currentcolor）、border style 先于 width
 /// （none/hidden 时宽度归零）。
-const PROPERTY_ORDER: [PropertyId; 37] = [
+const PROPERTY_ORDER: [PropertyId; 39] = [
     PropertyId::Display,
     PropertyId::Color,
     PropertyId::BackgroundColor,
@@ -178,6 +184,8 @@ const PROPERTY_ORDER: [PropertyId; 37] = [
     PropertyId::MaxHeight,
     PropertyId::BoxSizing,
     PropertyId::Overflow,
+    PropertyId::FlexGrow,
+    PropertyId::FlexBasis,
     PropertyId::MarginTop,
     PropertyId::MarginRight,
     PropertyId::MarginBottom,
@@ -528,6 +536,12 @@ fn resolve_all(
             (PropertyId::Overflow, Decision::Use(PropertyValue::Overflow(value))) => {
                 style.overflow = *value;
             }
+            (PropertyId::FlexGrow, Decision::Use(PropertyValue::FlexGrow(value))) => {
+                style.flex_grow = *value;
+            }
+            (PropertyId::FlexBasis, Decision::Use(PropertyValue::FlexBasis(value))) => {
+                style.flex_basis = *value;
+            }
             (PropertyId::MarginTop, Decision::Use(PropertyValue::Margin(value))) => {
                 style.margin.top = *value;
             }
@@ -612,6 +626,8 @@ fn resolve_all(
                     PropertyId::MaxHeight => style.max_height = source.max_height,
                     PropertyId::BoxSizing => style.box_sizing = source.box_sizing,
                     PropertyId::Overflow => style.overflow = source.overflow,
+                    PropertyId::FlexGrow => style.flex_grow = source.flex_grow,
+                    PropertyId::FlexBasis => style.flex_basis = source.flex_basis,
                     PropertyId::MarginTop => style.margin.top = source.margin.top,
                     PropertyId::MarginRight => style.margin.right = source.margin.right,
                     PropertyId::MarginBottom => style.margin.bottom = source.margin.bottom,

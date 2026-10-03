@@ -91,6 +91,10 @@ pub enum PropertyId {
     BoxSizing,
     /// `overflow`。
     Overflow,
+    /// `flex-grow`。
+    FlexGrow,
+    /// `flex-basis`。
+    FlexBasis,
     /// `margin-top`。
     MarginTop,
     /// `margin-right`。
@@ -155,6 +159,8 @@ impl PropertyId {
             PropertyId::MaxHeight => "max-height",
             PropertyId::BoxSizing => "box-sizing",
             PropertyId::Overflow => "overflow",
+            PropertyId::FlexGrow => "flex-grow",
+            PropertyId::FlexBasis => "flex-basis",
             PropertyId::MarginTop => "margin-top",
             PropertyId::MarginRight => "margin-right",
             PropertyId::MarginBottom => "margin-bottom",
@@ -182,7 +188,7 @@ impl PropertyId {
     /// （CSS Syntax：声明名匹配大小写不敏感）。
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
-        const ALL: [PropertyId; 37] = [
+        const ALL: [PropertyId; 39] = [
             PropertyId::Display,
             PropertyId::Color,
             PropertyId::BackgroundColor,
@@ -200,6 +206,8 @@ impl PropertyId {
             PropertyId::MaxHeight,
             PropertyId::BoxSizing,
             PropertyId::Overflow,
+            PropertyId::FlexGrow,
+            PropertyId::FlexBasis,
             PropertyId::MarginTop,
             PropertyId::MarginRight,
             PropertyId::MarginBottom,
@@ -280,6 +288,10 @@ pub enum PropertyValue {
     BoxSizing(BoxSizingValue),
     /// `overflow` 关键字。
     Overflow(OverflowValue),
+    /// `flex-grow` 数值。
+    FlexGrow(f32),
+    /// `flex-basis` 值（auto | <length-percentage>）。
+    FlexBasis(SizeValue),
     /// margin 值（四边共用）。
     Margin(MarginValue),
     /// padding 值（四边共用）。
@@ -685,6 +697,8 @@ fn parse_property_value(property: PropertyId, input: &mut Parser<'_>) -> Result<
         | PropertyId::MaxHeight => parse_size(input).map(PropertyValue::Size),
         PropertyId::BoxSizing => parse_box_sizing(input).map(PropertyValue::BoxSizing),
         PropertyId::Overflow => parse_overflow(input).map(PropertyValue::Overflow),
+        PropertyId::FlexGrow => parse_flex_grow(input).map(PropertyValue::FlexGrow),
+        PropertyId::FlexBasis => parse_size(input).map(PropertyValue::FlexBasis),
         PropertyId::MarginTop
         | PropertyId::MarginRight
         | PropertyId::MarginBottom
@@ -768,6 +782,14 @@ fn parse_overflow(input: &mut Parser<'_>) -> Result<OverflowValue, ()> {
     match input.next().map_err(|_| ())? {
         Token::Ident(name) if name.eq_ignore_ascii_case("visible") => Ok(OverflowValue::Visible),
         Token::Ident(name) if name.eq_ignore_ascii_case("hidden") => Ok(OverflowValue::Hidden),
+        _ => Err(()),
+    }
+}
+
+/// `flex-grow`：<number [0,∞]>（CSS Flexbox §7.1；负数非法）。
+fn parse_flex_grow(input: &mut Parser<'_>) -> Result<f32, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Number { value, .. } if *value >= 0.0 => Ok(*value),
         _ => Err(()),
     }
 }
@@ -1932,6 +1954,42 @@ mod tests {
             PropertyValue::FontStyle(FontStyleValue::Oblique(Some(30.0)))
         );
         parse_err(PropertyId::FontStyle, "oblique 30px");
+    }
+
+    #[test]
+    fn flex_property_forms() {
+        // flex-grow：<number [0,∞]>（CSS Flexbox §7.1）
+        assert_eq!(
+            parse_one(PropertyId::FlexGrow, "2.5"),
+            PropertyValue::FlexGrow(2.5)
+        );
+        assert_eq!(
+            parse_one(PropertyId::FlexGrow, "0"),
+            PropertyValue::FlexGrow(0.0)
+        );
+        parse_err(PropertyId::FlexGrow, "-1");
+        parse_err(PropertyId::FlexGrow, "auto");
+        parse_err(PropertyId::FlexGrow, "1 2");
+
+        // flex-basis：auto | <length-percentage>（CSS Flexbox §7.2）
+        assert_eq!(
+            parse_one(PropertyId::FlexBasis, "auto"),
+            PropertyValue::FlexBasis(SizeValue::Auto)
+        );
+        assert_eq!(
+            parse_one(PropertyId::FlexBasis, "0"),
+            PropertyValue::FlexBasis(SizeValue::Length(0.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::FlexBasis, "100px"),
+            PropertyValue::FlexBasis(SizeValue::Length(100.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::FlexBasis, "50%"),
+            PropertyValue::FlexBasis(SizeValue::Percent(0.5))
+        );
+        parse_err(PropertyId::FlexBasis, "-5px");
+        parse_err(PropertyId::FlexBasis, "content");
     }
 
     #[test]
