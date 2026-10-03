@@ -116,6 +116,37 @@ fn anonymous_fragments_draw_no_background_or_border() {
     assert!(text_count >= 2, "两段文本各自成行");
 }
 
+/// T0 回归：折行段落的每行 baseline 必须按行高递增（此前所有行画在同一
+/// baseline 上，第二行起与首行重叠）。
+#[test]
+fn multiline_baselines_advance_by_line_height() {
+    let text = "aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp qqq rrr sss ttt";
+    let page = pipeline::load_page(&format!("<p>{text}</p>"), "");
+    let shaper = ParleyTextShaper::new();
+    let root = pipeline::layout_page(&page, &shaper, 300.0).expect("root");
+    let scene = pipeline::build_scene(&page, &root);
+
+    let mut baselines: Vec<f32> = scene
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::DrawText { baseline, .. } => Some(*baseline),
+            _ => None,
+        })
+        .collect();
+    baselines.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+    assert!(
+        baselines.len() >= 2,
+        "该文本在 300px 视口下应折成多行"
+    );
+    for pair in baselines.windows(2) {
+        assert!(
+            pair[1] > pair[0],
+            "相邻两行 baseline 相同（{pair:?}）→ 行重叠"
+        );
+    }
+}
+
 /// T8：行内原子盒（inline-block）的内容进入显示列表——背景与内部文本。
 #[test]
 fn inline_block_content_is_emitted_into_scene() {

@@ -1,104 +1,94 @@
-# goal.md — 本轮任务：子资源加载；补齐现代排版最小集
+# goal.md — 本轮任务：Chrome 窗口层补全；网络接驳准备
 
-日期：2026-10-02。前置：八层已落地并端到端连通（network→html→dom→css→
-layout→paint→chrome），WPT tree-construction 1854/1959。
+日期：2026-10-03。前置：上轮 T1–T8 完成（子资源加载、低成本 CSS、@media、
+inline-block/单行 flex），文档与子资源已在 app 后台线程经 `ReqwestFetcher`
+真实抓取。旧 goal 归档于
+[docs/plans/2026-10-02-round-subresources-css-flex.md](docs/plans/2026-10-02-round-subresources-css-flex.md)。
 
-## 本轮为什么先做这些
+## 本轮为什么做这些
 
-评估「距离可打开无 JS 网页」后的结论：八层连通已不是瓶颈，**真实页面打不开**
-才是瓶颈。两个硬约束决定优先级：
-
-1. **`img` / `link` / `script` 零实现** —— 现在打开任何真实网页连一个 logo 都
-   出不来，`<link rel=stylesheet>` 的外链 CSS 也不会被应用。这是「能不能用」
-   的直接门槛，收益高于任何布局特性。
-2. **CSS 属性只覆盖约 30 个**（`PropertyId` 枚举到 border 系列为止，无
-   `box-sizing` / `float` / `position` / `overflow`），且失效方式最糟的不是
-   「算错」而是「跳过」：`@media` 整块跳过、`var()` 不求值。
-
-故本轮顺序为：**子资源加载 → 低成本高收益 CSS → flex 单行**。GPU 光栅
-（vello_hybrid）与 paint 指令集扩展（圆角/渐变）本轮降级——它们对「能打开
-网页」零贡献，CPU 光栅在 1080p 下够用。
+网络能拉回页面，但窗口层没有配套能力：页面高于视口就看不到下方内容
+（无滚动）、链接点不了（无命中测试）、没有后退/前进/刷新、加载中无反馈、
+多行文本还画在同一个 baseline 上（下探时发现的渲染 bug）。这些是「真实
+网页能逛起来」的直接门槛。网络层 trait 与 reqwest 实现已就位，缺的是
+接驳缝：可替换 fetcher、请求头（User-Agent）、超时、加载状态出口。
 
 ## 任务清单与退出条件
 
-### T1 nexty-network：相对 URL 解析（0.1.2）
-- 新增 `NetworkFetcher::resolve(base: &str, target: &str) -> Result<String, NetworkError>`
-  （或等价 API）：以文档 URL 为 base 解析相对路径，供 chrome 层拼子资源地址。
-- 退出条件：回环测试——相对 URL（`/a.png`、`./b.css`、`../c.js`、带 query/
-  fragment）解析为绝对 URL；跨协议相对路径（base=http、target=//host/x）
-  正确取协议；非法 base → `InvalidUrl`。
+### T0 nexty-chrome：多行文本 baseline 重叠（渲染 bug）
+- `pipeline::emit` 逐行累加行偏移：文本 baseline、行内图片与行内原子盒
+  的 y 都要加「前面行高之和」；`LineFragment` 坐标保持行内局部系不变。
+- 退出条件：先写 failing test（折行段落的各 DrawText baseline 严格递增）
+  看它 fail → 修 → pass；单行内容回归不破坏。
 
-### T2 nexty-paint：DrawImage 指令（0.1.2）
-- `Command::DrawImage`：图像矩形 + 像素来源 + 缩放模式（先只做 1:1 整数缩放，
-  不引入插值）；图像解码**不做在 paint**——paint 只消费已解码的 RGBA8。
-- 退出条件：像素级单测——DrawImage 落点正确；越界裁剪；未覆盖区仍透明。
+### T1 nexty-chrome/ui：地址栏工具带（样式 + 状态机）
+- 布局改为：左侧 后退/前进/刷新 三按钮（等宽方块，字形 DrawText，整形
+  失败降级不画字形），右侧输入框（现有样式迁移）；输入区不再占满整条。
+- `UiAction` 扩展工具命令（back/forward/reload）；按钮按可用标志禁用
+  灰显，禁用点击无动作。
+- 加载状态：`set_loading(bool)`，加载中在地址栏下缘画强调色进度条
+  （静态，无动画）。
+- 退出条件：单测——按钮命中区产生对应命令；禁用态无命令；loading 条按
+  状态绘制；输入框新几何下聚焦/输入/提交回归不破坏。
 
-### T3 nexty-network + paint：图片解码归属（0.1.2）
-- 决策：**解码器不进 paint，也不进 network**（network 只管字节传输）。新增
-  facade 内的最小解码路径，或作为 `nexty-paint` 的可选 feature。
-- 退出条件：能解码 PNG（回环服务返回构造的 PNG 字节）→ RGBA8；不支持格式
-  （如 GIF/WebP 首版）返回明确错误而非 panic。
+### T2 nexty-chrome：会话历史栈
+- 新增 `History`：push（新导航清空前进栈）、go_back/go_forward（返回
+  URL 并交换栈位）、current、can_back/can_forward。
+- app 接线：导航入栈；T1 按钮触发后退/前进/刷新；后退/前进把地址栏
+  可用标志与滚动位置归零。
+- 退出条件：History 单测覆盖 push/back/forward/新导航清前进栈/空栈边界；
+  app 接线实机验收（无头不可测，模块文档注明）。
 
-### T4 nexty-html + css：外链样式表接入（0.1.3）
-- `nexty-html`：`<link rel=stylesheet>` 与 `<style>` 收集为资源清单（不解析）。
-- `nexty-css`：`Stylesheet` 支持多张表合并级联（当前 `compute_document_styles`
-  已接受 `&[&sheet]`，需验证多表与顺序即优先级）。
-- 退出条件：无头测试——`<style>` + 外链 CSS 同时存在时，作者样式按源顺序
-  级联，后者覆盖前者；外链失败不阻塞页面渲染。
+### T3 nexty-chrome/app：页面滚动与滚动条
+- 滚动状态：scroll_y ∈ [0, max]，max = 内容高 + BAR_HEIGHT − 视口高
+  （下限 0）；新页面加载归零，resize 重排后保留并重新 clamp。
+- 输入：滚轮（LineDelta/PixelDelta 均支持）；地址栏未聚焦时
+  PageUp/PageDown/Home/End/↑/↓。
+- 合成：每帧按 `origin_y = BAR_HEIGHT − scroll_y` 重建页面显示列表
+  （复用 `build_scene_at`）；页面溢出时右侧绘制滚动条轨道 + thumb
+  （纯几何函数，thumb 最小高度下限）。
+- resize 触发按当前视口宽重排（复用 set_page）。
+- 退出条件：max/clamp 与 thumb 几何单测（零溢出、半溢出、超长文档、
+  thumb 下限）；实机验收滚轮/按键/滚动条指示。
 
-### T5 chrome：子资源抓取与页面重组（0.1.2）
-- `app.rs`：文档加载后解析出子资源清单（CSS + 图片），**并发**抓取后重组
-  页面再布局（复用 `set_page`）；图片按 `DrawImage` 下发。
-- 退出条件：无头集成测试——构造含外链 CSS + 图片的页面，产出预期
-  `Scene` 指令序列；单个子资源失败不影响其余渲染（降级而非白屏）。
+### T4 nexty-chrome/pipeline：链接命中测试与点击导航
+- `hit_test(root, point) -> Option<NodeId>`：块级/原子盒 border_box、
+  行盒文本 run（字形 x 范围 + 行纵向范围）、图片 run 递归命中，取最深。
+- `link_target(page, node) -> Option<String>`：DOM parent 链找最近
+  `<a href>` 祖先，返回 href 原文；相对 href 由调用方经
+  `nexty_network::resolve` 归一。
+- app：地址栏区域外的点击换算页面坐标（含 scroll）→ hit test →
+  link_target → resolve → 导航。
+- 退出条件：单测——命中行内链接文本、块级链接、图片链接、行内原子盒；
+  点空白返回 None；`<a>` 无 href 不产生目标；相对 href 解析为绝对 URL。
 
-### T6 nexty-css：低成本高收益属性（0.1.4）
-- `box-sizing`（`content-box` / `border-box`，影响 width/height/margin/padding
-  解析）、`overflow`（先只做 `visible` / `hidden` 的裁剪标记）、`min-width` /
-  `min-height` / `max-width` / `max-height`。
-- 退出条件：单测——`box-sizing: border-box` 下 width 含 padding+border；
-  `max-width` 收窄盒宽；UA 默认 `content-box` 不回归既有布局测试。
+### T5 nexty-network + chrome：网络接驳准备
+- `Request` 增加 `headers: Vec<(String, String)>`（默认空；reqwest 实现逐
+  条应用到请求；回环测试验证到达）。
+- app 侧：fetcher 字段改为 `Arc<dyn NetworkFetcher>`（接驳缝，网络层可
+  整体替换）；启动用 `with_timeout(30s)`；导航请求带 User-Agent。
+- 加载反馈接线：navigate → loading=true，PageLoaded → loading=false；
+  `document_title` helper → 窗口标题；错误页加内联样式（可读排版）。
+- 退出条件：network 回环单测——请求头到达服务端、既有错误路径回归；
+  document_title 单测（有/无 title）；实机验收真实站点（UA/超时/错误页/
+  标题）。
 
-### T7 nexty-css：`@media` 求值（0.1.5）
-- 从「整块跳过」改为按视口宽度求值：`Stylesheet::parse_with_context` 接受视口
-  条件；cascade 按匹配结果决定该规则是否参与。
-- 退出条件：单测——窄视口命中 `max-width` 分支、宽视口命中 `min-width` 分支、
-  不匹配的规则不参与级联；UA 样式表不受影响。
-
-### T8 nexty-layout：inline-block 与 flex 单行（0.1.2）
-- `inline-block`：按 shrink-to-fit 定宽，参与行内行盒（当前按 inline 处理）。
-- flex **只做单行 `flex-direction: row`**：`display: flex` 容器内子项按
-  `flex-grow` / `flex-basis` 分配主轴尺寸，交叉轴对齐先只支持 `stretch`。
-- 退出条件：单测——inline-block 不再被拆行；单行 flex 三项等分 / 按 grow
-  比例分配；容器不换行；未指定 display 的元素行为不变（不回归）。
-
-### T9 门禁与收尾
-- `cargo check --workspace` 零 warning；`cargo test --workspace` 全绿；
-  clippy `-D warnings` 零告警；`cargo fmt --all -- --check` 通过。
-- 新增依赖（图片解码极可能引入，如 `png`）→ `cargo deny check` + `cargo about`
-  重跑，许可证须在白名单内。
-- AGENTS.md「当前状态」与各模块偏差清单同步更新（尤其 layout / css 的
-  「未实现」条目逐条收敛）。
+### T6 门禁与收尾
+- cargo check --workspace 零 warning；cargo test --workspace 全绿；
+  clippy -D warnings 零告警；cargo fmt 通过。
+- AGENTS.md「当前状态」与 chrome 模块偏差清单同步（无头不可测项注明
+  实机验收）。
 - 分任务 commit，最终 push。
 
 ## 非目标（本轮不做）
-- **GPU 加速光栅（vello_hybrid）**——对「能打开网页」零贡献，降级到后续轮次
-- paint 圆角 / 渐变 / 阴影 / 变换
-- grid 布局、多行 flex、`float`、绝对定位
-- `var()` 自定义属性求值（自定义属性收集先只存不发）
-- JS 运行时、DOM 事件与绑定、表单提交
-- 页面滚动、链接点击、后退/前进历史、多标签
-- winit/wgpu 胶水的自动化测试（无头环境不可行，见上轮 T6 备注）
-
-## 里程碑与顺序
-
-- **M1（本轮前半）**：T1～T5 —— 能打开带外链 CSS 与图片的真实静态页面
-- **M2（本轮后半）**：T6～T8 —— 现代页面排版基本正确
-
-M1 是首个可用里程碑，达成后应立即实机打开若干真实站点验收（用户侧），
-用真实页面反馈驱动 M2，而不是在合成测试页上调数值。
+- 多标签页、下载、右键菜单、文本选择、表单交互
+- 滚动条拖拽（本轮滚动条仅指示不可拖）、平滑滚动/滚动动画
+- vello_hybrid GPU 光栅、paint 圆角/渐变/阴影
+- JS 运行时、cookie/缓存层、HTTP/2 以上特性调优
+- 触摸/手势输入、DPI 缩放策略（仍按物理像素 1:1）
 
 ## 验证流（AGENTS.md Verification Flow）
 每层：cargo check 零 warning → cargo test 全绿 → fmt/clippy → commit。
-管线端到端以无头像素断言替代 WPT 比对；app 模块的 GPU 胶水仍不可无头测试，
-实机验收列为用户侧待办并在模块文档注明。
+app 胶水（滚轮/键盘路由/窗口标题/实机网络）无头不可测：纯逻辑
+（UI 状态机、History、滚动几何、命中测试、title 提取）进单测，其余列为
+实机验收待办并在模块文档注明。

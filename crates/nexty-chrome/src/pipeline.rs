@@ -184,8 +184,12 @@ fn emit(
         );
     }
 
+    // 行盒纵向堆叠：LineFragment 内坐标是行内局部系（baseline、图片/原子盒
+    // 的 y 相对行顶），绘制前累加前面各行高
+    let mut line_offset = 0.0_f32;
     for line in &fragment.lines {
-        let baseline = content_y + line.baseline;
+        let line_y = content_y + line_offset;
+        let baseline = line_y + line.baseline;
         for run in &line.runs {
             if run.glyphs.is_empty() {
                 continue;
@@ -213,7 +217,7 @@ fn emit(
                 image.node,
                 PaintRect {
                     x: content_x + image.x,
-                    y: content_y + image.y,
+                    y: line_y + image.y,
                     width: image.width,
                     height: image.height,
                 },
@@ -221,11 +225,12 @@ fn emit(
                 pool,
             );
         }
-        // 行内原子盒（inline-block 等）：完整子片段树，x/y 已相对本片段
-        // 内容盒定位，按子片段原样递归
+        // 行内原子盒（inline-block 等）：完整子片段树，x/y 已相对行顶定位，
+        // 按子片段递归（原点 = 本行顶）
         for atomic in &line.boxes {
-            emit(page, atomic, content_x, content_y, scene, pool);
+            emit(page, atomic, content_x, line_y, scene, pool);
         }
+        line_offset += line.height;
     }
 
     for child in &fragment.children {
