@@ -18,9 +18,10 @@ use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
+use crate::history::History;
 use crate::pipeline::{self, Page};
 use crate::render::RenderThread;
-use crate::ui::{AddressBar, BAR_HEIGHT, UiEvent};
+use crate::ui::{AddressBar, BAR_HEIGHT, BarCommand, UiEvent};
 
 /// 应用错误。
 #[derive(Debug)]
@@ -89,6 +90,9 @@ struct BrowserApp {
     fetcher: Option<Arc<ReqwestFetcher>>,
     shaper: nexty_text::ParleyTextShaper,
     bar: AddressBar,
+    history: History,
+    /// Alt 修饰键按住状态（后退/前进快捷键）。
+    alt_down: bool,
     page: Option<Page>,
     scene: Option<Scene>,
     cursor: (f32, f32),
@@ -104,6 +108,8 @@ impl BrowserApp {
             fetcher: None,
             shaper: nexty_text::ParleyTextShaper::new(),
             bar: AddressBar::new("about:blank"),
+            history: History::new("about:blank"),
+            alt_down: false,
             page: None,
             scene: None,
             cursor: (0.0, 0.0),
@@ -155,9 +161,44 @@ impl BrowserApp {
         }
     }
 
-    /// 导航：立即更新地址栏并后台抓取。
+    /// 导航：入历史栈并加载。
     fn navigate(&mut self, url: &str) {
+        self.history.push(url.to_owned());
+        self.sync_history_flags();
+        self.load(url);
+    }
+
+    /// 后退/前进（历史栈搬运后按目标 URL 加载，不再入栈）。
+    fn go_back(&mut self) {
+        if let Some(url) = self.history.go_back() {
+            self.sync_history_flags();
+            self.load(&url);
+        }
+    }
+
+    fn go_forward(&mut self) {
+        if let Some(url) = self.history.go_forward() {
+            self.sync_history_flags();
+            self.load(&url);
+        }
+    }
+
+    /// 刷新：重载当前条目，不产生新历史。
+    fn reload(&mut self) {
+        let url = self.history.current().to_owned();
+        self.load(&url);
+    }
+
+    /// 把历史栈可用性同步到工具带按钮。
+    fn sync_history_flags(&mut self) {
+        self.bar
+            .set_history(self.history.can_back(), self.history.can_forward());
+    }
+
+    /// 加载：更新地址栏并后台抓取（不改历史栈）。
+    fn load(&mut self, url: &str) {
         self.bar.set_url(url.to_owned());
+        self.bar.set_loading(true);
 
         // 内部 scheme（about:blank 等）不由网络抓取，直接生成本地空白页。
         // 交给 NetworkFetcher 会被协议白名单判为 InvalidUrl，白屏。
@@ -218,6 +259,7 @@ impl BrowserApp {
 
     /// 抓取完成：重建页面与显示列表。
     fn page_loaded(&mut self, url: String, result: Result<Page, String>) {
+        self.bar.set_loading(false);
         match result {
             Ok(page) => {
                 self.set_page(page);
@@ -333,12 +375,45 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
                 ..
             } => {
                 let (x, y) = self.cursor;
-                let _ = self.bar.handle(UiEvent::Click { x, y });
+                let action = self.bar.handle(UiEvent::Click { x, y });
+                match action.command {
+                    Some(BarCommand::Back) => self.go_back(),
+                    Some(BarCommand::Forward) => self.go_forward(),
+                    Some(BarCommand::Reload) => self.reload(),
+                    None => {
+                        if let Some(url) = action.navigate {
+                            self.navigate(&url);
+                        }
+                    }
+                }
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
             }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.alt_down = modifiers.state().alt_key();
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                // Alt+方向键：后退/前进（优先于地址栏输入路由）
+                if self.alt_down {
+                    match event.logical_key {
+                        Key::Named(NamedKey::ArrowLeft) => {
+                            self.go_back();
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowRight) => {
+                            self.go_forward();
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 if let Some(text) = &event.text {
                     for character in text.chars() {
                         let _ = self.bar.handle(UiEvent::Character(character));
