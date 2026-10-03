@@ -240,6 +240,26 @@ impl BrowserApp {
         window.request_redraw();
     }
 
+    /// 页面区域点击：命中测试 → 最近 `<a href>` → 相对地址归一 → 导航。
+    ///
+    /// 未命中链接（点空白/非锚元素）时不动。
+    fn open_link_at(&mut self, x: f32, y: f32) {
+        let page_y = y - BAR_HEIGHT + self.scroll_y;
+        let target = self
+            .root
+            .as_ref()
+            .and_then(|root| pipeline::hit_test(root, x, page_y))
+            .and_then(|node| {
+                self.page
+                    .as_ref()
+                    .and_then(|page| pipeline::link_target(page, node))
+            })
+            .and_then(|href| nexty_network::resolve(self.history.current(), &href).ok());
+        if let Some(url) = target {
+            self.navigate(&url);
+        }
+    }
+
     /// 导航：入历史栈并加载。
     fn navigate(&mut self, url: &str) {
         self.history.push(url.to_owned());
@@ -504,6 +524,9 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
                     None => {
                         if let Some(url) = action.navigate {
                             self.navigate(&url);
+                        } else if y > BAR_HEIGHT {
+                            // 页面区域：链接命中导航
+                            self.open_link_at(x, y);
                         }
                     }
                 }

@@ -248,6 +248,101 @@ fn is_image_node(document: &Document, node: NodeId) -> bool {
     )
 }
 
+/// 命中测试：返回视口点 `(x, y)` 命中的最深片段节点。
+///
+/// 坐标以 `root` 的边框盒原点为参照（与 [`build_scene_at`] 的原点参数
+/// 一致：窗口坐标减去原点即得）。命中顺序镜像绘制顺序：行内内容
+/// （文本 run / 图片 / 行内原子盒）优先于块级子盒；点在盒内但未命中
+/// 更深层时返回本盒节点。
+pub fn hit_test(root: &Fragment, x: f32, y: f32) -> Option<NodeId> {
+    hit_fragment(root, 0.0, 0.0, x, y)
+}
+
+/// `hit_test` 的递归体：`(ox, oy)` 为父链累积的本片段边框盒原点。
+fn hit_fragment(fragment: &Fragment, ox: f32, oy: f32, x: f32, y: f32) -> Option<NodeId> {
+    let bx = ox + fragment.border_box.x;
+    let by = oy + fragment.border_box.y;
+    if x < bx || x > bx + fragment.border_box.width || y < by || y > by + fragment.border_box.height
+    {
+        return None;
+    }
+    let content_x = bx + fragment.border.left + fragment.padding.left;
+    let content_y = by + fragment.border.top + fragment.padding.top;
+
+    // 行内内容按行堆叠（与 emit 的行偏移累加一致）
+    let mut line_offset = 0.0_f32;
+    for line in &fragment.lines {
+        let line_y = content_y + line_offset;
+        if y >= line_y && y <= line_y + line.height {
+            // 文本 run：字形 x 范围（glyph.x 已相对本片段内容盒）
+            for run in &line.runs {
+                let Some(first) = run.glyphs.first() else {
+                    continue;
+                };
+                let Some(last) = run.glyphs.last() else {
+                    continue;
+                };
+                let run_start = content_x + first.x;
+                let run_end = content_x + last.x + last.advance;
+                if x >= run_start && x <= run_end {
+                    return Some(run.node);
+                }
+            }
+            for image in &line.images {
+                let top = line_y + image.y;
+                if x >= content_x + image.x
+                    && x <= content_x + image.x + image.width
+                    && y >= top
+                    && y <= top + image.height
+                {
+                    return Some(image.node);
+                }
+            }
+            for atomic in &line.boxes {
+                if let Some(node) = hit_fragment(atomic, content_x, line_y, x, y) {
+                    return Some(node);
+                }
+            }
+        }
+        line_offset += line.height;
+    }
+
+    for child in &fragment.children {
+        if let Some(node) = hit_fragment(child, content_x, content_y, x, y) {
+            return Some(node);
+        }
+    }
+    Some(fragment.node)
+}
+
+/// `node` 向上找最近的 `<a href>` 祖先（含自身），返回 href 原文。
+///
+/// 返回的是文档里的原始属性值；相对地址由调用方以文档 URL 为 base
+/// 归一（`nexty_network::resolve`）。无 `<a>` 祖先或 href 为空返回 `None`。
+pub fn link_target(page: &Page, node: NodeId) -> Option<String> {
+    use nexty_dom::{Namespace, NodeKind};
+    let mut current = Some(node);
+    while let Some(id) = current {
+        if let Some(NodeKind::Element(data)) = page.document.node(id)
+            && data.namespace == Namespace::Html
+            && data.name == "a"
+        {
+            let href = data
+                .attributes
+                .iter()
+                .find(|attr| attr.name == "href")
+                .map(|attr| attr.value.trim().to_owned())
+                .unwrap_or_default();
+            if href.is_empty() {
+                return None;
+            }
+            return Some(href);
+        }
+        current = page.document.parent(id);
+    }
+    None
+}
+
 /// 在指定矩形下发一张图片：像素进池（按节点去重），指令按下标引用。
 fn draw_image_at(
     page: &Page,

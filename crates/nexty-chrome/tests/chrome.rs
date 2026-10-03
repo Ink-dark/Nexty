@@ -135,10 +135,7 @@ fn multiline_baselines_advance_by_line_height() {
         })
         .collect();
     baselines.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
-    assert!(
-        baselines.len() >= 2,
-        "该文本在 300px 视口下应折成多行"
-    );
+    assert!(baselines.len() >= 2, "该文本在 300px 视口下应折成多行");
     for pair in baselines.windows(2) {
         assert!(
             pair[1] > pair[0],
@@ -178,6 +175,89 @@ fn inline_block_content_is_emitted_into_scene() {
         .filter(|command| matches!(command, Command::DrawText { .. }))
         .count();
     assert_eq!(text_count, 2, "out 与 in 分别下发");
+}
+
+/// T4：块级链接命中 → href 原文 → 相对地址归一；空白区不产生链接。
+#[test]
+fn hit_test_finds_block_link_and_resolves_href() {
+    let page = pipeline::load_page(
+        "<body><a href=\"/target\" style=\"display: block; height: 20px\">block link</a></body>",
+        "body { margin: 0; height: 50px }",
+    );
+    let shaper = ParleyTextShaper::new();
+    let root = pipeline::layout_page(&page, &shaper, 200.0).expect("root");
+
+    let node = pipeline::hit_test(&root, 10.0, 5.0).expect("命中链接");
+    assert_eq!(
+        pipeline::link_target(&page, node).as_deref(),
+        Some("/target")
+    );
+    let resolved = nexty_network::resolve("https://origin.test/dir/page", "/target");
+    assert_eq!(resolved.as_deref(), Ok("https://origin.test/target"));
+
+    // a（高 20）之外、body（高 50）之内：命中 body，无链接
+    let node = pipeline::hit_test(&root, 10.0, 30.0).expect("命中 body");
+    assert!(pipeline::link_target(&page, node).is_none());
+}
+
+/// T4：行内链接文本 run 命中（坐标取自 run 字形范围）。
+#[test]
+fn hit_test_finds_inline_link_text_run() {
+    let page = pipeline::load_page(
+        "<body><p style=\"margin: 0\"><a href=\"https://a.test/x\">linktext</a></p></body>",
+        "body { margin: 0 }",
+    );
+    let shaper = ParleyTextShaper::new();
+    let root = pipeline::layout_page(&page, &shaper, 200.0).expect("root");
+    let body = &root.children[0];
+    let p = &body.children[0];
+    let run = &p.lines[0].runs[0];
+    let first = run.glyphs[0];
+    let last = run.glyphs.last().expect("glyphs");
+    let mid = (first.x + last.x + last.advance) / 2.0;
+
+    let node = pipeline::hit_test(p, mid, 2.0).expect("命中行内链接");
+    assert_eq!(
+        pipeline::link_target(&page, node).as_deref(),
+        Some("https://a.test/x")
+    );
+    // p 盒内、run 之外（右侧空白）：命中 p 本身，无链接
+    let node = pipeline::hit_test(p, p.border_box.width - 1.0, 2.0).expect("命中 p");
+    assert!(pipeline::link_target(&page, node).is_none());
+}
+
+/// T4：链接内的图片命中后沿祖先链找到 `<a href>`。
+#[test]
+fn hit_test_finds_image_inside_anchor() {
+    let page = pipeline::load_page(
+        "<body><a href=\"logo\" style=\"display: block\"><img width=40 height=30 src=a.png></a></body>",
+        "body { margin: 0 }",
+    );
+    let shaper = ParleyTextShaper::new();
+    let root = pipeline::layout_page(&page, &shaper, 200.0).expect("root");
+    let body = &root.children[0];
+    let anchor = &body.children[0];
+
+    let node = pipeline::hit_test(anchor, 10.0, 10.0).expect("命中图片");
+    assert_eq!(pipeline::link_target(&page, node).as_deref(), Some("logo"));
+    // 图片矩形之外（a 盒内、图片下方）→ a 自身，仍有链接
+    let node = pipeline::hit_test(anchor, 10.0, anchor.border_box.height - 1.0).expect("命中 a");
+    assert_eq!(pipeline::link_target(&page, node).as_deref(), Some("logo"));
+}
+
+/// T4：`<a>` 缺 href 不产生链接目标；盒外命中测试返回 None。
+#[test]
+fn link_target_requires_href_and_miss_returns_none() {
+    let page = pipeline::load_page(
+        "<body><a style=\"display: block; height: 20px\">no href</a></body>",
+        "body { margin: 0 }",
+    );
+    let shaper = ParleyTextShaper::new();
+    let root = pipeline::layout_page(&page, &shaper, 200.0).expect("root");
+    let node = pipeline::hit_test(&root, 5.0, 5.0).expect("命中 a");
+    assert!(pipeline::link_target(&page, node).is_none());
+    // body 之外（视口下方远处）
+    assert!(pipeline::hit_test(&root, 5.0, 300.0).is_none());
 }
 
 #[test]
