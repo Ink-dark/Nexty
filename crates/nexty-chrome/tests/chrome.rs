@@ -260,6 +260,27 @@ fn link_target_requires_href_and_miss_returns_none() {
     assert!(pipeline::hit_test(&root, 5.0, 300.0).is_none());
 }
 
+/// T5：`<title>` 文本提取；空白/缺失/非 HTML 命名空间返回 None。
+#[test]
+fn document_title_extraction() {
+    let page = pipeline::load_page(
+        "<html><head><title>文档标题</title></head><body></body></html>",
+        "",
+    );
+    assert_eq!(
+        pipeline::document_title(&page.document).as_deref(),
+        Some("文档标题")
+    );
+
+    // 空白 title 视为缺失
+    let page = pipeline::load_page("<head><title>   </title></head><body></body>", "");
+    assert!(pipeline::document_title(&page.document).is_none());
+
+    // 无 title
+    let page = pipeline::load_page("<body></body>", "");
+    assert!(pipeline::document_title(&page.document).is_none());
+}
+
 #[test]
 fn render_thread_round_trips() {
     let thread = RenderThread::spawn(Arc::new(nexty_paint::VelloCpuRasterizer::new()));

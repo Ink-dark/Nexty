@@ -141,6 +141,7 @@ fn fetch_many(fetcher: &dyn NetworkFetcher, urls: &[String]) -> Vec<Option<Vec<u
                     let request = Request {
                         url: url.clone(),
                         method: Method::Get,
+                        headers: Vec::new(),
                     };
                     scope.spawn(move || fetch_ok(fetcher, &request))
                 })

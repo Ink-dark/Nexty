@@ -9,6 +9,7 @@
 //! surface present。像素 1:1 上屏，无缩放采样。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use nexty_layout::Fragment;
 use nexty_network::{Method, NetworkFetcher, ReqwestFetcher};
@@ -131,7 +132,8 @@ struct BrowserApp {
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
     renderer: Option<RenderThread>,
-    fetcher: Option<Arc<ReqwestFetcher>>,
+    /// 网络接驳缝：后端可整体替换（reqwest 实现或其他 `NetworkFetcher`）。
+    fetcher: Option<Arc<dyn NetworkFetcher>>,
     shaper: nexty_text::ParleyTextShaper,
     bar: AddressBar,
     history: History,
@@ -185,7 +187,10 @@ impl BrowserApp {
         )));
         // 启动路径用 fail-fast：TLS 后端不可用时浏览器本就无法工作，
         // 带着半初始化的状态继续跑不如立刻退出（渲染路径才需要降级）。
-        self.fetcher = Some(Arc::new(ReqwestFetcher::new().expect("network fetcher")));
+        // 整请求超时 30s：真实站点挂起时不无限占住加载状态。
+        self.fetcher = Some(Arc::new(
+            ReqwestFetcher::with_timeout(Duration::from_secs(30)).expect("network fetcher"),
+        ));
         self.show_blank();
         window.request_redraw();
     }
@@ -323,6 +328,11 @@ impl BrowserApp {
                 let request = nexty_network::Request {
                     url: target.clone(),
                     method: Method::Get,
+                    // 不少真实站点对无 UA 请求直接 403/429
+                    headers: vec![(
+                        "User-Agent".to_owned(),
+                        format!("Nexty/{}", env!("CARGO_PKG_VERSION")),
+                    )],
                 };
                 // 全部加载在后台线程完成：文档抓取 → 解析 → 子资源并发抓取
                 // → 级联 → 页面就绪。主线程只做布局与呈现。
@@ -361,14 +371,26 @@ impl BrowserApp {
         self.bar.set_loading(false);
         match result {
             Ok(page) => {
+                let title = pipeline::document_title(&page.document);
                 self.set_page(page, true);
                 self.bar.set_url(url);
+                if let Some(window) = &self.window {
+                    match title {
+                        Some(title) => window.set_title(&format!("{title} - Nexty")),
+                        None => window.set_title("Nexty"),
+                    }
+                }
             }
             Err(error) => {
                 eprintln!("load {url} failed: {error}");
                 // 失败也要出错误页：只打日志会让画面停在上一帧或空白，
                 // 用户看不到任何反馈。
-                let html = format!("<body><h1>加载失败</h1><p>{url}</p><p>{error}</p></body>");
+                let html = format!(
+                    "<body style=\"font-family: sans-serif; padding: 24px\">\
+                     <h1 style=\"color: #c5221f\">无法加载此页</h1>\
+                     <p>{url}</p>\
+                     <p style=\"color: #5f6368\">{error}</p></body>"
+                );
                 self.set_page(pipeline::load_page(&html, ""), true);
             }
         }

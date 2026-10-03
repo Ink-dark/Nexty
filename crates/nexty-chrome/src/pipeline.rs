@@ -343,6 +343,33 @@ pub fn link_target(page: &Page, node: NodeId) -> Option<String> {
     None
 }
 
+/// 提取文档 `<title>` 的文本（HTML 命名空间的 title 元素，首个非空者）。
+///
+/// 供窗口标题显示；缺失或空白返回 `None`。SVG 的 `<title>` 不在此列。
+pub fn document_title(document: &Document) -> Option<String> {
+    use nexty_dom::{Namespace, NodeKind};
+    fn walk(document: &Document, node: NodeId) -> Option<String> {
+        // Document/文本等非元素节点没有 title，但子树仍需下钻
+        if let Some(NodeKind::Element(data)) = document.node(node)
+            && data.namespace == Namespace::Html
+            && data.name == "title"
+        {
+            let mut text = String::new();
+            for child in document.children(node) {
+                if let Some(NodeKind::Text(content)) = document.node(child) {
+                    text.push_str(content);
+                }
+            }
+            let trimmed = text.trim();
+            return (!trimmed.is_empty()).then(|| trimmed.to_owned());
+        }
+        document
+            .children(node)
+            .find_map(|child| walk(document, child))
+    }
+    walk(document, document.root())
+}
+
 /// 在指定矩形下发一张图片：像素进池（按节点去重），指令按下标引用。
 fn draw_image_at(
     page: &Page,
