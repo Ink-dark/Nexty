@@ -23,6 +23,7 @@ use nexty_text::TextShaper;
 mod block;
 mod fragment;
 mod inline;
+mod intrinsic;
 
 pub use fragment::{Edges, Fragment, ImageRun, LineFragment, Rect, TextRun};
 

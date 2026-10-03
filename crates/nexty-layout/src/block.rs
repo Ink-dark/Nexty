@@ -12,7 +12,9 @@
 
 use std::collections::HashMap;
 
-use nexty_css::{BoxSizingValue, ComputedStyle, DisplayValue, MarginValue, PaddingValue, SizeValue};
+use nexty_css::{
+    BoxSizingValue, ComputedStyle, DisplayValue, MarginValue, PaddingValue, SizeValue,
+};
 use nexty_dom::{Document, Namespace, NodeId, NodeKind};
 use nexty_text::TextShaper;
 
@@ -132,19 +134,24 @@ fn resolve_padding(paddings: nexty_css::Edges<PaddingValue>, containing_width: f
 
 /// 块容器的子内容分组：连续的行内级内容归为一组（匿名块候选）。
 pub(crate) enum ChildGroup {
-    /// 块级元素子盒。
-    Block(NodeId, ComputedStyle),
+    /// 块级元素子盒（样式由消费端从 `Context::styles` 查回）。
+    Block(NodeId),
     /// 一段连续的行内级内容（词/原子图片序列）。
     Inline(Vec<InlineItem>),
 }
 
-fn group_children(ctx: &Context<'_>, node: NodeId) -> Vec<ChildGroup> {
+fn group_children(ctx: &Context<'_>, node: NodeId, containing_width: f32) -> Vec<ChildGroup> {
     let mut groups: Vec<ChildGroup> = Vec::new();
-    collect_groups(ctx, node, &mut groups);
+    collect_groups(ctx, node, &mut groups, containing_width);
     groups
 }
 
-fn collect_groups(ctx: &Context<'_>, node: NodeId, groups: &mut Vec<ChildGroup>) {
+fn collect_groups(
+    ctx: &Context<'_>,
+    node: NodeId,
+    groups: &mut Vec<ChildGroup>,
+    containing_width: f32,
+) {
     let style = ctx
         .styles
         .get(&node)
@@ -157,10 +164,8 @@ fn collect_groups(ctx: &Context<'_>, node: NodeId, groups: &mut Vec<ChildGroup>)
         match ctx.document.node(child) {
             Some(NodeKind::Text(text)) => {
                 // 文本属于行内内容，样式取父元素
-                run.get_or_insert_with(|| {
-                    InlineRun::new(ctx.document, ctx.styles, ctx.image_sizes)
-                })
-                .push_text(text, node, &style);
+                run.get_or_insert_with(|| InlineRun::new(ctx, containing_width))
+                    .push_text(text, node, &style);
             }
             Some(NodeKind::Element(_)) => {
                 let Some(child_style) = ctx.styles.get(&child) else {
@@ -173,24 +178,22 @@ fn collect_groups(ctx: &Context<'_>, node: NodeId, groups: &mut Vec<ChildGroup>)
                         if let Some(finished) = run.take() {
                             push_items(groups, finished.finish());
                         }
-                        collect_groups(ctx, child, groups);
+                        collect_groups(ctx, child, groups, containing_width);
                     }
                     DisplayValue::Inline
                     | DisplayValue::InlineBlock
                     | DisplayValue::InlineFlex
                     | DisplayValue::InlineGrid
                     | DisplayValue::InlineTable => {
-                        run.get_or_insert_with(|| {
-                            InlineRun::new(ctx.document, ctx.styles, ctx.image_sizes)
-                        })
-                        .push_element(child, child_style);
+                        run.get_or_insert_with(|| InlineRun::new(ctx, containing_width))
+                            .push_element(child, child_style);
                     }
                     _ => {
                         // 块级子盒切断行内流
                         if let Some(finished) = run.take() {
                             push_items(groups, finished.finish());
                         }
-                        groups.push(ChildGroup::Block(child, child_style.clone()));
+                        groups.push(ChildGroup::Block(child));
                     }
                 }
             }
@@ -271,29 +274,53 @@ pub(crate) fn layout_block_box(
     let border_box_sizing = style.box_sizing == BoxSizingValue::BorderBox;
 
     // ---- 宽度解析（§10.3.3，ltr）+ min/max 收束（§10.4） ----
-    let width = content_space_size(
+    let margin_left = used_edge(style.margin.left, containing_width);
+    let margin_right = used_edge(style.margin.right, containing_width);
+    let width_value = content_space_size(
         style.width,
         border_box_sizing,
         horizontal_fixed,
         containing_width,
     );
-    let (margin_left, _margin_right, content_width) = resolve_width(
-        width,
-        containing_width,
-        &style.margin,
-        horizontal_fixed,
-    );
+    // §10.3.7：行内原子盒的 auto 宽 → shrink-to-fit（margin auto 按 0）
+    let (margin_left, _margin_right, content_width) = match width_value {
+        SizeValue::Auto
+            if matches!(
+                style.display,
+                DisplayValue::InlineBlock | DisplayValue::InlineTable | DisplayValue::InlineFlex
+            ) =>
+        {
+            let intrinsic = crate::intrinsic::measure_box(ctx, node, style);
+            let available = containing_width - horizontal_fixed - margin_left - margin_right;
+            // min(max(preferred_min, available), preferred)
+            let content = intrinsic
+                .max
+                .min(available.max(intrinsic.min))
+                .max(intrinsic.min);
+            (margin_left, margin_right, content)
+        }
+        _ => resolve_width(
+            width_value,
+            containing_width,
+            &style.margin,
+            horizontal_fixed,
+        ),
+    };
     let content_width = clamp_to_min_max(
         content_width,
-        used_size(style.min_width, border_box_sizing, horizontal_fixed, containing_width),
-        used_max(style.max_width, border_box_sizing, horizontal_fixed, containing_width),
+        used_size(
+            style.min_width,
+            border_box_sizing,
+            horizontal_fixed,
+            containing_width,
+        ),
+        used_max(
+            style.max_width,
+            border_box_sizing,
+            horizontal_fixed,
+            containing_width,
+        ),
     );
-
-    // ---- 子内容分组（§9.2.1.1） ----
-    let groups = group_children(ctx, node);
-    let has_block_children = groups
-        .iter()
-        .any(|group| matches!(group, ChildGroup::Block(..)));
 
     // ---- 高度（§10.5） ----
     let height = content_space_size(
@@ -303,6 +330,28 @@ pub(crate) fn layout_block_box(
         containing_height.unwrap_or(0.0),
     );
     let specified_height = resolve_height(height, containing_height);
+
+    // ---- 单行 flex（CSS Flexbox 子集：row、nowrap、stretch） ----
+    if matches!(style.display, DisplayValue::Flex | DisplayValue::InlineFlex) {
+        return layout_flex_row(
+            ctx,
+            node,
+            style,
+            border,
+            padding,
+            horizontal_fixed,
+            vertical_fixed,
+            content_width,
+            specified_height,
+            containing_width,
+        );
+    }
+
+    // ---- 子内容分组（§9.2.1.1） ----
+    let groups = group_children(ctx, node, content_width);
+    let has_block_children = groups
+        .iter()
+        .any(|group| matches!(group, ChildGroup::Block(..)));
 
     // ---- margin 折叠前提 ----
     let top_separated = border.top > 0.0 || padding.top > 0.0;
@@ -322,7 +371,11 @@ pub(crate) fn layout_block_box(
 
     for group in &groups {
         match group {
-            ChildGroup::Block(child_node, child_style) => {
+            ChildGroup::Block(child_node) => {
+                // collect_groups 只在有样式时入组，这里查回必然成功
+                let Some(child_style) = ctx.styles.get(child_node) else {
+                    continue;
+                };
                 let result = layout_block_box(
                     ctx,
                     *child_node,
@@ -563,6 +616,148 @@ fn resolve_height(height: SizeValue, containing_height: Option<f32>) -> Option<f
         SizeValue::Auto => None,
         SizeValue::Length(px) => Some(px),
         SizeValue::Percent(fraction) => containing_height.map(|containing| fraction * containing),
+    }
+}
+
+/// 单行 flex 布局（CSS Flexbox 子集）。
+///
+/// 支持：`flex-direction: row`（默认，唯一方向）、单行不换行（nowrap）、
+/// `flex-grow` / `flex-basis` 主轴分配、交叉轴 `stretch`。
+/// 偏差：`flex-shrink` 不实现（超出的项溢出）；margin auto 不吸收剩余空间；
+/// stretch 不做二次布局（子项内容保持原位，仅盒高拉伸）；
+/// `flex-basis: auto` 回退到子项 width，再回退 max-content。
+#[allow(clippy::too_many_arguments)]
+fn layout_flex_row(
+    ctx: &Context<'_>,
+    node: NodeId,
+    style: &ComputedStyle,
+    border: Edges,
+    padding: Edges,
+    horizontal_fixed: f32,
+    vertical_fixed: f32,
+    content_width: f32,
+    specified_height: Option<f32>,
+    containing_width: f32,
+) -> BlockBox {
+    struct ItemPlan {
+        node: NodeId,
+        style: ComputedStyle,
+        /// 主轴基准（内容盒空间，CSS px）。
+        base: f32,
+        /// 自身水平 border+padding。
+        fixed: f32,
+        grow: f32,
+        margin_left: f32,
+        margin_right: f32,
+        margin_top: f32,
+        height_auto: bool,
+    }
+
+    // ---- 收集 flex items：元素子节点（display: none 跳过；文本子节点
+    // 不产生 item，v1 偏差） ----
+    let mut plans: Vec<ItemPlan> = Vec::new();
+    for child in ctx.document.children(node) {
+        let Some(child_style) = ctx.styles.get(&child) else {
+            continue;
+        };
+        if child_style.display == DisplayValue::None
+            || child_style.display == DisplayValue::Contents
+        {
+            continue;
+        }
+        let fixed = to_layout_edges(child_style.border_width).left
+            + to_layout_edges(child_style.border_width).right
+            + resolve_padding(child_style.padding, content_width).left
+            + resolve_padding(child_style.padding, content_width).right;
+        let box_sizing = child_style.box_sizing == BoxSizingValue::BorderBox;
+        // flex-basis → width → max-content（CSS Flexbox §7.2）
+        let base =
+            match content_space_size(child_style.flex_basis, box_sizing, fixed, content_width) {
+                SizeValue::Length(px) => px,
+                SizeValue::Percent(fraction) => fraction * content_width,
+                SizeValue::Auto => {
+                    match content_space_size(child_style.width, box_sizing, fixed, content_width) {
+                        SizeValue::Length(px) => px,
+                        SizeValue::Percent(fraction) => fraction * content_width,
+                        // auto → 内容尺寸（max-content）
+                        SizeValue::Auto => {
+                            crate::intrinsic::measure_box(ctx, child, child_style).max
+                        }
+                    }
+                }
+            };
+        plans.push(ItemPlan {
+            node: child,
+            style: child_style.clone(),
+            base,
+            fixed,
+            grow: child_style.flex_grow,
+            margin_left: used_edge(child_style.margin.left, content_width),
+            margin_right: used_edge(child_style.margin.right, content_width),
+            margin_top: used_edge(child_style.margin.top, content_width),
+            height_auto: matches!(child_style.height, SizeValue::Auto),
+        });
+    }
+
+    // ---- 主轴分配：剩余空间按 grow 比例分给各项（CSS Flexbox §9.7） ----
+    let total_base: f32 = plans
+        .iter()
+        .map(|plan| plan.base + plan.fixed + plan.margin_left + plan.margin_right)
+        .sum();
+    let free = content_width - total_base;
+    let sum_grow: f32 = plans.iter().map(|plan| plan.grow).sum();
+    if free > 0.0 && sum_grow > 0.0 {
+        for plan in &mut plans {
+            plan.base += plan.grow / sum_grow * free;
+        }
+    }
+
+    // ---- 逐项布局与放置 ----
+    let mut children: Vec<Fragment> = Vec::new();
+    let mut stretch: Vec<bool> = Vec::new();
+    let mut cursor = 0.0_f32;
+    let mut cross = 0.0_f32;
+    for plan in plans {
+        let allocated = plan.base.max(0.0);
+        let result = layout_block_box(ctx, plan.node, &plan.style, allocated, None, false);
+        let mut fragment = result.fragment;
+        fragment.border_box.x = cursor + plan.margin_left;
+        fragment.border_box.y = plan.margin_top;
+        cursor += plan.margin_left + fragment.border_box.width + plan.margin_right;
+        cross = cross.max(fragment.border_box.height + plan.margin_top);
+        stretch.push(plan.height_auto);
+        children.push(fragment);
+    }
+
+    // ---- 交叉轴（仅 stretch）：高度 auto 的项拉伸到行交叉尺寸 ----
+    let cross = specified_height.unwrap_or(cross);
+    for (fragment, height_auto) in children.iter_mut().zip(&stretch) {
+        if *height_auto {
+            fragment.border_box.height = cross;
+        }
+    }
+
+    let margins = resolve_edges(style.margin, containing_width);
+    BlockBox {
+        fragment: Fragment {
+            node,
+            anonymous: false,
+            border_box: Rect {
+                x: margins.left,
+                y: 0.0,
+                width: content_width + horizontal_fixed,
+                height: cross + vertical_fixed,
+            },
+            border,
+            padding,
+            style: style.clone(),
+            children,
+            lines: Vec::new(),
+        },
+        margin_top: margins.top,
+        margin_bottom: margins.bottom,
+        // flex 容器不与子项折叠 margin（§9.4 格式化上下文）
+        self_collapsing: false,
     }
 }
 

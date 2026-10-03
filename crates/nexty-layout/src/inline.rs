@@ -6,8 +6,7 @@
 //! （空白折叠）与 [§7](https://drafts.csswg.org/css-text-3/#line-breaking)（断行）。
 //!
 //! 已知偏差：断行只在 ASCII 空白处（无 UAX#14 完整断点，CJK 不折行）；
-//! `vertical-align` 仅 baseline；`display: inline-block` 暂按 `inline` 参与
-//! 行内流。
+//! `vertical-align` 仅 baseline（原子盒/图片底边对齐基线）。
 
 use std::collections::HashMap;
 
@@ -15,7 +14,8 @@ use nexty_css::{ComputedStyle, DisplayValue, LineHeightValue};
 use nexty_dom::{Document, ElementData, Namespace, NodeId, NodeKind};
 use nexty_text::{FontMetrics, Glyph, ShapedText, TextShaper, TextStyle};
 
-use crate::fragment::{ImageRun, LineFragment, TextRun};
+use crate::block::Context;
+use crate::fragment::{Fragment, ImageRun, LineFragment, TextRun};
 
 /// 行内流中的一个原子图片项（替换元素，v1 仅 `<img>`）。
 pub(crate) struct AtomicImage {
@@ -31,10 +31,21 @@ pub(crate) struct AtomicImage {
     pub style: ComputedStyle,
 }
 
-/// 行内流中的一项：文本词或原子图片。
+/// 行内流中的一个原子盒（`inline-block` 等）：已独立布局好的子片段。
+pub(crate) struct AtomicBlock {
+    /// 布局完成的子片段（border_box.x/y 由行盒组装阶段定位）。
+    pub fragment: Fragment,
+    /// 该项前面是否隔着空白（行首空白不渲染）。
+    pub preceded_by_space: bool,
+    /// 样式来源（其后空白按它计宽）。
+    pub style: ComputedStyle,
+}
+
+/// 行内流中的一项：文本词、原子图片或原子盒。
 pub(crate) enum InlineItem {
     Text(Word),
     Image(AtomicImage),
+    Block(Box<AtomicBlock>),
 }
 
 /// 行内流中的一个词（空白折叠后）。
@@ -94,9 +105,9 @@ fn is_image_node(document: &Document, node: NodeId) -> bool {
 
 /// 行内项收集状态。
 struct Collector<'a> {
-    document: &'a Document,
-    styles: &'a HashMap<NodeId, ComputedStyle>,
-    image_sizes: &'a HashMap<NodeId, (f32, f32)>,
+    ctx: &'a Context<'a>,
+    /// 所属块容器的内容宽（行内原子盒的可用空间）。
+    containing_width: f32,
     items: Vec<InlineItem>,
     pending_space: bool,
     word_buffer: String,
@@ -136,7 +147,7 @@ impl Collector<'_> {
 
     /// 收集一个行内原子图片。
     fn push_image(&mut self, node: NodeId, style: &ComputedStyle) {
-        let (width, height) = image_box_size(self.document, node, self.image_sizes);
+        let (width, height) = image_box_size(self.ctx.document, node, self.ctx.image_sizes);
         self.flush_word();
         self.items.push(InlineItem::Image(AtomicImage {
             node,
@@ -146,29 +157,43 @@ impl Collector<'_> {
             style: style.clone(),
         }));
     }
+
+    /// 收集一个原子盒（inline-block 等）：以当前可用宽独立布局。
+    fn push_atomic_block(&mut self, node: NodeId, style: &ComputedStyle) {
+        self.flush_word();
+        // §10.3.7：auto 宽的 shrink-to-fit 在 layout_block_box 内解析
+        let result = crate::block::layout_block_box(
+            self.ctx,
+            node,
+            style,
+            self.containing_width,
+            None,
+            /* is_root */ false,
+        );
+        self.items.push(InlineItem::Block(Box::new(AtomicBlock {
+            fragment: result.fragment,
+            preceded_by_space: std::mem::take(&mut self.pending_space),
+            style: style.clone(),
+        })));
+    }
 }
 
 /// 一段连续行内流的收集器。
 ///
 /// 块容器按树序把行内内容喂给它：直接文本子节点走 [`InlineRun::push_text`]
-/// （不递归子树），行内级子元素走 [`InlineRun::push_element`]（递归其子树）。
-/// 空白折叠状态（词缓冲、前导空白）跨子节点持续，保证
-/// `text <b>bold</b>` 这类跨界序列不重复收集、不丢空白。
+/// （不递归子树），行内级子元素走 [`InlineRun::push_element`]（递归其子树，
+/// 原子行内盒则独立布局）。空白折叠状态（词缓冲、前导空白）跨子节点持续，
+/// 保证 `text <b>bold</b>` 这类跨界序列不重复收集、不丢空白。
 pub(crate) struct InlineRun<'a> {
     collector: Collector<'a>,
 }
 
 impl<'a> InlineRun<'a> {
-    pub(crate) fn new(
-        document: &'a Document,
-        styles: &'a HashMap<NodeId, ComputedStyle>,
-        image_sizes: &'a HashMap<NodeId, (f32, f32)>,
-    ) -> Self {
+    pub(crate) fn new(ctx: &'a Context<'a>, containing_width: f32) -> Self {
         Self {
             collector: Collector {
-                document,
-                styles,
-                image_sizes,
+                ctx,
+                containing_width,
                 items: Vec::new(),
                 pending_space: false,
                 word_buffer: String::new(),
@@ -186,13 +211,19 @@ impl<'a> InlineRun<'a> {
     /// 收集一个行内级子元素的子树。
     ///
     /// 元素本身是行内 `<img>` 时按原子图片收集（其子树只有 alt 文本，
-    /// v1 不做失败回退渲染）。
+    /// v1 不做失败回退渲染）；原子行内盒（inline-block 等）独立布局后
+    /// 作为原子项参与行盒。
     pub(crate) fn push_element(&mut self, element: NodeId, style: &ComputedStyle) {
-        if is_image_node(self.collector.document, element) {
+        if is_image_node(self.collector.ctx.document, element) {
             self.collector.push_image(element, style);
             return;
         }
-        collect_children(&mut self.collector, element, style);
+        match style.display {
+            DisplayValue::InlineBlock | DisplayValue::InlineFlex | DisplayValue::InlineTable => {
+                self.collector.push_atomic_block(element, style);
+            }
+            _ => collect_children(&mut self.collector, element, style),
+        }
     }
 
     /// 结束收集，刷出词缓冲。
@@ -203,12 +234,12 @@ impl<'a> InlineRun<'a> {
 }
 
 fn collect_children(collector: &mut Collector<'_>, node: NodeId, style: &ComputedStyle) {
-    let document = collector.document;
+    let document = collector.ctx.document;
     for child in document.children(node) {
         match document.node(child) {
             Some(NodeKind::Text(text)) => collector.push_text(text, node, style),
             Some(NodeKind::Element(data)) => {
-                let Some(child_style) = collector.styles.get(&child) else {
+                let Some(child_style) = collector.ctx.styles.get(&child) else {
                     continue;
                 };
                 if child_style.display == DisplayValue::None {
@@ -228,12 +259,14 @@ fn collect_children(collector: &mut Collector<'_>, node: NodeId, style: &Compute
                     DisplayValue::Contents => {
                         collect_children(collector, child, child_style);
                     }
-                    // 行内级（inline-block 暂按 inline 参与行内流，见模块偏差）
-                    DisplayValue::Inline
-                    | DisplayValue::InlineBlock
+                    // 原子行内盒：独立布局，不递归进其子树
+                    DisplayValue::InlineBlock
                     | DisplayValue::InlineFlex
-                    | DisplayValue::InlineGrid
                     | DisplayValue::InlineTable => {
+                        collector.push_atomic_block(child, child_style);
+                    }
+                    // 行内级：递归进入
+                    DisplayValue::Inline => {
                         collect_children(collector, child, child_style);
                     }
                     // 块级子元素不属于行内流（由块级分组处理），跳过
@@ -341,11 +374,16 @@ pub(crate) fn build_lines(
                 }
                 // 替换元素底边对齐基线：整个盒高在基线之上
                 InlineItem::Image(image) => baseline = baseline.max(image.height),
+                // 原子盒底边对齐基线（v1 简化：不含 margin）
+                InlineItem::Block(atomic) => {
+                    baseline = baseline.max(atomic.fragment.border_box.height)
+                }
             }
         }
 
         let mut runs: Vec<TextRun> = Vec::new();
         let mut images: Vec<ImageRun> = Vec::new();
+        let mut boxes: Vec<Fragment> = Vec::new();
         // 同源词合并进同一 run，但不得跨越中间的图片（绘制顺序会被打乱）
         let mut mergeable = false;
         for placed_item in placed.iter() {
@@ -388,6 +426,14 @@ pub(crate) fn build_lines(
                     });
                     mergeable = false;
                 }
+                InlineItem::Block(atomic) => {
+                    let mut fragment = atomic.fragment.clone();
+                    // 底边对齐基线：x/y 相对所属片段内容盒
+                    fragment.border_box.x = placed_item.x;
+                    fragment.border_box.y = baseline - fragment.border_box.height;
+                    boxes.push(fragment);
+                    mergeable = false;
+                }
             }
         }
         lines.push(LineFragment {
@@ -395,6 +441,7 @@ pub(crate) fn build_lines(
             height: baseline + below,
             runs,
             images,
+            boxes,
         });
         placed.clear();
     };
@@ -410,6 +457,7 @@ pub(crate) fn build_lines(
         let (node, style) = match previous {
             InlineItem::Text(word) => (word.node, &word.style),
             InlineItem::Image(image) => (image.node, &image.style),
+            InlineItem::Block(atomic) => (atomic.fragment.node, &atomic.style),
         };
         *space_cache.entry(node).or_insert_with(|| {
             shaper
@@ -423,6 +471,7 @@ pub(crate) fn build_lines(
         let preceded_by_space = match item {
             InlineItem::Text(word) => word.preceded_by_space,
             InlineItem::Image(image) => image.preceded_by_space,
+            InlineItem::Block(atomic) => atomic.preceded_by_space,
         };
         let space_width = if preceded_by_space && !placed.is_empty() {
             space_after_previous(items, &placed, &mut space_cache, shaper)
@@ -473,6 +522,21 @@ pub(crate) fn build_lines(
                     shaped: None,
                 });
                 image.width
+            }
+            InlineItem::Block(atomic) => {
+                // 原子盒不可拆：放不下先换行，行首仍放不下则溢出放置
+                let width = atomic.fragment.border_box.width;
+                let needs_break = !placed.is_empty() && cursor + space_width + width > max_width;
+                if needs_break {
+                    flush(&mut placed, &mut lines);
+                    cursor = 0.0;
+                }
+                placed.push(PlacedItem {
+                    item_index: index,
+                    x: cursor + space_width,
+                    shaped: None,
+                });
+                width
             }
         };
         cursor += space_width + item_width;

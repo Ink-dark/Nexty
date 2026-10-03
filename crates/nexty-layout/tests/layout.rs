@@ -169,7 +169,11 @@ fn border_box_width_includes_padding_and_border() {
     let div = find(&document, &root, "div").expect("div fragment");
     assert!(approx(div.border_box.width, 100.0));
     assert!(approx(
-        div.border_box.width - div.border.left - div.padding.left - div.border.right - div.padding.right,
+        div.border_box.width
+            - div.border.left
+            - div.padding.left
+            - div.border.right
+            - div.padding.right,
         70.0
     ));
     // height 同理：边框盒 = 40，内容高 = 40 - 10 = 30
@@ -529,4 +533,167 @@ fn line_fragment_baseline_inside_height() {
     let line: &LineFragment = &p.lines[0];
     assert!(line.baseline > 0.0);
     assert!(line.baseline <= line.height);
+}
+
+// ---- T8：inline-block 与单行 flex（CSS 2.1 §10.3.7、CSS Flexbox 子集） ----
+
+/// inline-block 作为原子盒参与行盒：整体不拆行，内部行盒独立。
+#[test]
+fn inline_block_is_atomic_and_not_split() {
+    let (document, root) = layout(
+        "<body><i style=\"display: inline-block; width: 100px; height: 30px\">inner</i> tail</body>",
+        "",
+        400.0,
+    );
+    let body_fragment = body(&document, &root);
+    assert_eq!(body_fragment.lines.len(), 1, "原子盒放得下，单行");
+    let line = &body_fragment.lines[0];
+    assert_eq!(line.boxes.len(), 1, "一个行内原子盒");
+    assert!(line.images.is_empty());
+    let atomic = &line.boxes[0];
+    assert!(approx(atomic.border_box.width, 100.0));
+    assert!(approx(atomic.border_box.height, 30.0));
+    assert!(approx(atomic.border_box.x, 0.0), "行首第一项无前导空白");
+    // 原子盒内部内容独立成行盒，不并入父行
+    assert_eq!(atomic.lines.len(), 1, "内部内容单行");
+    // 父行文本只剩 tail，且从原子盒右侧开始
+    assert_eq!(line.runs.len(), 1);
+    assert!(line.runs[0].glyphs[0].x >= 100.0, "tail 在原子盒之后");
+}
+
+/// 原子盒在剩余空间放不下时整体换行，不被拆分。
+#[test]
+fn inline_block_breaks_to_next_line_without_splitting() {
+    let (document, root) = layout(
+        "<body>text <i style=\"display: inline-block; width: 250px; height: 10px\"></i></body>",
+        "",
+        260.0,
+    );
+    let lines = &body(&document, &root).lines;
+    assert_eq!(lines.len(), 2, "text 在第一行，原子盒整体换到第二行");
+    assert!(lines[0].boxes.is_empty(), "第一行无原子盒");
+    assert_eq!(lines[1].boxes.len(), 1);
+    let atomic = &lines[1].boxes[0];
+    assert!(approx(atomic.border_box.width, 250.0), "原子盒不被拆分");
+    assert!(approx(atomic.border_box.x, 0.0), "行首原子盒无前导空白");
+}
+
+/// flex 单行等分：三项 grow 1、basis 0 → 平分容器主轴。
+#[test]
+fn flex_row_distributes_free_space_equally() {
+    let (document, root) = layout(
+        "<body><div style=\"display: flex; width: 300px\">\
+         <div style=\"flex-grow: 1; flex-basis: 0px\">a</div>\
+         <div style=\"flex-grow: 1; flex-basis: 0px\">b</div>\
+         <div style=\"flex-grow: 1; flex-basis: 0px\">c</div></div></body>",
+        "",
+        400.0,
+    );
+    let container = &body(&document, &root).children[0];
+    assert_eq!(container.children.len(), 3);
+    for (index, item) in container.children.iter().enumerate() {
+        assert!(
+            approx(item.border_box.width, 100.0),
+            "第 {index} 项等分 100"
+        );
+        assert!(
+            approx(item.border_box.x, 100.0 * index as f32),
+            "第 {index} 项主轴位置"
+        );
+        assert!(approx(item.border_box.y, 0.0), "单行：所有项同一交叉位置");
+    }
+    assert!(approx(container.border_box.width, 300.0));
+}
+
+/// flex 按 grow 比例分配：basis 100×3、grow 1:1:2、容器 400 → 125/125/150。
+#[test]
+fn flex_row_distributes_free_space_by_grow_ratio() {
+    let (document, root) = layout(
+        "<body><div style=\"display: flex; width: 400px\">\
+         <div style=\"flex-basis: 100px; flex-grow: 1\"></div>\
+         <div style=\"flex-basis: 100px; flex-grow: 1\"></div>\
+         <div style=\"flex-basis: 100px; flex-grow: 2\"></div></div></body>",
+        "",
+        400.0,
+    );
+    let items = &body(&document, &root).children[0].children;
+    let widths: Vec<f32> = items.iter().map(|item| item.border_box.width).collect();
+    assert!(approx(widths[0], 125.0), "grow 1 → 100 + 25");
+    assert!(approx(widths[1], 125.0));
+    assert!(approx(widths[2], 150.0), "grow 2 → 100 + 50");
+    assert!(approx(items[2].border_box.x, 250.0));
+}
+
+/// flex 不换行（nowrap 默认）：基和超宽的项溢出同一行，容器高度不增高。
+#[test]
+fn flex_row_does_not_wrap_overflowing_items() {
+    let (document, root) = layout(
+        "<body><div style=\"display: flex; width: 200px\">\
+         <div style=\"flex-basis: 100px; height: 10px\"></div>\
+         <div style=\"flex-basis: 100px; height: 10px\"></div>\
+         <div style=\"flex-basis: 100px; height: 10px\"></div></div></body>",
+        "",
+        200.0,
+    );
+    let container = &body(&document, &root).children[0];
+    assert_eq!(container.children.len(), 3);
+    for (index, item) in container.children.iter().enumerate() {
+        assert!(approx(item.border_box.y, 0.0), "不换行：所有项同处一行");
+        assert!(
+            approx(item.border_box.x, 100.0 * index as f32),
+            "第 {index} 项溢出排布"
+        );
+        assert!(approx(item.border_box.width, 100.0), "无剩余空间不分 grow");
+    }
+    assert!(
+        approx(container.border_box.height, 10.0),
+        "容器高度 = 行交叉尺寸，不因溢出增高"
+    );
+}
+
+/// 交叉轴 stretch：容器指定高度时，高度 auto 的项拉伸到行交叉尺寸。
+#[test]
+fn flex_row_stretches_auto_height_items_to_container_height() {
+    let (document, root) = layout(
+        "<body><div style=\"display: flex; width: 300px; height: 50px\">\
+         <div style=\"flex-grow: 1\"></div><div style=\"flex-grow: 1\"></div></div></body>",
+        "",
+        400.0,
+    );
+    let container = &body(&document, &root).children[0];
+    assert!(approx(container.border_box.height, 50.0));
+    for item in &container.children {
+        assert!(approx(item.border_box.width, 150.0));
+        assert!(
+            approx(item.border_box.height, 50.0),
+            "auto 高项拉伸到容器高"
+        );
+        assert!(approx(item.border_box.y, 0.0));
+    }
+}
+
+/// inline-flex：行内级 flex 容器按 shrink-to-fit 参与行内行盒（原子盒）。
+#[test]
+fn inline_flex_participates_in_line_box_as_atomic_box() {
+    let (document, root) = layout(
+        "<body>x <i style=\"display: inline-flex\">\
+         <b style=\"flex-grow: 1; flex-basis: 0px\"></b>\
+         <b style=\"flex-grow: 1; flex-basis: 0px\"></b></i></body>",
+        "i { width: 100px }",
+        400.0,
+    );
+    let lines = &body(&document, &root).lines;
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].boxes.len(), 1, "inline-flex 作为原子盒进父行");
+    let flex = &lines[0].boxes[0];
+    assert!(
+        approx(flex.border_box.width, 100.0),
+        "shrink-to-fit 不超过指定宽"
+    );
+    assert_eq!(flex.children.len(), 2, "子项单行 flex 布局");
+    assert!(
+        approx(flex.children[0].border_box.width, 50.0),
+        "两项等分主轴"
+    );
+    assert!(approx(flex.children[1].border_box.x, 50.0));
 }

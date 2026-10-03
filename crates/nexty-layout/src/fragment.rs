@@ -67,6 +67,9 @@ pub struct LineFragment {
     pub runs: Vec<TextRun>,
     /// 行内原子图片（替换元素，按基线对齐：底边落在基线上）。
     pub images: Vec<ImageRun>,
+    /// 行内原子盒（`inline-block` 等）：完整子片段树，`border_box` 相对
+    /// 所属片段内容盒（x 为行内位置，y 已按底边对齐基线折算）。
+    pub boxes: Vec<Fragment>,
 }
 
 /// 行内一张图片的落点。
