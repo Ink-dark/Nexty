@@ -6,9 +6,10 @@
 //! - [§10.3.3](https://www.w3.org/TR/CSS21/visudet.html#blockwidth)（块级非替换宽度解析）
 //! - [§10.5/§10.6.3](https://www.w3.org/TR/CSS21/visudet.html#the-height-property)（高度）
 //!
-//! 已知偏差：`display: inline-block` 按 inline 参与行内流；`float`、定位、
-//! min/max 尺寸、box-sizing 未实现；百分比高度仅在包含块高度明确时解析，
-//! 否则按 auto；末尾自折叠子盒对父内容高的贡献按折叠链近似处理。
+//! 已知偏差：`float`、定位、grid/表格、多行 flex（wrap/flex-shrink/其余
+//! 对齐值）未实现；flex 项 margin auto 不吸收剩余空间，stretch 不做二次
+//! 布局；百分比高度仅在包含块高度明确时解析，否则按 auto；末尾自折叠
+//! 子盒对父内容高的贡献按折叠链近似处理。
 
 use std::collections::HashMap;
 
