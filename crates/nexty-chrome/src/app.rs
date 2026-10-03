@@ -10,10 +10,11 @@
 
 use std::sync::Arc;
 
+use nexty_layout::Fragment;
 use nexty_network::{Method, NetworkFetcher, ReqwestFetcher};
 use nexty_paint::{Pixmap, Scene, Size};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
@@ -22,6 +23,49 @@ use crate::history::History;
 use crate::pipeline::{self, Page};
 use crate::render::RenderThread;
 use crate::ui::{AddressBar, BAR_HEIGHT, BarCommand, UiEvent};
+
+/// 滚轮一格（LineDelta 1.0）对应的滚动距离，px。
+const WHEEL_LINE_PX: f32 = 40.0;
+/// 滚动条轨道宽度，px。
+const SCROLLBAR_WIDTH: f32 = 8.0;
+/// 滚动条 thumb 最小高度，px。
+const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+
+/// 最大滚动量：内容总高（页面 + 工具带）超出视口的部分，下限 0。
+fn max_scroll(content_height: f32, bar_height: f32, viewport_height: f32) -> f32 {
+    (content_height + bar_height - viewport_height).max(0.0)
+}
+
+/// 把滚动量限制到 `[0, max]`。
+fn clamp_scroll(scroll: f32, max: f32) -> f32 {
+    scroll.clamp(0.0, max)
+}
+
+/// 滚动条 thumb 矩形（视口坐标）：页面不溢出时 `None`。
+///
+/// thumb 高 = 轨道高 × 视口占比，不低于 [`SCROLLBAR_MIN_THUMB`]；y 按
+/// 滚动比例落在轨道内。
+fn scrollbar_thumb(
+    scroll: f32,
+    viewport_height: f32,
+    content_height: f32,
+    bar_height: f32,
+    track_width: f32,
+) -> Option<nexty_paint::Rect> {
+    let total = content_height + bar_height;
+    if total <= viewport_height {
+        return None;
+    }
+    let track = viewport_height - bar_height;
+    let thumb_height = (track * viewport_height / total).max(SCROLLBAR_MIN_THUMB);
+    let progress = scroll / (total - viewport_height);
+    Some(nexty_paint::Rect {
+        x: 0.0,
+        y: bar_height + (track - thumb_height) * progress,
+        width: track_width,
+        height: thumb_height,
+    })
+}
 
 /// 应用错误。
 #[derive(Debug)]
@@ -94,7 +138,12 @@ struct BrowserApp {
     /// Alt 修饰键按住状态（后退/前进快捷键）。
     alt_down: bool,
     page: Option<Page>,
-    scene: Option<Scene>,
+    /// 当前页面布局好的根片段（滚动时按偏移重建显示列表）。
+    root: Option<Fragment>,
+    /// 根片段内容总高，px（滚动条与 clamp 的依据）。
+    content_height: f32,
+    /// 页面滚动量，px ∈ [0, max_scroll]。
+    scroll_y: f32,
     cursor: (f32, f32),
 }
 
@@ -111,7 +160,9 @@ impl BrowserApp {
             history: History::new("about:blank"),
             alt_down: false,
             page: None,
-            scene: None,
+            root: None,
+            content_height: 0.0,
+            scroll_y: 0.0,
             cursor: (0.0, 0.0),
         }
     }
@@ -142,23 +193,51 @@ impl BrowserApp {
     /// 显示空白页（`about:blank` 等内部 scheme 走这里，不经网络）。
     fn show_blank(&mut self) {
         self.bar.set_url("about:blank");
-        self.set_page(pipeline::load_page("", ""));
+        self.set_page(pipeline::load_page("", ""), true);
     }
 
-    /// 把已解析页面按当前视口布局成显示列表。
-    fn set_page(&mut self, page: Page) {
-        let viewport_width = self
+    /// 把已解析页面按当前视口布局。
+    ///
+    /// `reset_scroll` 为 false 时保留滚动量（resize 重排场景），但按新
+    /// 视口重新 clamp。
+    fn set_page(&mut self, page: Page, reset_scroll: bool) {
+        let (viewport_width, viewport_height) = self
             .window
             .as_ref()
-            .map(|window| window.inner_size().width as f32)
-            .unwrap_or(800.0);
+            .map(|window| {
+                let size = window.inner_size();
+                (size.width as f32, size.height as f32)
+            })
+            .unwrap_or((800.0, 600.0));
         let root = pipeline::layout_page(&page, &self.shaper, viewport_width);
-        // 页面内容从地址栏下方开始，避免被 UI 覆盖
-        self.scene = root.map(|root| pipeline::build_scene_at(&page, &root, 0.0, BAR_HEIGHT));
+        self.content_height = root
+            .as_ref()
+            .map(|root| root.border_box.height)
+            .unwrap_or(0.0);
+        self.root = root;
         self.page = Some(page);
+        self.scroll_y = if reset_scroll {
+            0.0
+        } else {
+            clamp_scroll(
+                self.scroll_y,
+                max_scroll(self.content_height, BAR_HEIGHT, viewport_height),
+            )
+        };
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+
+    /// 滚动 `delta` px（正值向下看更多内容），并按当前视口 clamp。
+    fn scroll_by(&mut self, delta: f32) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let viewport_height = window.inner_size().height as f32;
+        let max = max_scroll(self.content_height, BAR_HEIGHT, viewport_height);
+        self.scroll_y = clamp_scroll(self.scroll_y + delta, max);
+        window.request_redraw();
     }
 
     /// 导航：入历史栈并加载。
@@ -262,7 +341,7 @@ impl BrowserApp {
         self.bar.set_loading(false);
         match result {
             Ok(page) => {
-                self.set_page(page);
+                self.set_page(page, true);
                 self.bar.set_url(url);
             }
             Err(error) => {
@@ -270,7 +349,7 @@ impl BrowserApp {
                 // 失败也要出错误页：只打日志会让画面停在上一帧或空白，
                 // 用户看不到任何反馈。
                 let html = format!("<body><h1>加载失败</h1><p>{url}</p><p>{error}</p></body>");
-                self.set_page(pipeline::load_page(&html, ""));
+                self.set_page(pipeline::load_page(&html, ""), true);
             }
         }
     }
@@ -291,9 +370,15 @@ impl BrowserApp {
         if viewport.width == 0 || viewport.height == 0 {
             return;
         }
+        let (width, height) = (viewport.width as f32, viewport.height as f32);
 
-        // 页面 + 地址栏合成显示列表
-        let mut scene = self.scene.clone().unwrap_or_default();
+        // 页面按滚动偏移重建显示列表（内容从工具带下方开始）
+        let mut scene = match (&self.page, &self.root) {
+            (Some(page), Some(root)) => {
+                pipeline::build_scene_at(page, root, 0.0, BAR_HEIGHT - self.scroll_y)
+            }
+            _ => Scene::default(),
+        };
         // 画布底色：pipeline 的画布保持透明，直接 blit 会把透明像素交给
         // surface（alpha_mode Auto），在部分后端表现为黑屏/花屏。先铺不透明白底。
         scene.commands.insert(
@@ -302,14 +387,38 @@ impl BrowserApp {
                 rect: nexty_paint::Rect {
                     x: 0.0,
                     y: 0.0,
-                    width: viewport.width as f32,
-                    height: viewport.height as f32,
+                    width,
+                    height,
                 },
                 color: nexty_paint::Color::opaque(0xff, 0xff, 0xff),
             },
         );
-        self.bar
-            .draw(&self.shaper, &mut scene, viewport.width as f32);
+        // 滚动条：仅指示（不可拖，本轮偏差）
+        if let Some(thumb) = scrollbar_thumb(
+            self.scroll_y,
+            height,
+            self.content_height,
+            BAR_HEIGHT,
+            SCROLLBAR_WIDTH,
+        ) {
+            scene.commands.push(nexty_paint::Command::FillRect {
+                rect: nexty_paint::Rect {
+                    x: width - SCROLLBAR_WIDTH,
+                    y: BAR_HEIGHT,
+                    width: SCROLLBAR_WIDTH,
+                    height: height - BAR_HEIGHT,
+                },
+                color: nexty_paint::Color::opaque(0xe2, 0xe2, 0xe2),
+            });
+            scene.commands.push(nexty_paint::Command::FillRect {
+                rect: nexty_paint::Rect {
+                    x: width - SCROLLBAR_WIDTH,
+                    ..thumb
+                },
+                color: nexty_paint::Color::opaque(0xb4, 0xb4, 0xb4),
+            });
+        }
+        self.bar.draw(&self.shaper, &mut scene, width);
 
         let Some(renderer) = &self.renderer else {
             return;
@@ -360,6 +469,10 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(size.width, size.height);
                 }
+                // 按新视口宽重排（保留滚动量，set_page 内重新 clamp）
+                if let Some(page) = self.page.take() {
+                    self.set_page(page, false);
+                }
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -368,6 +481,14 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32, position.y as f32);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // 滚轮向上（y > 0）→ 减小滚动量
+                let amount = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y * WHEEL_LINE_PX,
+                    MouseScrollDelta::PixelDelta(position) => position.y as f32,
+                };
+                self.scroll_by(-amount);
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -410,6 +531,37 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
                                 window.request_redraw();
                             }
                             return;
+                        }
+                        _ => {}
+                    }
+                }
+                // 地址栏未聚焦时，翻页/滚动键作用于页面
+                if !self.bar.is_focused() {
+                    let viewport_height = self
+                        .window
+                        .as_ref()
+                        .map(|window| window.inner_size().height as f32)
+                        .unwrap_or(0.0);
+                    let page_step = viewport_height * 0.9;
+                    match event.logical_key {
+                        Key::Named(NamedKey::PageDown) => {
+                            self.scroll_by(page_step);
+                        }
+                        Key::Named(NamedKey::PageUp) => {
+                            self.scroll_by(-page_step);
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            self.scroll_by(WHEEL_LINE_PX);
+                        }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            self.scroll_by(-WHEEL_LINE_PX);
+                        }
+                        Key::Named(NamedKey::Home) => {
+                            self.scroll_by(-self.scroll_y);
+                        }
+                        Key::Named(NamedKey::End) => {
+                            let max = max_scroll(self.content_height, BAR_HEIGHT, viewport_height);
+                            self.scroll_by(max - self.scroll_y);
                         }
                         _ => {}
                     }
@@ -842,7 +994,55 @@ fn fs_main_bgra(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32
 
 #[cfg(test)]
 mod tests {
-    use super::{FULLSCREEN_TRIANGLE, pad_rows};
+    use super::{
+        BAR_HEIGHT, FULLSCREEN_TRIANGLE, clamp_scroll, max_scroll, pad_rows, scrollbar_thumb,
+    };
+
+    /// 最大滚动量：不足视口为 0，超出为差值（含工具带高度）。
+    #[test]
+    fn max_scroll_is_overflow_above_viewport() {
+        assert_eq!(max_scroll(0.0, BAR_HEIGHT, 600.0), 0.0);
+        assert_eq!(max_scroll(564.0, BAR_HEIGHT, 600.0), 0.0, "恰好填满视口");
+        assert_eq!(max_scroll(1064.0, BAR_HEIGHT, 600.0), 500.0);
+        assert_eq!(max_scroll(2000.0, BAR_HEIGHT, 100.0), 1936.0);
+    }
+
+    /// 滚动量 clamp 到 [0, max]。
+    #[test]
+    fn clamp_scroll_bounds() {
+        assert_eq!(clamp_scroll(-50.0, 100.0), 0.0);
+        assert_eq!(clamp_scroll(42.0, 100.0), 42.0);
+        assert_eq!(clamp_scroll(150.0, 100.0), 100.0);
+        assert_eq!(clamp_scroll(5.0, 0.0), 0.0, "无溢出时滚动量归零");
+    }
+
+    /// thumb 几何：零溢出无 thumb；半溢出 thumb 占轨道一半（受最小高度约束）。
+    #[test]
+    fn scrollbar_thumb_geometry() {
+        // 不溢出：None
+        assert!(scrollbar_thumb(0.0, 600.0, 100.0, BAR_HEIGHT, 8.0).is_none());
+        assert!(scrollbar_thumb(0.0, 600.0, 564.0, BAR_HEIGHT, 8.0).is_none());
+
+        // 溢出 500（总高 1100）：thumb 高 = 564 × 600/1100 ≈ 307.6（> 24 下限），
+        // 顶部对齐轨道顶
+        let thumb = scrollbar_thumb(0.0, 600.0, 1064.0, BAR_HEIGHT, 8.0).expect("thumb");
+        assert_eq!(thumb.width, 8.0);
+        let expected_height = (600.0 - BAR_HEIGHT) * 600.0 / (1064.0 + BAR_HEIGHT);
+        assert!((thumb.height - expected_height).abs() < 0.01);
+        assert!(
+            (thumb.y - BAR_HEIGHT).abs() < 0.01,
+            "scroll=0 时 thumb 贴轨道顶"
+        );
+
+        // 滚到底：thumb 贴轨道底
+        let thumb = scrollbar_thumb(500.0, 600.0, 1064.0, BAR_HEIGHT, 8.0).expect("thumb");
+        assert!((thumb.y + thumb.height - 600.0).abs() < 0.01);
+
+        // 超长文档：thumb 触发 24px 下限
+        let thumb = scrollbar_thumb(0.0, 600.0, 100000.0, BAR_HEIGHT, 8.0).expect("thumb");
+        assert_eq!(thumb.height, 24.0);
+        assert!((thumb.y - BAR_HEIGHT).abs() < 0.01);
+    }
 
     /// 点是否在三角形内（叉积符号一致法）。
     fn in_triangle(points: [[f32; 2]; 3], p: [f32; 2]) -> bool {
