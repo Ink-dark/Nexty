@@ -307,8 +307,10 @@ impl BrowserApp {
         // 内部 scheme（about:blank 等）不由网络抓取，直接生成本地空白页。
         // 交给 NetworkFetcher 会被协议白名单判为 InvalidUrl，白屏。
         if !url.starts_with("http://") && !url.starts_with("https://") {
+            self.bar.set_loading(false);
             self.show_blank();
             if let Some(window) = &self.window {
+                window.set_title("Nexty");
                 window.request_redraw();
             }
             return;
@@ -392,6 +394,9 @@ impl BrowserApp {
                      <p style=\"color: #5f6368\">{error}</p></body>"
                 );
                 self.set_page(pipeline::load_page(&html, ""), true);
+                if let Some(window) = &self.window {
+                    window.set_title("加载失败 - Nexty");
+                }
             }
         }
     }
