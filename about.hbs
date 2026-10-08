@@ -8,15 +8,19 @@
   h1 { border-bottom: 2px solid #333; padding-bottom: .3rem; }
   h2 { margin-top: 2rem; border-bottom: 1px solid #ccc; padding-bottom: .2rem; font-size: 1.15rem; }
   h2 code { font-size: .85rem; color: #666; font-weight: normal; }
+  h3 { margin-top: 1.2rem; font-size: 1rem; }
   ul { margin: .4rem 0 0; padding-left: 1.4rem; }
   li { margin: .15rem 0; }
   .ver { color: #666; font-size: .9em; }
   pre { white-space: pre-wrap; background: #f6f6f6; padding: 1rem; font-size: .8rem; border-radius: 4px; overflow-x: auto; }
   .note { color: #666; font-size: .9rem; }
   table { border-collapse: collapse; width: 100%; font-size: .92rem; }
-  th, td { border: 1px solid #ddd; padding: .35rem .6rem; text-align: left; }
+  th, td { border: 1px solid #ddd; padding: .35rem .6rem; text-align: left; vertical-align: top; }
   th { background: #f2f2f2; }
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  /* 多重许可的 crate 在每组都出现，加底纹提示读者这是同一 crate 的重复 */
+  tr.multi td:first-child { border-left: 3px solid #b58900; }
+  .spdx { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: .82rem; color: #444; }
 </style>
 </head>
 <body>
@@ -30,7 +34,7 @@
 <h2>许可证概览</h2>
 <table>
   <thead>
-    <tr><th>许可证</th><th>名称</th><th>依赖数</th></tr>
+    <tr><th>许可证</th><th>名称</th><th class="num">条目数</th></tr>
   </thead>
   <tbody>
     {{#each overview}}
@@ -43,11 +47,27 @@
   </tbody>
 </table>
 
-<h2>许可证全文</h2>
-<p class="note">
-  同一 SPDX 标识可能因各 crate 附带的许可证正文不同而分成多段列出（cargo-about 按「标识 + 正文」分组），
-  故下方出现多个同名许可证属正常现象。
-</p>
+<h2>如何阅读本清单</h2>
+<ul class="note">
+  <li>
+    cargo-about 按「<strong>SPDX 标识 + 许可证正文</strong>」分组。因此：
+    <ul>
+      <li>同一 SPDX 标识但正文不同的，会拆成多个同名章节（正文内容相同，属正常现象）；</li>
+      <li>声明了多个标识的 crate（如 <code>ISC AND (Apache-2.0 OR ISC) AND …</code>）
+          会<strong>在每个相关章节各出现一次</strong>，左侧有金色左边框的条目即此类重复项。</li>
+    </ul>
+  </li>
+  <li>
+    每个条目的「SPDX 声明」列给出该 crate 的<strong>原始 SPDX 表达式</strong>，
+    「本清单中的章节数」列给出它在多少个章节重复出现——两者对照即可判断
+    该 crate 是单许可还是多重许可，无需跨章节比对。
+  </li>
+  <li>
+    <code>AND</code> 表示须<strong>同时</strong>履行各项义务；
+    <code>OR</code> 表示可<strong>任选其一</strong>。跨组的 crate 几乎都是
+    多重许可（多为 Rust 生态的 <code>MIT OR Apache-2.0</code>），义务不叠加。
+  </li>
+</ul>
 
 {{#each licenses}}
 <section>
@@ -57,14 +77,72 @@
     <li>
       <strong>{{crate.name}}</strong> <span class="ver">{{crate.version}}</span>
       {{#if crate.repository}} — <a href="{{crate.repository}}">{{crate.repository}}</a>{{/if}}
+      {{#if crate.license}}
+      <br><span class="spdx">SPDX: {{crate.license}}</span>
+      {{/if}}
     </li>
     {{/each}}
   </ul>
+  {{#if source_path}}
+  <p class="note">许可证正文来源：<code>{{source_path}}</code></p>
+  {{/if}}
   <details>
     <summary>许可证全文</summary>
     <pre>{{text}}</pre>
   </details>
 </section>
 {{/each}}
+
+<h2>NOTICE 与归属声明</h2>
+<p class="note">
+  Apache-2.0 §4(d) 要求：若作品附带 <code>NOTICE</code> 文件，衍生作品必须保留其中的
+  归属声明。下表列出随依赖包分发的归属声明文件（NOTICE / COPYING / AUTHORS 等）。
+  <strong>此区块由<code>.workbuddy/collect_notices.py</code> + <code>inject.py</code>
+  注入</strong>——cargo-about 的模板上下文不提供 NOTICE 数据，
+  故需在 <code>cargo about generate</code> 之后追加一步注入。
+</p>
+<!--CARGO-ABOUT:NOTICES-->
+<!--/CARGO-ABOUT:NOTICES-->
+
+<!--CARGO-ABOUT:MULTI-->
+<!--/CARGO-ABOUT:MULTI-->
+
+<h2>已知的完整性问题</h2>
+<ul class="note">
+  <li>
+    <strong><code>aws-lc-sys 0.45.0</code> 横跨 ISC / Apache-2.0 / MIT /
+    BSD-3-Clause 四组</strong>，其单个 <code>LICENSE</code>（316 行）是聚合文件：
+    第 91 行起为「Third-Party Libraries (compiled into libcrypto/libssl)」，
+    第 142 行起为「(NOT compiled into…)」，内含 Amazon（Copyright Amazon.com,
+    Inc.）、Google Inc.（2014-2024、2025-2026、2008）、The OpenSSL Project
+    （1998-2011）、Eric Young（1995-1998）、the fiat-crypto authors（2015-2020）、
+    Stephan Mueller（2017-2025）、The Go Authors、mlkem-native / mldsa-native
+    project authors 等<strong>十余个独立版权方</strong>的条款。
+    这些声明目前只存在于该聚合 LICENSE 内，<strong>未被单独抽出为 NOTICE 文件</strong>。
+  </li>
+  <li>
+    <strong>Jitter Entropy 的许可切换需留意</strong>：其代码本为 BSD / GPLv2 双许可，
+    AWS 声明「expressly elects to distribute the package under the
+    3-Clause BSD License and <em>NOT</em> under GNU GPL v2」。本项目遵循
+    BSD-3-Clause 路径，<strong>不得</strong>同时主张 GPLv2。
+  </li>
+  <li>
+    <strong>Keccak / AES 参考实现为公有领域（CC0）</strong>：无版权保留义务，
+    但其「作者列于源文件注释中」的说明意味着署名信息分布在源码树而非 NOTICE。
+  </li>
+  <li>
+    本清单由 cargo-about 生成，<strong>只能覆盖「随 crate 包分发」的文件</strong>。
+    部分 crate 在仓库根目录或子目录另附 <code>LICENSE-*</code>、<code>COPYING</code>
+    或第三方声明，包内未含——这类需回查上游仓库，本清单无法代为核对。
+  </li>
+</ul>
+
+<h2>机器可读视图</h2>
+<p class="note">
+  面向阅读的精简致谢视图见 <a href="third-party-credits.md">docs/third-party-credits.md</a>
+  （按许可证标识集合分组，含版权年份与版权人）。许可证白名单与门禁判定见
+  <code>deny.toml</code> 与 <code>cargo deny check</code>；若本清单与门禁结论
+  不一致，以门禁为准。
+</p>
 </body>
 </html>

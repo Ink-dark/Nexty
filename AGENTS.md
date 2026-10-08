@@ -37,7 +37,14 @@ cargo fmt --all -- --check
 
 # 依赖门禁与许可证清单（引入/升级任何依赖后必跑）
 cargo deny check                         # 白名单见根目录 deny.toml，扫传递依赖
+cargo about generate --format json -o .workbuddy/about.json# 供注入脚本读取
 cargo about generate about.hbs -o docs/dependencies.html   # 重新生成第三方依赖清单
+# 上面两步之后必须再跑注入，补cargo-about 不提供的两个区块：
+#   NOTICE/归属声明清单、多重许可（SPDX 含 AND）人工核对表。
+# 这两块无法写在 .hbs 里——cargo-about 的模板上下文只有
+# overview/licenses/crates，没有 notices，也没有「同一 crate 跨几个 license 组」。
+# 脚本在 .workbuddy/（本机代理数据，不入库），流程可重复执行且幂等：
+python .workbuddy/collect_notices.py && python .workbuddy/inject.py
 
 # 单个 crate 目录下（例如 crates/nexty-xxx/）
 cargo check                             # 检查该 crate（必须零 warning）
