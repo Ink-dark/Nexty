@@ -18,10 +18,10 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::history::History;
-use crate::pipeline::{self, Page};
+use crate::pipeline::{self, HoverKind, Page};
 use crate::render::RenderThread;
 use crate::scrollbar::{self, ScrollGeometry, Scrollbar, ScrollbarHit};
 use crate::ui::{self, AddressBar, BAR_HEIGHT, BarCommand, CaretDirection, UiEvent};
@@ -114,6 +114,8 @@ struct BrowserApp {
     /// 页面滚动量，px ∈ [0, max_scroll]。
     scroll_y: f32,
     cursor: (f32, f32),
+    /// 当前系统光标种类（仅在变化时调用 `set_cursor`）。
+    hover: HoverKind,
 }
 
 impl BrowserApp {
@@ -136,6 +138,7 @@ impl BrowserApp {
             content_height: 0.0,
             scroll_y: 0.0,
             cursor: (0.0, 0.0),
+            hover: HoverKind::Default,
         }
     }
 
@@ -225,6 +228,43 @@ impl BrowserApp {
         };
         let target = scrollbar::clamp_scroll(self.scroll_y + delta, geometry.max_scroll());
         self.set_scroll(target);
+    }
+
+    /// 按光标位置更新系统光标形状（仅在种类变化时调用 `set_cursor`）。
+    ///
+    /// 拖拽滚动条期间不覆盖（拖拽是明确的指代动作）。
+    fn update_cursor_icon(&mut self) {
+        if self.scrollbar.is_dragging() {
+            return;
+        }
+        let (x, y) = self.cursor;
+        let viewport_width = self
+            .window
+            .as_ref()
+            .map_or(0.0, |window| window.inner_size().width as f32);
+        let kind = if y <= BAR_HEIGHT {
+            // 工具带：输入框范围内是 I 形，其余默认
+            let input = ui::input_rect(viewport_width);
+            if x >= input.x && x <= input.x + input.width {
+                HoverKind::Text
+            } else {
+                HoverKind::Default
+            }
+        } else {
+            match (&self.page, &self.root) {
+                (Some(page), Some(root)) => {
+                    // 窗口坐标 → 页面坐标（与命中测试/导航同一换算）
+                    pipeline::hover_kind(page, root, x, y - BAR_HEIGHT + self.scroll_y)
+                }
+                _ => HoverKind::Default,
+            }
+        };
+        if kind != self.hover {
+            self.hover = kind;
+            if let Some(window) = &self.window {
+                window.set_cursor(cursor_icon(kind));
+            }
+        }
     }
 
     /// 页面区域左键按下：滚动条优先（拖拽 thumb / 轨道翻页），其次链接命中导航。
@@ -551,6 +591,7 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
                 {
                     window.request_redraw();
                 }
+                self.update_cursor_icon();
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 // 滚轮向上（y > 0）→ 减小滚动量
@@ -726,6 +767,15 @@ fn caret_direction(key: ui::Key) -> Option<CaretDirection> {
         ui::Key::Home => Some(CaretDirection::Home),
         ui::Key::End => Some(CaretDirection::End),
         _ => None,
+    }
+}
+
+/// 悬停语义 → 系统光标形状。
+fn cursor_icon(kind: HoverKind) -> CursorIcon {
+    match kind {
+        HoverKind::Default => CursorIcon::Default,
+        HoverKind::Text => CursorIcon::Text,
+        HoverKind::Pointer => CursorIcon::Pointer,
     }
 }
 

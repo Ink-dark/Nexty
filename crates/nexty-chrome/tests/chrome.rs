@@ -260,6 +260,109 @@ fn link_target_requires_href_and_miss_returns_none() {
     assert!(pipeline::hit_test(&root, 5.0, 300.0).is_none());
 }
 
+/// T4：悬停光标语义——链接（文本/块级/图片）→ 手型，正文文本 → I 形，空白 → 默认。
+#[test]
+fn hover_kind_follows_links_text_and_blank() {
+    let page = pipeline::load_page(
+        "<body style=\"margin: 0\">\
+         <p style=\"margin: 0\"><a href=\"/x\">linktext</a></p>\
+         <p style=\"margin: 0\">plaintext</p>\
+         </body>",
+        "",
+    );
+    let shaper = ParleyTextShaper::new();
+    let root = pipeline::layout_page(&page, &shaper, 300.0).expect("root");
+    let body = &root.children[0];
+    let link_p = &body.children[0];
+    let plain_p = &body.children[1];
+
+    // 链接文本 run 中点 → 手型
+    let run = &link_p.lines[0].runs[0];
+    let first = run.glyphs[0];
+    let last = run.glyphs.last().expect("glyphs");
+    let mid = (first.x + last.x + last.advance) / 2.0;
+    let y = link_p.border_box.y + 2.0;
+    assert_eq!(
+        pipeline::hover_kind(&page, body, mid, y),
+        pipeline::HoverKind::Pointer,
+        "链接文本 → 手型"
+    );
+
+    // 正文文本 run 中点 → I 形
+    let run = &plain_p.lines[0].runs[0];
+    let first = run.glyphs[0];
+    let last = run.glyphs.last().expect("glyphs");
+    let mid = (first.x + last.x + last.advance) / 2.0;
+    let y = plain_p.border_box.y + 2.0;
+    assert_eq!(
+        pipeline::hover_kind(&page, body, mid, y),
+        pipeline::HoverKind::Text,
+        "正文文本 → I 形"
+    );
+
+    // 盒内空白（文本右侧、行纵向之外）→ 默认；盒外 → 默认
+    assert_eq!(
+        pipeline::hover_kind(&page, body, plain_p.border_box.width - 1.0, y),
+        pipeline::HoverKind::Default,
+        "盒内非文本区 → 默认"
+    );
+    assert_eq!(
+        pipeline::hover_kind(&page, body, 10.0, -50.0),
+        pipeline::HoverKind::Default,
+        "盒外 → 默认"
+    );
+}
+
+/// T4：块级链接整个盒 → 手型；链接内图片 → 手型，且命中类型区分为图片。
+#[test]
+fn hover_kind_covers_block_link_and_image() {
+    let page = pipeline::load_page(
+        "<body><a href=\"t\" style=\"display: block; height: 20px\">block</a>\
+         <a href=\"logo\" style=\"display: block\"><img width=40 height=30 src=a.png></a></body>",
+        "body { margin: 0 }",
+    );
+    let shaper = ParleyTextShaper::new();
+    let root = pipeline::layout_page(&page, &shaper, 200.0).expect("root");
+    let body = &root.children[0];
+    let block_link = &body.children[0];
+    let image_link = &body.children[1];
+
+    // 块级链接盒内（文本之下）仍是链接
+    assert_eq!(
+        pipeline::hover_kind(
+            &page,
+            body,
+            10.0,
+            block_link.border_box.y + block_link.border_box.height - 2.0
+        ),
+        pipeline::HoverKind::Pointer,
+        "块级链接 → 手型"
+    );
+
+    // 链接内图片：命中类型为 Image，光标仍是手型
+    let hit = pipeline::hit_test_ex(body, 10.0, image_link.border_box.y + 10.0).expect("命中图片");
+    assert_eq!(hit.kind, pipeline::HitKind::Image);
+    assert_eq!(
+        pipeline::hover_kind(&page, body, 10.0, image_link.border_box.y + 10.0),
+        pipeline::HoverKind::Pointer
+    );
+}
+
+/// T4：`hit_test` 仍是 `hit_test_ex` 的薄封装（节点一致）。
+#[test]
+fn hit_test_wrapper_matches_hit_test_ex_node() {
+    let page = pipeline::load_page(
+        "<body><p style=\"margin: 0\">hello</p></body>",
+        "body { margin: 0 }",
+    );
+    let shaper = ParleyTextShaper::new();
+    let root = pipeline::layout_page(&page, &shaper, 200.0).expect("root");
+    let node = pipeline::hit_test(&root, 5.0, 5.0).expect("命中");
+    let hit = pipeline::hit_test_ex(&root, 5.0, 5.0).expect("命中");
+    assert_eq!(Some(node), Some(hit.node));
+    assert_eq!(hit.kind, pipeline::HitKind::TextRun, "命中的是文本 run");
+}
+
 /// T5：`<title>` 文本提取；空白/缺失/非 HTML 命名空间返回 None。
 #[test]
 fn document_title_extraction() {

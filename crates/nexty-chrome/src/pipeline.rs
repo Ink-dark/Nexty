@@ -248,18 +248,73 @@ fn is_image_node(document: &Document, node: NodeId) -> bool {
     )
 }
 
-/// 命中测试：返回视口点 `(x, y)` 命中的最深片段节点。
+/// 命中的内容类型（决定悬停光标等交互反馈）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitKind {
+    /// 命中的是盒本身（未深入行内内容或块级子盒）。
+    Fragment,
+    /// 命中了行内文本 run。
+    TextRun,
+    /// 命中了图片（行内替换元素）。
+    Image,
+}
+
+/// 命中结果：最深片段节点 + 命中类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hit {
+    /// 命中的节点。
+    pub node: NodeId,
+    /// 命中类型。
+    pub kind: HitKind,
+}
+
+/// 悬停光标语义：链接 → 手型，文本 → I 形，其余 → 默认箭头。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoverKind {
+    /// 默认箭头。
+    Default,
+    /// I 形（文本）。
+    Text,
+    /// 手型（链接）。
+    Pointer,
+}
+
+/// 计算页面点 `(x, y)` 的悬停光标语义（坐标与 [`hit_test_ex`] 同系）。
+///
+/// 链接触发优先于文本：命中节点的祖先链上存在带 `href` 的 `<a>` 即为链接。
+#[must_use]
+pub fn hover_kind(page: &Page, root: &Fragment, x: f32, y: f32) -> HoverKind {
+    let Some(hit) = hit_test_ex(root, x, y) else {
+        return HoverKind::Default;
+    };
+    if link_target(page, hit.node).is_some() {
+        return HoverKind::Pointer;
+    }
+    match hit.kind {
+        HitKind::TextRun => HoverKind::Text,
+        HitKind::Fragment | HitKind::Image => HoverKind::Default,
+    }
+}
+
+/// 命中测试：返回视口点 `(x, y)` 命中的最深片段节点与命中类型。
 ///
 /// 坐标以 `root` 的边框盒原点为参照（与 [`build_scene_at`] 的原点参数
 /// 一致：窗口坐标减去原点即得）。命中顺序镜像绘制顺序：行内内容
 /// （文本 run / 图片 / 行内原子盒）优先于块级子盒；点在盒内但未命中
 /// 更深层时返回本盒节点。
-pub fn hit_test(root: &Fragment, x: f32, y: f32) -> Option<NodeId> {
+#[must_use]
+pub fn hit_test_ex(root: &Fragment, x: f32, y: f32) -> Option<Hit> {
     hit_fragment(root, 0.0, 0.0, x, y)
 }
 
-/// `hit_test` 的递归体：`(ox, oy)` 为父链累积的本片段边框盒原点。
-fn hit_fragment(fragment: &Fragment, ox: f32, oy: f32, x: f32, y: f32) -> Option<NodeId> {
+/// 命中测试：只取命中的节点（[`hit_test_ex`] 的薄封装）。
+#[must_use]
+pub fn hit_test(root: &Fragment, x: f32, y: f32) -> Option<NodeId> {
+    hit_test_ex(root, x, y).map(|hit| hit.node)
+}
+
+/// `hit_test_ex` 的递归体：`(ox, oy)` 为父链累积的本片段边框盒原点。
+fn hit_fragment(fragment: &Fragment, ox: f32, oy: f32, x: f32, y: f32) -> Option<Hit> {
     let bx = ox + fragment.border_box.x;
     let by = oy + fragment.border_box.y;
     if x < bx || x > bx + fragment.border_box.width || y < by || y > by + fragment.border_box.height
@@ -285,7 +340,10 @@ fn hit_fragment(fragment: &Fragment, ox: f32, oy: f32, x: f32, y: f32) -> Option
                 let run_start = content_x + first.x;
                 let run_end = content_x + last.x + last.advance;
                 if x >= run_start && x <= run_end {
-                    return Some(run.node);
+                    return Some(Hit {
+                        node: run.node,
+                        kind: HitKind::TextRun,
+                    });
                 }
             }
             for image in &line.images {
@@ -295,12 +353,15 @@ fn hit_fragment(fragment: &Fragment, ox: f32, oy: f32, x: f32, y: f32) -> Option
                     && y >= top
                     && y <= top + image.height
                 {
-                    return Some(image.node);
+                    return Some(Hit {
+                        node: image.node,
+                        kind: HitKind::Image,
+                    });
                 }
             }
             for atomic in &line.boxes {
-                if let Some(node) = hit_fragment(atomic, content_x, line_y, x, y) {
-                    return Some(node);
+                if let Some(hit) = hit_fragment(atomic, content_x, line_y, x, y) {
+                    return Some(hit);
                 }
             }
         }
@@ -308,11 +369,14 @@ fn hit_fragment(fragment: &Fragment, ox: f32, oy: f32, x: f32, y: f32) -> Option
     }
 
     for child in &fragment.children {
-        if let Some(node) = hit_fragment(child, content_x, content_y, x, y) {
-            return Some(node);
+        if let Some(hit) = hit_fragment(child, content_x, content_y, x, y) {
+            return Some(hit);
         }
     }
-    Some(fragment.node)
+    Some(Hit {
+        node: fragment.node,
+        kind: HitKind::Fragment,
+    })
 }
 
 /// `node` 向上找最近的 `<a href>` 祖先（含自身），返回 href 原文。

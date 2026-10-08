@@ -178,7 +178,10 @@ fn button_rect(button: BarButton) -> Rect {
 }
 
 /// 地址栏输入框的矩形（视口坐标；右侧给按钮让位）。
-fn input_rect(viewport_width: f32) -> Rect {
+///
+/// 供外壳判定悬停光标（输入框范围内是 I 形）。
+#[must_use]
+pub fn input_rect(viewport_width: f32) -> Rect {
     let x = INSET + BUTTON_COUNT as f32 * (BUTTON_SIZE + GAP);
     Rect {
         x,
