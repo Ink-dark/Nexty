@@ -1,14 +1,20 @@
 //! 自绘浏览器 UI：工具带（导航按钮 + 地址栏）状态机与绘制。
 //!
 //! 没有控件库——工具带是纯状态机 + 显示列表指令（背景填充、按钮底色、
-//! 输入框描边、文本 run），与页面走同一条渲染管线。绘制坐标系：视口
-//! 左上角为原点。
+//! 输入框描边、文本 run、选区高亮、光标竖线），与页面走同一条渲染管线。
+//! 绘制坐标系：视口左上角为原点。
 //!
-//! 已知偏差：按钮字形（←/→/⟳）依赖字体回退，整形失败时降级为只画按钮
-//! 底色；按钮无悬停态（未跟踪光标）；加载进度条为静态指示，无动画。
+//! 地址栏是可编辑的单行输入框：光标（`caret`，字节偏移且始终落在 char 边界）
+//! 与选区（`anchor`），支持 `←`/`→`/Home/End 移动、Shift+方向扩选、Ctrl+A 全选、
+//! Backspace/Delete 删选区或单字符、输入字符替换选区；点击输入框 = 聚焦并全选
+//! （Chrome 语义）。文本超出输入框宽度时按光标位置横向滚动。
+//!
+//! 已知偏差：按钮字形（←/→/⟳）依赖字体回退，整形失败时降级为只画按钮底色；
+//! 按钮无悬停态（未跟踪光标）；点击输入框不按 x 落光标（事件层拿不到整形度量，
+//! 故只做聚焦 + 全选）；加载进度条为静态指示，无动画。
 
 use nexty_paint::{Color, Command, Rect, Scene, TextGlyph};
-use nexty_text::TextShaper;
+use nexty_text::{TextShaper, TextStyle};
 
 /// 工具带高度，px。
 pub const BAR_HEIGHT: f32 = 36.0;
@@ -26,6 +32,17 @@ pub const BUTTON_SIZE: f32 = 28.0;
 const BUTTON_COUNT: usize = 3;
 /// 加载进度条厚度，px。
 const LOADING_STRIP_HEIGHT: f32 = 3.0;
+/// 选区高亮色（半透明蓝，叠加在输入框白底上）。
+const SELECTION_COLOR: Color = Color {
+    r: 0x1a,
+    g: 0x73,
+    b: 0xe8,
+    a: 0x59,
+};
+/// 光标竖线宽度，px。
+const CARET_WIDTH: f32 = 1.0;
+/// 光标距输入框上下缘的留白，px。
+const CARET_INSET: f32 = 3.0;
 
 /// 工具带按钮（从左到右）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +89,19 @@ pub enum BarCommand {
     Reload,
 }
 
+/// 光标移动方向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaretDirection {
+    /// 左移一个字符（或收拢到选区起点）。
+    Left,
+    /// 右移一个字符（或收拢到选区终点）。
+    Right,
+    /// 移到文本开头。
+    Home,
+    /// 移到文本末尾。
+    End,
+}
+
 /// 按钮的命中矩形（视口坐标）。
 fn button_rect(button: BarButton) -> Rect {
     let x = INSET + button.index() as f32 * (BUTTON_SIZE + GAP);
@@ -102,19 +132,41 @@ pub struct AddressBar {
     loading: bool,
     can_back: bool,
     can_forward: bool,
+    /// 光标位置（字节偏移，始终落在 char 边界）。
+    caret: usize,
+    /// 选区锚点（字节偏移）；`None` 表示无选区。
+    anchor: Option<usize>,
 }
 
 /// UI 输入事件（由窗口事件转译而来）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UiEvent {
-    /// 输入一个字符（仅聚焦时生效）。
+    /// 输入一个字符（仅聚焦时生效；有选区时替换选区）。
     Character(char),
-    /// 退格（仅聚焦时生效）。
+    /// 退格：删选区，或删除光标前一个字符。
     Backspace,
+    /// 前向删除：删选区，或删除光标后一个字符。
+    Delete,
+    /// 移动光标；`extend` 为真（Shift）时扩选而非取消选区。
+    MoveCaret {
+        /// 移动方向。
+        direction: CaretDirection,
+        /// 是否按住 Shift 扩选。
+        extend: bool,
+    },
+    /// 全选输入框内容。
+    SelectAll,
     /// 提交（Enter）。
     Submit,
     /// 鼠标左键按下（按视口坐标路由到按钮或输入框）。
-    Click { x: f32, y: f32 },
+    Click {
+        /// 视口 x。
+        x: f32,
+        /// 视口 y。
+        y: f32,
+    },
+    /// 聚焦输入框并全选（Ctrl+L 等快捷键）。
+    FocusAndSelect,
 }
 
 /// 一次事件处理的结果。
@@ -127,15 +179,18 @@ pub struct UiAction {
 }
 
 impl AddressBar {
-    /// 创建工具带并展示初始 URL（输入框聚焦）。
+    /// 创建工具带并展示初始 URL（输入框聚焦，光标在末尾）。
     #[must_use]
     pub fn new(url: impl Into<String>) -> Self {
+        let url = url.into();
         Self {
-            url: url.into(),
+            caret: url.len(),
+            url,
             focused: true,
             loading: false,
             can_back: false,
             can_forward: false,
+            anchor: None,
         }
     }
 
@@ -151,9 +206,19 @@ impl AddressBar {
         self.focused
     }
 
-    /// 展示一个 URL（导航完成后由外壳调用）。
+    /// 当前选区 `(起点, 终点)`（归一化，字节偏移）；无选区为 `None`。
+    #[must_use]
+    pub fn selection(&self) -> Option<(usize, usize)> {
+        let anchor = self.anchor?;
+        let (start, end) = (anchor.min(self.caret), anchor.max(self.caret));
+        (start != end).then_some((start, end))
+    }
+
+    /// 展示一个 URL（导航完成后由外壳调用）；光标移到末尾并清空选区。
     pub fn set_url(&mut self, url: impl Into<String>) {
         self.url = url.into();
+        self.caret = self.url.len();
+        self.anchor = None;
     }
 
     /// 更新加载状态（外壳在导航开始/结束时调用）。
@@ -167,19 +232,71 @@ impl AddressBar {
         self.can_forward = can_forward;
     }
 
+    /// 取消聚焦并清空选区（Esc）。
+    pub fn blur(&mut self) {
+        self.focused = false;
+        self.anchor = None;
+    }
+
     /// 处理一次 UI 事件。
     #[must_use]
     pub fn handle(&mut self, event: UiEvent) -> UiAction {
         match event {
             UiEvent::Character(character) => {
                 if self.focused && !character.is_control() {
-                    self.url.push(character);
+                    self.delete_selection();
+                    self.url.insert(self.caret, character);
+                    self.caret += character.len_utf8();
+                    self.anchor = None;
                 }
             }
             UiEvent::Backspace => {
                 if self.focused {
-                    self.url.pop();
+                    if !self.delete_selection() && self.caret > 0 {
+                        let previous = self.previous_boundary(self.caret);
+                        self.url.replace_range(previous..self.caret, "");
+                        self.caret = previous;
+                    }
+                    self.anchor = None;
                 }
+            }
+            UiEvent::Delete => {
+                if self.focused {
+                    if !self.delete_selection() && self.caret < self.url.len() {
+                        let next = self.next_boundary(self.caret);
+                        self.url.replace_range(self.caret..next, "");
+                    }
+                    self.anchor = None;
+                }
+            }
+            UiEvent::MoveCaret { direction, extend } => {
+                if self.focused {
+                    let target = match direction {
+                        // 未扩选时，带选区的左/右移动先收拢到选区端点
+                        CaretDirection::Left => match self.selection() {
+                            Some((start, _)) if !extend => start,
+                            _ => self.previous_boundary(self.caret),
+                        },
+                        CaretDirection::Right => match self.selection() {
+                            Some((_, end)) if !extend => end,
+                            _ => self.next_boundary(self.caret),
+                        },
+                        CaretDirection::Home => 0,
+                        CaretDirection::End => self.url.len(),
+                    };
+                    self.move_caret(target, extend);
+                }
+            }
+            UiEvent::SelectAll => {
+                if self.focused {
+                    self.anchor = Some(0);
+                    self.caret = self.url.len();
+                }
+            }
+            UiEvent::FocusAndSelect => {
+                self.focused = true;
+                self.anchor = Some(0);
+                self.caret = self.url.len();
             }
             UiEvent::Submit => {
                 if self.focused
@@ -195,6 +312,7 @@ impl AddressBar {
                 if y > BAR_HEIGHT {
                     // 页面区域：取消聚焦
                     self.focused = false;
+                    self.anchor = None;
                     return UiAction::default();
                 }
                 // 工具带内：按钮命中优先（不改变聚焦态），否则进输入框
@@ -223,6 +341,11 @@ impl AddressBar {
                         return UiAction::default();
                     }
                 }
+                // 输入框：未聚焦时点击 = 聚焦并全选（Chrome 语义）
+                if !self.focused {
+                    self.anchor = Some(0);
+                    self.caret = self.url.len();
+                }
                 self.focused = true;
             }
         }
@@ -230,8 +353,6 @@ impl AddressBar {
     }
 
     /// 把工具带绘制为显示列表指令（画在视口顶部）。
-    ///
-    /// URL 文本超出输入框宽度时截断（不做省略号，简化处理）。
     pub fn draw(&self, shaper: &dyn TextShaper, scene: &mut Scene, viewport_width: f32) {
         // 背景条
         scene.commands.push(Command::FillRect {
@@ -257,7 +378,7 @@ impl AddressBar {
         }
 
         let families = vec!["sans-serif".to_owned()];
-        let style = nexty_text::TextStyle {
+        let style = TextStyle {
             families: families.clone(),
             size: FONT_SIZE,
         };
@@ -325,41 +446,156 @@ impl AddressBar {
             width: 1.5,
         });
 
-        // URL 文本（超出宽度时按字符截断）
-        let max_width = input.width - 2.0 * TEXT_PADDING;
-        let mut text = self.url.clone();
-        // 每轮缩短一个字符直到放得下，用 `loop` 而非 `while let`：终止条件是
-        // 「宽度达标或文本为空」，不是「Option 为 None」。
-        #[allow(clippy::while_let_loop)]
-        loop {
-            // 整形失败（系统字体缺失等）不能 panic：draw 在主线程执行，
-            // 渲染线程的 catch_unwind 兜底覆盖不到这里。降级为不画文本，
-            // 输入框仍正常显示。
-            let Ok(shaped) = shaper.shape(&text, &style) else {
-                break;
-            };
-            if shaped.width <= max_width || text.is_empty() {
-                if !shaped.glyphs.is_empty() {
-                    scene.commands.push(Command::DrawText {
-                        glyphs: shaped
-                            .glyphs
-                            .iter()
-                            .map(|glyph| TextGlyph {
-                                id: glyph.id,
-                                x: input.x + TEXT_PADDING + glyph.x,
-                                y: glyph.y,
-                            })
-                            .collect(),
-                        baseline: input.y + input.height - 8.0,
-                        families: families.clone(),
-                        size: FONT_SIZE,
-                        color: Color::opaque(0x20, 0x20, 0x20),
-                    });
-                }
-                break;
+        self.draw_text(shaper, scene, &style, &families, input);
+    }
+
+    /// 输入框内的文本、选区高亮与光标。
+    ///
+    /// 文本超出输入框宽度时按光标位置横向滚动（光标移出右缘则整体左移）。
+    /// 整形失败（系统字体缺失等）降级为不画文本：`draw` 在主线程执行，
+    /// 渲染线程的 `catch_unwind` 兜底覆盖不到这里。
+    fn draw_text(
+        &self,
+        shaper: &dyn TextShaper,
+        scene: &mut Scene,
+        style: &TextStyle,
+        families: &[String],
+        input: Rect,
+    ) {
+        let Ok(shaped) = shaper.shape(&self.url, style) else {
+            return;
+        };
+        let max_width = (input.width - 2.0 * TEXT_PADDING).max(0.0);
+        let caret_x = self.prefix_width(&self.url[..self.caret], shaper, style);
+        // 横向滚动：把光标保持在输入框内
+        let offset = if shaped.width > max_width {
+            let mut offset = 0.0_f32;
+            if caret_x > max_width {
+                offset = caret_x - max_width;
             }
-            text.pop();
+            if caret_x < offset {
+                offset = caret_x;
+            }
+            offset.clamp(0.0, shaped.width - max_width)
+        } else {
+            0.0
+        };
+        let origin_x = input.x + TEXT_PADDING - offset;
+        let baseline = input.y + input.height - 8.0;
+
+        // 选区高亮（画在文本之下），夹取到输入框内
+        if let Some((start, end)) = self.selection() {
+            let start_x = origin_x + self.prefix_width(&self.url[..start], shaper, style);
+            let end_x = origin_x + self.prefix_width(&self.url[..end], shaper, style);
+            let left = start_x.max(input.x);
+            let right = end_x.min(input.x + input.width);
+            if right > left {
+                scene.commands.push(Command::FillRect {
+                    rect: Rect {
+                        x: left,
+                        y: input.y,
+                        width: right - left,
+                        height: input.height,
+                    },
+                    color: SELECTION_COLOR,
+                });
+            }
         }
+
+        // 文本：逐字形按输入框范围裁剪，避免溢出到按钮上
+        let glyphs: Vec<TextGlyph> = shaped
+            .glyphs
+            .iter()
+            .filter(|glyph| {
+                let x = origin_x + glyph.x;
+                x + glyph.advance >= input.x && x <= input.x + input.width
+            })
+            .map(|glyph| TextGlyph {
+                id: glyph.id,
+                x: origin_x + glyph.x,
+                y: glyph.y,
+            })
+            .collect();
+        if !glyphs.is_empty() {
+            scene.commands.push(Command::DrawText {
+                glyphs,
+                baseline,
+                families: families.to_vec(),
+                size: FONT_SIZE,
+                color: Color::opaque(0x20, 0x20, 0x20),
+            });
+        }
+
+        // 光标：聚焦且无选区时画竖线
+        if self.focused && self.selection().is_none() {
+            let caret = (origin_x + caret_x).clamp(input.x, input.x + input.width - CARET_WIDTH);
+            scene.commands.push(Command::FillRect {
+                rect: Rect {
+                    x: caret,
+                    y: input.y + CARET_INSET,
+                    width: CARET_WIDTH,
+                    height: input.height - 2.0 * CARET_INSET,
+                },
+                color: Color::opaque(0x20, 0x20, 0x20),
+            });
+        }
+    }
+
+    /// 前缀整形宽度（光标与选区端点的定位依据）。
+    fn prefix_width(&self, text: &str, shaper: &dyn TextShaper, style: &TextStyle) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        shaper.shape(text, style).map_or(0.0, |shaped| shaped.width)
+    }
+
+    /// 光标左侧的 char 边界。
+    fn previous_boundary(&self, index: usize) -> usize {
+        self.url[..index]
+            .chars()
+            .next_back()
+            .map_or(0, |character| index - character.len_utf8())
+    }
+
+    /// 光标右侧的 char 边界。
+    fn next_boundary(&self, index: usize) -> usize {
+        self.url[index..]
+            .chars()
+            .next()
+            .map_or(self.url.len(), |character| index + character.len_utf8())
+    }
+
+    /// 把索引吸附到最近的 char 边界（防御中间偏移）。
+    fn snap_boundary(&self, index: usize) -> usize {
+        let mut index = index.min(self.url.len());
+        while index > 0 && !self.url.is_char_boundary(index) {
+            index -= 1;
+        }
+        index
+    }
+
+    /// 移动光标；`extend` 为真时以原光标为锚点扩选。
+    fn move_caret(&mut self, index: usize, extend: bool) {
+        let index = self.snap_boundary(index);
+        if extend {
+            if self.anchor.is_none() {
+                self.anchor = Some(self.caret);
+            }
+        } else {
+            self.anchor = None;
+        }
+        self.caret = index;
+    }
+
+    /// 删除当前选区并返回是否确有删除。
+    fn delete_selection(&mut self) -> bool {
+        let Some((start, end)) = self.selection() else {
+            return false;
+        };
+        self.url.replace_range(start..end, "");
+        self.caret = start;
+        self.anchor = None;
+        true
     }
 }
 
@@ -379,6 +615,14 @@ fn normalize(url: &str) -> Option<String> {
 mod tests {
     use super::*;
     use nexty_text::ParleyTextShaper;
+
+    fn click_input(bar: &mut AddressBar) {
+        let _ = bar.handle(UiEvent::Click { x: 100.0, y: 10.0 });
+    }
+
+    fn move_caret(bar: &mut AddressBar, direction: CaretDirection, extend: bool) {
+        let _ = bar.handle(UiEvent::MoveCaret { direction, extend });
+    }
 
     #[test]
     fn typing_accumulates_and_backspace_pops() {
@@ -418,11 +662,13 @@ mod tests {
         assert!(!bar.is_focused());
         let _ = bar.handle(UiEvent::Character('x'));
         assert_eq!(bar.url(), "about:blank");
-        // 点击输入框 → 聚焦，输入生效
-        let _ = bar.handle(UiEvent::Click { x: 100.0, y: 10.0 });
+        // 点击输入框 → 聚焦并全选，输入替换整段
+        click_input(&mut bar);
         assert!(bar.is_focused());
+        assert_eq!(bar.selection(), Some((0, "about:blank".len())));
         let _ = bar.handle(UiEvent::Character('x'));
-        assert_eq!(bar.url(), "about:blankx");
+        assert_eq!(bar.url(), "x");
+        assert!(bar.selection().is_none(), "输入后选区被替换清除");
     }
 
     #[test]
@@ -471,6 +717,135 @@ mod tests {
     }
 
     #[test]
+    fn caret_moves_by_character_and_home_end() {
+        let mut bar = AddressBar::new("abc");
+        let _ = bar.handle(UiEvent::SelectAll); // 先把光标置于末尾
+        assert!(bar.selection().is_some());
+
+        move_caret(&mut bar, CaretDirection::Left, false);
+        // 带选区时的左移先收拢到选区起点
+        assert_eq!(bar.selection(), None);
+        assert_eq!(bar.url(), "abc");
+        // 再左移一次：光标在起点，插入点应在最前
+        move_caret(&mut bar, CaretDirection::Left, false);
+        let _ = bar.handle(UiEvent::Character('X'));
+        assert_eq!(bar.url(), "Xabc");
+
+        move_caret(&mut bar, CaretDirection::End, false);
+        let _ = bar.handle(UiEvent::Character('Y'));
+        assert_eq!(bar.url(), "XabcY");
+
+        move_caret(&mut bar, CaretDirection::Home, false);
+        let _ = bar.handle(UiEvent::Character('Z'));
+        assert_eq!(bar.url(), "ZXabcY");
+    }
+
+    #[test]
+    fn caret_stays_on_char_boundary() {
+        // 多字节字符：按 char 移动/删除，不会切出非法 UTF-8
+        let mut bar = AddressBar::new("中a");
+        move_caret(&mut bar, CaretDirection::Home, false);
+        // Home 后在 '中' 之前插入
+        let _ = bar.handle(UiEvent::Character('文'));
+        assert_eq!(bar.url(), "文中a");
+        // 光标在插入的 '文' 之后 → 退格删 '文'
+        let _ = bar.handle(UiEvent::Backspace);
+        assert_eq!(bar.url(), "中a");
+        // 光标此时在 '中' 之前 → Delete 前向删 '中'（三字节整体删除）
+        let _ = bar.handle(UiEvent::Delete);
+        assert_eq!(bar.url(), "a");
+        let _ = bar.handle(UiEvent::Delete);
+        assert_eq!(bar.url(), "");
+    }
+
+    #[test]
+    fn shift_extends_selection_and_typing_replaces_it() {
+        let mut bar = AddressBar::new("abcdef");
+        move_caret(&mut bar, CaretDirection::Home, false);
+        for _ in 0..3 {
+            move_caret(&mut bar, CaretDirection::Right, true);
+        }
+        assert_eq!(bar.selection(), Some((0, 3)));
+        assert_eq!(bar.url(), "abcdef", "扩选不改文本");
+        // 输入替换选区
+        let _ = bar.handle(UiEvent::Character('X'));
+        assert_eq!(bar.url(), "Xdef");
+        assert!(bar.selection().is_none());
+    }
+
+    #[test]
+    fn extension_follows_caret_and_normalizes_reversed_range() {
+        let mut bar = AddressBar::new("abcdef");
+        move_caret(&mut bar, CaretDirection::End, false);
+        for _ in 0..2 {
+            move_caret(&mut bar, CaretDirection::Left, true);
+        }
+        // 反向扩选：选区归一化后仍是（起点, 终点）
+        assert_eq!(bar.selection(), Some((4, 6)));
+        let _ = bar.handle(UiEvent::Backspace);
+        assert_eq!(bar.url(), "abcd", "退格删除选区");
+        assert_eq!(bar.selection(), None);
+    }
+
+    #[test]
+    fn delete_removes_selection_or_next_character() {
+        let mut bar = AddressBar::new("abc");
+        move_caret(&mut bar, CaretDirection::Home, false);
+        let _ = bar.handle(UiEvent::Delete);
+        assert_eq!(bar.url(), "bc", "Delete 删除光标后的字符");
+
+        let _ = bar.handle(UiEvent::SelectAll);
+        let _ = bar.handle(UiEvent::Delete);
+        assert_eq!(bar.url(), "", "Delete 删除选区");
+    }
+
+    #[test]
+    fn select_all_then_backspace_clears_and_replace_resets_caret() {
+        let mut bar = AddressBar::new("https://example.test/");
+        let _ = bar.handle(UiEvent::SelectAll);
+        assert_eq!(bar.selection(), Some((0, bar.url.len())));
+        let _ = bar.handle(UiEvent::Backspace);
+        assert!(bar.url().is_empty());
+        // 空输入框上 Backspace/Delete 无副作用
+        let _ = bar.handle(UiEvent::Backspace);
+        let _ = bar.handle(UiEvent::Delete);
+        assert!(bar.url().is_empty());
+
+        // set_url 重置编辑态：光标在末尾、无选区
+        bar.set_url("about:blank");
+        assert_eq!(bar.selection(), None);
+        let _ = bar.handle(UiEvent::Backspace);
+        assert_eq!(bar.url(), "about:blan");
+    }
+
+    #[test]
+    fn blur_clears_selection_and_gates_editing() {
+        let mut bar = AddressBar::new("abc");
+        let _ = bar.handle(UiEvent::SelectAll);
+        bar.blur();
+        assert!(!bar.is_focused());
+        assert_eq!(bar.selection(), None);
+        let _ = bar.handle(UiEvent::Character('x'));
+        assert_eq!(bar.url(), "abc", "失焦后输入不生效");
+        // FocusAndSelect：重新聚焦并全选
+        let _ = bar.handle(UiEvent::FocusAndSelect);
+        assert!(bar.is_focused());
+        assert_eq!(bar.selection(), Some((0, 3)));
+    }
+
+    #[test]
+    fn caret_and_moves_are_inert_when_unfocused() {
+        let mut bar = AddressBar::new("abc");
+        let _ = bar.handle(UiEvent::Click { x: 10.0, y: 200.0 });
+        assert!(!bar.is_focused());
+        move_caret(&mut bar, CaretDirection::Home, false);
+        let _ = bar.handle(UiEvent::SelectAll);
+        let _ = bar.handle(UiEvent::Delete);
+        assert_eq!(bar.url(), "abc");
+        assert_eq!(bar.selection(), None);
+    }
+
+    #[test]
     fn draw_emits_bar_commands() {
         let mut bar = AddressBar::new("example.test");
         bar.set_history(true, false);
@@ -493,11 +868,82 @@ mod tests {
             .iter()
             .filter(|command| matches!(command, Command::DrawText { .. }))
             .count();
-        // 背景条 + 可用按钮底色（后退/刷新）+ 输入框白底 = 4
-        assert_eq!(fills, 4);
+        // 背景条 + 可用按钮底色（后退/刷新）+ 输入框白底 + 聚焦光标 = 5
+        assert_eq!(fills, 5);
         assert_eq!(strokes, 1, "输入框描边");
         // URL 文本 + 两个可用按钮字形
         assert_eq!(texts, 3);
+    }
+
+    /// 选区高亮与光标互斥：有选区画高亮带，无选区画光标竖线。
+    #[test]
+    fn draw_emits_selection_highlight_or_caret() {
+        let shaper = ParleyTextShaper::new();
+        let mut bar = AddressBar::new("example.test");
+
+        // 无选区（默认光标在末尾）：有光标竖线、无选区色
+        let mut scene = Scene::default();
+        bar.draw(&shaper, &mut scene, 400.0);
+        assert!(
+            scene
+                .commands
+                .iter()
+                .any(|command| matches!(command, Command::FillRect { color, .. }
+                    if *color == Color::opaque(0x20, 0x20, 0x20))),
+            "聚焦且无选区应有光标竖线"
+        );
+        assert!(
+            !scene
+                .commands
+                .iter()
+                .any(|command| matches!(command, Command::FillRect { color, .. }
+                    if *color == SELECTION_COLOR)),
+            "无选区时不应有高亮带"
+        );
+
+        // 全选后有高亮带、无光标竖线
+        let _ = bar.handle(UiEvent::SelectAll);
+        let mut scene = Scene::default();
+        bar.draw(&shaper, &mut scene, 400.0);
+        assert!(
+            scene
+                .commands
+                .iter()
+                .any(|command| matches!(command, Command::FillRect { color, .. }
+                    if *color == SELECTION_COLOR)),
+            "选中应有高亮带"
+        );
+        assert!(
+            !scene
+                .commands
+                .iter()
+                .any(|command| matches!(command, Command::FillRect { color, .. }
+                    if *color == Color::opaque(0x20, 0x20, 0x20))),
+            "有选区时不画光标竖线"
+        );
+    }
+
+    /// 选区高亮带不越出输入框：超长 URL 全选后高亮带仍夹在输入框内。
+    #[test]
+    fn selection_highlight_is_clipped_to_input_box() {
+        let shaper = ParleyTextShaper::new();
+        let mut bar = AddressBar::new("https://example.test/".repeat(20));
+        let _ = bar.handle(UiEvent::SelectAll);
+        let mut scene = Scene::default();
+        bar.draw(&shaper, &mut scene, 400.0);
+
+        let input = input_rect(400.0);
+        let highlight = scene
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::FillRect { rect, color } if *color == SELECTION_COLOR => Some(*rect),
+                _ => None,
+            })
+            .expect("超长文本全选应有高亮带");
+        assert!(highlight.x >= input.x - 0.01);
+        assert!(highlight.x + highlight.width <= input.x + input.width + 0.01);
+        assert!(highlight.width > 0.0);
     }
 
     #[test]
