@@ -102,6 +102,70 @@ pub enum CaretDirection {
     End,
 }
 
+/// 窗口事件的抽象键（与具体窗口库解耦，便于单测）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    /// 字符键（组合键用；大小写不敏感）。
+    Character(char),
+    /// 左方向键。
+    Left,
+    /// 右方向键。
+    Right,
+    /// Home。
+    Home,
+    /// End。
+    End,
+    /// F5。
+    F5,
+    /// Esc。
+    Escape,
+}
+
+/// 修饰键状态。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Modifiers {
+    /// Ctrl。
+    pub ctrl: bool,
+    /// Shift。
+    pub shift: bool,
+    /// Alt。
+    pub alt: bool,
+}
+
+/// 浏览器级快捷键命令（由窗口外壳执行）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shortcut {
+    /// 后退。
+    Back,
+    /// 前进。
+    Forward,
+    /// 重新加载当前页。
+    Reload,
+    /// 聚焦地址栏并全选。
+    FocusAddressBar,
+    /// 全选（本轮只对地址栏生效，页面文本选择未实现）。
+    SelectAll,
+    /// 失焦并还原当前页 URL（丢弃未提交的编辑）。
+    Escape,
+}
+
+/// 把「键 + 修饰键」映射为浏览器命令（Chrome 常用快捷键）。
+///
+/// 未命中的组合返回 `None`，由调用方按普通编辑/滚动键处理。
+#[must_use]
+pub fn shortcut(key: Key, modifiers: Modifiers) -> Option<Shortcut> {
+    match key {
+        Key::Left if modifiers.alt => Some(Shortcut::Back),
+        Key::Right if modifiers.alt => Some(Shortcut::Forward),
+        Key::Character('l' | 'L') if modifiers.ctrl => Some(Shortcut::FocusAddressBar),
+        Key::Character('a' | 'A') if modifiers.ctrl => Some(Shortcut::SelectAll),
+        Key::Character('r' | 'R') if modifiers.ctrl => Some(Shortcut::Reload),
+        Key::F5 => Some(Shortcut::Reload),
+        Key::Escape => Some(Shortcut::Escape),
+        _ => None,
+    }
+}
+
 /// 按钮的命中矩形（视口坐标）。
 fn button_rect(button: BarButton) -> Rect {
     let x = INSET + button.index() as f32 * (BUTTON_SIZE + GAP);
@@ -944,6 +1008,51 @@ mod tests {
         assert!(highlight.x >= input.x - 0.01);
         assert!(highlight.x + highlight.width <= input.x + input.width + 0.01);
         assert!(highlight.width > 0.0);
+    }
+
+    #[test]
+    fn shortcut_maps_chrome_keys_and_rejects_others() {
+        let none = Modifiers::default();
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        };
+        let alt = Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        };
+
+        assert_eq!(shortcut(Key::Left, alt), Some(Shortcut::Back));
+        assert_eq!(shortcut(Key::Right, alt), Some(Shortcut::Forward));
+        // 大小写不敏感
+        assert_eq!(
+            shortcut(Key::Character('l'), ctrl),
+            Some(Shortcut::FocusAddressBar)
+        );
+        assert_eq!(
+            shortcut(Key::Character('L'), ctrl),
+            Some(Shortcut::FocusAddressBar)
+        );
+        assert_eq!(
+            shortcut(Key::Character('a'), ctrl),
+            Some(Shortcut::SelectAll)
+        );
+        assert_eq!(shortcut(Key::Character('r'), ctrl), Some(Shortcut::Reload));
+        assert_eq!(shortcut(Key::F5, none), Some(Shortcut::Reload));
+        assert_eq!(shortcut(Key::Escape, none), Some(Shortcut::Escape));
+
+        // 未命中：无修饰的方向键（须走光标/滚动）、无 Ctrl 的字母键
+        assert_eq!(shortcut(Key::Left, none), None);
+        assert_eq!(shortcut(Key::Right, none), None);
+        assert_eq!(shortcut(Key::Home, none), None);
+        assert_eq!(shortcut(Key::Character('l'), none), None);
+        assert_eq!(shortcut(Key::Character('x'), ctrl), None);
+        // Alt+字母 不是快捷键
+        assert_eq!(
+            shortcut(Key::Character('l'), alt),
+            None,
+            "Alt+L 不应聚焦地址栏"
+        );
     }
 
     #[test]

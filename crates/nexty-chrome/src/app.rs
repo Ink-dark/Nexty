@@ -24,7 +24,7 @@ use crate::history::History;
 use crate::pipeline::{self, Page};
 use crate::render::RenderThread;
 use crate::scrollbar::{self, ScrollGeometry, Scrollbar, ScrollbarHit};
-use crate::ui::{AddressBar, BAR_HEIGHT, BarCommand, UiEvent};
+use crate::ui::{self, AddressBar, BAR_HEIGHT, BarCommand, CaretDirection, UiEvent};
 
 /// 滚轮一格（LineDelta 1.0）对应的滚动距离，px。
 const WHEEL_LINE_PX: f32 = 40.0;
@@ -102,6 +102,10 @@ struct BrowserApp {
     scrollbar: Scrollbar,
     /// Alt 修饰键按住状态（后退/前进快捷键）。
     alt_down: bool,
+    /// Ctrl 修饰键按住状态（快捷键映射）。
+    ctrl_down: bool,
+    /// Shift 修饰键按住状态（地址栏扩选）。
+    shift_down: bool,
     page: Option<Page>,
     /// 当前页面布局好的根片段（滚动时按偏移重建显示列表）。
     root: Option<Fragment>,
@@ -125,6 +129,8 @@ impl BrowserApp {
             history: History::new("about:blank"),
             scrollbar: Scrollbar::new(),
             alt_down: false,
+            ctrl_down: false,
+            shift_down: false,
             page: None,
             root: None,
             content_height: 0.0,
@@ -585,31 +591,35 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
                 self.scrollbar.on_release();
             }
             WindowEvent::ModifiersChanged(modifiers) => {
-                self.alt_down = modifiers.state().alt_key();
+                let state = modifiers.state();
+                self.alt_down = state.alt_key();
+                self.ctrl_down = state.control_key();
+                self.shift_down = state.shift_key();
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                // Alt+方向键：后退/前进（优先于地址栏输入路由）
-                if self.alt_down {
-                    match event.logical_key {
-                        Key::Named(NamedKey::ArrowLeft) => {
-                            self.go_back();
-                            if let Some(window) = &self.window {
-                                window.request_redraw();
-                            }
-                            return;
-                        }
-                        Key::Named(NamedKey::ArrowRight) => {
-                            self.go_forward();
-                            if let Some(window) = &self.window {
-                                window.request_redraw();
-                            }
-                            return;
-                        }
-                        _ => {}
-                    }
+                let modifiers = ui::Modifiers {
+                    ctrl: self.ctrl_down,
+                    shift: self.shift_down,
+                    alt: self.alt_down,
+                };
+                let key = ui_key(&event.logical_key);
+                // 浏览器级快捷键优先于一切（Alt+方向键、Ctrl+L/R/A、F5、Esc）
+                if let Some(key) = key
+                    && let Some(shortcut) = ui::shortcut(key, modifiers)
+                {
+                    self.apply_shortcut(shortcut);
+                    return;
                 }
-                // 地址栏未聚焦时，翻页/滚动键作用于页面
-                if !self.bar.is_focused() {
+                if self.bar.is_focused() {
+                    // 地址栏聚焦：方向键/Home/End 作用于光标（Shift 扩选）
+                    if let Some(direction) = key.and_then(caret_direction) {
+                        let _ = self.bar.handle(UiEvent::MoveCaret {
+                            direction,
+                            extend: modifiers.shift,
+                        });
+                    }
+                } else {
+                    // 未聚焦：翻页/滚动键作用于页面
                     let page_step = self
                         .geometry()
                         .map_or(0.0, |geometry| geometry.page_step() * 0.9);
@@ -646,6 +656,9 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
                     Key::Named(NamedKey::Backspace) => {
                         let _ = self.bar.handle(UiEvent::Backspace);
                     }
+                    Key::Named(NamedKey::Delete) => {
+                        let _ = self.bar.handle(UiEvent::Delete);
+                    }
                     Key::Named(NamedKey::Enter) => {
                         let action = self.bar.handle(UiEvent::Submit);
                         if let Some(url) = action.navigate {
@@ -660,6 +673,59 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
             }
             _ => {}
         }
+    }
+}
+
+/// 执行浏览器级快捷键命令。
+impl BrowserApp {
+    fn apply_shortcut(&mut self, shortcut: ui::Shortcut) {
+        match shortcut {
+            ui::Shortcut::Back => self.go_back(),
+            ui::Shortcut::Forward => self.go_forward(),
+            ui::Shortcut::Reload => self.reload(),
+            ui::Shortcut::FocusAddressBar => {
+                let _ = self.bar.handle(UiEvent::FocusAndSelect);
+            }
+            ui::Shortcut::SelectAll => {
+                // 页面文本选择尚未实现（见 goal.md 非目标），本轮只对地址栏生效
+                if self.bar.is_focused() {
+                    let _ = self.bar.handle(UiEvent::SelectAll);
+                }
+            }
+            ui::Shortcut::Escape => {
+                // 与 Chrome 一致：Esc 丢弃未提交的编辑并失焦
+                self.bar.blur();
+                self.bar.set_url(self.history.current().to_owned());
+            }
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+}
+
+/// winit 逻辑键 → UI 抽象键（仅本层关心的键）。
+fn ui_key(key: &Key) -> Option<ui::Key> {
+    match key {
+        Key::Named(NamedKey::ArrowLeft) => Some(ui::Key::Left),
+        Key::Named(NamedKey::ArrowRight) => Some(ui::Key::Right),
+        Key::Named(NamedKey::Home) => Some(ui::Key::Home),
+        Key::Named(NamedKey::End) => Some(ui::Key::End),
+        Key::Named(NamedKey::F5) => Some(ui::Key::F5),
+        Key::Named(NamedKey::Escape) => Some(ui::Key::Escape),
+        Key::Character(text) => text.chars().next().map(ui::Key::Character),
+        _ => None,
+    }
+}
+
+/// UI 抽象键 → 光标移动方向（非方向键返回 `None`）。
+fn caret_direction(key: ui::Key) -> Option<CaretDirection> {
+    match key {
+        ui::Key::Left => Some(CaretDirection::Left),
+        ui::Key::Right => Some(CaretDirection::Right),
+        ui::Key::Home => Some(CaretDirection::Home),
+        ui::Key::End => Some(CaretDirection::End),
+        _ => None,
     }
 }
 
