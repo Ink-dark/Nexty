@@ -1,5 +1,10 @@
 # goal.md — 本轮任务：nexty-layout 引入 taffy 接管盒级几何（block/flex/grid/absolute）
 
+> **状态（2026-10-11）：已完成。** T0–T3 见 git 历史（`[layout]` 系列提交）；T4/T5 的
+> run 叶 measure 节点与 Layout 回填随 T3 提交落地；T6 专项测试（grid 双列 / 多行 flex
+> wrap / 绝对定位 inset / contents 提升 / 匿名块混排）与 grid/absolute feature 转正见
+> `[layout]` 提交；门禁与文档同步见 `[docs]` 提交。下一轮 goal 待用户指派。
+
 日期：2026-10-10。前置：上轮 chrome 交互补全（[docs/plans/2026-10-08-round-chrome-interaction.md](docs/plans/2026-10-08-round-chrome-interaction.md)）
 完成，`nexty-chrome` 0.1.14；八层骨架端到端连通，`nexty-layout` 0.1.4 自研块级流 + 单行 flex + 自研 inline 断行已落地。
 旧 chrome 交互 goal 归档于 `docs/plans/2026-10-08-round-chrome-interaction.md`。
