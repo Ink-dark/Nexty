@@ -624,9 +624,11 @@ fn flex_row_distributes_free_space_by_grow_ratio() {
     assert!(approx(items[2].border_box.x, 250.0));
 }
 
-/// flex 不换行（nowrap 默认）：基和超宽的项溢出同一行，容器高度不增高。
+/// flex 不换行（nowrap 默认）：基和超宽的项按 flex-shrink（初始值 1）等比收缩，
+/// 容器高度不增高。（T3 差异：旧自研不实现收缩、任由项溢出，taffy 按规范收缩，
+/// 见 block.rs 模块文档差异 2。）
 #[test]
-fn flex_row_does_not_wrap_overflowing_items() {
+fn flex_row_shrinks_overflowing_items() {
     let (document, root) = layout(
         "<body><div style=\"display: flex; width: 200px\">\
          <div style=\"flex-basis: 100px; height: 10px\"></div>\
@@ -637,13 +639,17 @@ fn flex_row_does_not_wrap_overflowing_items() {
     );
     let container = &body(&document, &root).children[0];
     assert_eq!(container.children.len(), 3);
+    // 收缩：赤字 100 按基权 100:100:100 分摊 → 每项 100 - 33.33 ≈ 66.67
     for (index, item) in container.children.iter().enumerate() {
         assert!(approx(item.border_box.y, 0.0), "不换行：所有项同处一行");
         assert!(
-            approx(item.border_box.x, 100.0 * index as f32),
-            "第 {index} 项溢出排布"
+            approx(item.border_box.width, 200.0 / 3.0),
+            "第 {index} 项按 flex-shrink 收缩"
         );
-        assert!(approx(item.border_box.width, 100.0), "无剩余空间不分 grow");
+        assert!(
+            approx(item.border_box.x, 200.0 / 3.0 * index as f32),
+            "第 {index} 项主轴位置"
+        );
     }
     assert!(
         approx(container.border_box.height, 10.0),

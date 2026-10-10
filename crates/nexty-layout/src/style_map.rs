@@ -24,10 +24,9 @@
 //! - grid `min` 尺寸函数中出现 `fr`（非法 CSS）：降级为 `auto`。
 //! - `overflow` 仅 `visible` / `hidden` 被建模（`auto`/`scroll`/`clip` 在 cascade 已丢弃），
 //!   影响 taffy 的 flex/grid item 自动最小尺寸。
-
-// 过渡期：本模块入口 `map_style` 在 T2/T3 接入前无调用方，其私有辅助函数会被判为
-// dead_code。待 `tree_build` / `block` 消费 `map_style` 后移除本行。
-#![allow(dead_code)]
+//! - `text-align` 不映射：taffy 的 `TextAlign::Legacy*` 是 legacy 块级子盒对齐
+//!   （`<center>` 语义），映射 `center` 会让块级子盒居中，偏离现代 CSS 语义
+//!   （行内内容的对齐由 `inline` 模块处理，本轮未做）。
 
 use nexty_css::{
     AlignItemsValue, AlignSelfValue, BoxSizingValue, ComputedStyle, DisplayValue,
@@ -147,6 +146,9 @@ pub(crate) fn map_style(style: &ComputedStyle) -> Style {
 // ---------------------------------------------------------------------------
 
 /// `display` → taffy `Display`，含必要 blockify（见模块文档偏差）。
+///
+/// flex 映射由 feature `flex` 门控：关闭时 flex 容器按 `Display::Block` 走
+/// 块级流（与自研时代 feature 关闭的行为一致）。
 fn map_display(d: DisplayValue) -> Display {
     match d {
         DisplayValue::Block
@@ -156,7 +158,10 @@ fn map_display(d: DisplayValue) -> Display {
         | DisplayValue::InlineTable
         | DisplayValue::TableInternal(_) => Display::Block,
         DisplayValue::FlowRoot => Display::FlowRoot,
+        #[cfg(feature = "flex")]
         DisplayValue::Flex | DisplayValue::InlineFlex => Display::Flex,
+        #[cfg(not(feature = "flex"))]
+        DisplayValue::Flex | DisplayValue::InlineFlex => Display::Block,
         DisplayValue::Grid | DisplayValue::InlineGrid => Display::Grid,
         DisplayValue::None => Display::None,
         // 偏差兜底：见模块文档。

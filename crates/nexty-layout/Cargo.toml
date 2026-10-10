@@ -1,7 +1,7 @@
 [package]
 name = "nexty-layout"
 description = "Nexty 自研盒级布局"
-version = "0.1.7"
+version = "0.1.8"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,26 +12,26 @@ rust-version.workspace = true
 # 未实现的能力（grid / table / absolute）不在 default 中，feature 槽位已预留，
 # 待对应任务落地时补全实现并加入 default。
 default = ["block", "inline", "flex", "replaced", "taffy-map"]
-# 块级流：display: block 的宽度解析、盒模型与margin 折叠（CSS 2.1 §9.2 / §10.3）。
-# 块级流按 §9.2.1.1 必须生成匿名块来包裹行内内容，故依赖 inline。
-block = ["inline"]
-# 行内流：行内盒断行、行盒 strut、匿名块（CSS 2.1 §9.2.1.1 / §10.8）。
+# 块级流：几何解算由 taffy 接管（CSS 2.1 §9.2 / §10.3 / §10.5–10.7）。taffy
+# 管线是块级流的唯一实现，故隐含 inline（行内断行喂给匿名块 measure 节点）与
+# taffy-map（盒树构建 + 样式映射）。
+block = ["inline", "taffy-map"]
+# 行内流：行内项收集、空白折叠、贪心断行与行盒组装（taffy 不做文本布局，
+# 永久自研；CSS 2.1 §9.2.2 / §10.8、CSS Text §3/§7）。
 inline = []
-# 弹性布局：display: flex / inline-flex 的单行 flex 几何（当前由自研实现，
-# T3 起改由 taffy 接管，feature 边界不变）。flex 容器是块级盒（display: flex
-# 参与块级流），且 flex-basis 回退需内在尺寸测量，故依赖 block。
+# 弹性布局：flex 容器的子项 blockify（tree_build）与 taffy Display::Flex 映射
+# （style_map）；主轴/交叉轴几何由 taffy 的 flexbox 算法解算（CSS Flexbox）。
 flex = ["block"]
 # 替换元素：块级与行内替换盒（<img>）的自然尺寸与内在尺寸测量。
 replaced = []
-# 预留：grid 布局（T2/T3 由 taffy 接管），当前未实现故不在 default。
+# 预留：grid 布局（taffy 已实现 grid 算法，待接线 grid item 生成），不在 default。
 grid = []
 # 预留：表格布局，当前未实现故不在 default。
 table = []
-# 预留：绝对定位与inset 几何（T5 由 taffy 接管），当前未实现故不在 default。
+# 预留：绝对定位与inset 几何（taffy 支持，待接线包含块判定），不在 default。
 absolute = []
-# ComputedStyle → taffy::Style 映射层与盒树构建（T1/T2 已落地）。taffy 依赖本身
-# 常驻，此 feature 只切这两层代码的编译，供 T3 接线前单独裁剪。盒树构建复用
-# inline 模块的 image_box_size 解算 <img> 尺寸，故依赖 inline。
+# ComputedStyle → taffy::Style 映射层（style_map）与盒树构建（tree_build）。
+# 块级流的 taffy 管线复用 inline 模块断行，故依赖 inline。
 taffy-map = ["inline"]
 
 [dependencies]

@@ -7,6 +7,11 @@
 //!
 //! 已知偏差：断行只在 ASCII 空白处（无 UAX#14 完整断点，CJK 不折行）；
 //! `vertical-align` 仅 baseline（原子盒/图片底边对齐基线）。
+//!
+//! feature `block` 关闭时本模块无消费方（行内流的唯一下游是 taffy 管线），
+//! 按模块整体抑制 dead_code。
+
+#![cfg_attr(not(feature = "block"), allow(dead_code))]
 
 use std::collections::HashMap;
 
@@ -14,7 +19,7 @@ use nexty_css::{ComputedStyle, DisplayValue, LineHeightValue};
 use nexty_dom::{Document, ElementData, Namespace, NodeId, NodeKind};
 use nexty_text::{FontMetrics, Glyph, ShapedText, TextShaper, TextStyle};
 
-use crate::block::Context;
+use crate::Context;
 use crate::fragment::{Fragment, ImageRun, LineFragment, TextRun};
 
 /// 行内流中的一个原子图片项（替换元素，v1 仅 `<img>`）。
@@ -31,7 +36,9 @@ pub(crate) struct AtomicImage {
     pub style: ComputedStyle,
 }
 
-/// 行内流中的一个原子盒（`inline-block` 等）：已独立布局好的子片段。
+/// 行内流中的一个原子盒（`inline-block` 等）：片段在 run 叶的 measure 期按
+/// taffy 给出的可用宽惰性布局（见 `tree_build::InlineRunNode`），收集期仅登记
+/// 节点与样式（占位片段的 `node`/`style` 字段供后续布局使用）。
 pub(crate) struct AtomicBlock {
     /// 布局完成的子片段（border_box.x/y 由行盒组装阶段定位）。
     pub fragment: Fragment,
@@ -106,8 +113,6 @@ fn is_image_node(document: &Document, node: NodeId) -> bool {
 /// 行内项收集状态。
 struct Collector<'a> {
     ctx: &'a Context<'a>,
-    /// 所属块容器的内容宽（行内原子盒的可用空间）。
-    containing_width: f32,
     items: Vec<InlineItem>,
     pending_space: bool,
     word_buffer: String,
@@ -158,20 +163,26 @@ impl Collector<'_> {
         }));
     }
 
-    /// 收集一个原子盒（inline-block 等）：以当前可用宽独立布局。
+    /// 收集一个原子盒（inline-block 等）：登记节点与样式，布局延迟到
+    /// run 叶的 measure 期（届时才知道 taffy 分配的可用宽）。
     fn push_atomic_block(&mut self, node: NodeId, style: &ComputedStyle) {
         self.flush_word();
-        // §10.3.7：auto 宽的 shrink-to-fit 在 layout_block_box 内解析
-        let result = crate::block::layout_block_box(
-            self.ctx,
-            node,
-            style,
-            self.containing_width,
-            None,
-            /* is_root */ false,
-        );
         self.items.push(InlineItem::Block(Box::new(AtomicBlock {
-            fragment: result.fragment,
+            fragment: Fragment {
+                node,
+                anonymous: false,
+                border_box: crate::fragment::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                },
+                border: Default::default(),
+                padding: Default::default(),
+                style: style.clone(),
+                children: Vec::new(),
+                lines: Vec::new(),
+            },
             preceded_by_space: std::mem::take(&mut self.pending_space),
             style: style.clone(),
         })));
@@ -189,11 +200,10 @@ pub(crate) struct InlineRun<'a> {
 }
 
 impl<'a> InlineRun<'a> {
-    pub(crate) fn new(ctx: &'a Context<'a>, containing_width: f32) -> Self {
+    pub(crate) fn new(ctx: &'a Context<'a>) -> Self {
         Self {
             collector: Collector {
                 ctx,
-                containing_width,
                 items: Vec::new(),
                 pending_space: false,
                 word_buffer: String::new(),
@@ -211,8 +221,9 @@ impl<'a> InlineRun<'a> {
     /// 收集一个行内级子元素的子树。
     ///
     /// 元素本身是行内 `<img>` 时按原子图片收集（其子树只有 alt 文本，
-    /// v1 不做失败回退渲染）；原子行内盒（inline-block 等）独立布局后
-    /// 作为原子项参与行盒。
+    /// v1 不做失败回退渲染）；原子行内盒（inline-block 等）登记为原子项，
+    /// 在 run 叶的 measure 期布局。空白折叠状态（词缓冲、前导空白）跨子节点
+    /// 持续，保证 `text <b>bold</b>` 这类跨界序列不重复收集、不丢空白。
     pub(crate) fn push_element(&mut self, element: NodeId, style: &ComputedStyle) {
         if is_image_node(self.collector.ctx.document, element) {
             self.collector.push_image(element, style);
