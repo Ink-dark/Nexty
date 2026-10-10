@@ -1,16 +1,20 @@
-//! Nexty 自研盒级布局。
+//! Nexty 盒级布局。
 //!
-//! 不依赖外部布局引擎：`taffy` 虽成熟，但布局是 WPT 对齐的关键层，需完全可控。
-//! 决策见 `docs/decisions/2026-10-01-crate-selection.md`。
+//! 盒级几何（block / flex / grid / absolute）由 [`taffy`]（MIT，被 Servo/Blitz 采用）
+//! 接管；**inline / 文本布局与 table 仍自研**。选型和能力边界见
+//! `docs/decisions/2026-10-01-crate-selection.md` 的修正记录。
 //!
 //! 行为 ground truth：CSS 2.1 可视格式化模型（普通流：块级 + 行内）、
-//! CSS Display、CSS Box Model。当前实现范围与偏差清单见 `block` 模块文档。
+//! CSS Display、CSS Box Model，盒级算法对齐 taffy 的 WPT 实现。当前实现范围与
+//! 偏差清单见 `block` / `style_map` 模块文档。
 //!
 //! 管线入口 [`layout_document`]：输入 arena 文档、各元素的 computed style
 //! （nexty-css 的 `compute_document_styles` 产物）与视口宽度，输出片段树
 //! [`Fragment`]（含边框盒几何、盒模型、行内文本行），供 paint 层消费。
 //!
-//! 上游类型一律不得出现在本 crate 的 pub 导出中（AGENTS.md 硬规则）。
+//! **上游类型隔离**：`taffy` 的 `Style` / `TaffyTree` / `Layout` 等类型只在本 crate
+//! 内部流动，**绝不**出现在 pub 导出中（AGENTS.md 硬规则）。`style_map` 是唯一的
+//! 类型边界：输入 `ComputedStyle`、输出 `taffy::Style`，二者都不外泄。
 
 #![forbid(unsafe_code)]
 
@@ -24,6 +28,7 @@ mod block;
 mod fragment;
 mod inline;
 mod intrinsic;
+mod style_map;
 
 pub use fragment::{Edges, Fragment, ImageRun, LineFragment, Rect, TextRun};
 

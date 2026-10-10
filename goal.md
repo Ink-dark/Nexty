@@ -1,75 +1,135 @@
-# goal.md — 本轮任务：Chrome 外壳交互补全（滚动条拖拽 / 地址栏编辑态 / 快捷键 / 悬停光标）
+# goal.md — 本轮任务：nexty-layout 引入 taffy 接管盒级几何（block/flex/grid/absolute）
 
-日期：2026-10-08。前置：上轮 T0–T6 完成（多行 baseline、工具带、历史栈、滚动、
-命中测试、网络接驳），文档与子资源已在 app 后台线程经 `ReqwestFetcher` 真实抓取。
-旧 goal 归档于
-[docs/plans/2026-10-03-round-chrome-window-toolbar.md](docs/plans/2026-10-03-round-chrome-window-toolbar.md)。
+日期：2026-10-10。前置：上轮 chrome 交互补全（[docs/plans/2026-10-08-round-chrome-interaction.md](docs/plans/2026-10-08-round-chrome-interaction.md)）
+完成，`nexty-chrome` 0.1.14；八层骨架端到端连通，`nexty-layout` 0.1.4 自研块级流 + 单行 flex + 自研 inline 断行已落地。
+旧 chrome 交互 goal 归档于 `docs/plans/2026-10-08-round-chrome-interaction.md`。
 
 ## 本轮为什么做这些
 
-上轮把「能打开真实网页」打通了——能抓、能排、能滚、能点、能后退。但工具带与滚动条
-目前只是**显示**，不是**控件**：滚动条看得见拖不动（上轮明确降级为「仅指示」）、地址栏
-只能退格删除（无光标、无选区，Home/End 无效）、键盘没有 Chrome 习惯的 Ctrl+L / Ctrl+R /
-F5、鼠标悬停链接无手型反馈。这些不阻碍「打开」，但阻碍「像浏览器一样用」。
+上一轮对「日常可用浏览器」的差距评估中，**盒级布局完备度仅约 35%**，最大缺口是
+grid、多行 flex、绝对定位与复杂块级流——这些恰恰是现代真实页面渲染质量的核心，自研补齐
+成本极高。
 
-本轮只动 chrome 层：四条能力都是纯逻辑 + 既有渲染管线，可无头单测；窗口/GPU 胶水
-照旧实机验收。
+当初 ADR（[docs/decisions/2026-10-01-crate-selection.md](docs/decisions/2026-10-01-crate-selection.md)）把布局定为自研的理由是
+"**`taffy` 虽成熟但布局是 WPT 对齐的关键层，需完全可控**"。但该理由已过时：taffy 0.14
+现已实现 **CSS Block / Flexbox / CSS Grid** 三套算法，被 Servo、Blitz 等成熟浏览器引擎
+采用，且为 MIT 许可（已在 `deny.toml` 白名单）。这与 Nexty「不造轮子」的总方针一致——
+布局层本就是 ADR 列出的"自研例外"之一，现在有条件收回这个例外。
+
+**引入 taffy ≠ 全替换**，边界由能力决定：
+- taffy **做**：块级盒几何（普通流块级子盒排列、宽度解析、margin）、flex 容器（含多行
+  wrap / flex-shrink / 完整对齐值）、grid 容器、绝对/固定定位盒。
+- taffy **不做**：inline / 文本布局、table。故 `inline.rs`（行内断行）必须保留；table
+  维持现状（taffy roadmap 尚未覆盖，本轮不引入 taffy table）。
+
+本轮目标：以**不破坏现有渲染**为前提，把块级流与 flex 的几何解算迁移到 taffy，并**顺带
+借 taffy 补齐 grid / 多行 flex / 绝对定位**；paint 层零改动——`layout_document` 的
+输入输出契约（`Document + ComputedStyle + image_sizes + viewport_width` → `Fragment` 树，
+定义见 `crates/nexty-layout/src/fragment.rs`）冻结。
+
+预期收益：盒级布局完备度从约 35% 提升至约 70–75%（grid / 多行 flex / 绝对定位补齐；
+剩余为 table + 完整 UAX#14 断行 + 部分 edge case）。
 
 ## 任务清单与退出条件
 
-### T1 nexty-chrome/scrollbar：滚动条几何与拖拽（新模块）
-- 把 `max_scroll` / `clamp_scroll` / thumb 几何自 `app.rs` 迁入 `scrollbar` 模块，成为
-  公开纯函数；新增 `ScrollGeometry`（视口宽高 + 内容高 + 工具带高）。
-- 交互状态机 `Scrollbar`：命中（thumb / 轨道上方 / 轨道下方 / 无）、按住 thumb 拖拽
-  （记录抓取偏移，thumb 不跳变）、点击轨道翻一页（页高 = 轨道高）。
-- 悬停态只改绘制色，不改命中区（悬停加宽会让拖拽抖动）。
-- 退出条件：单测——几何（零溢出 / 半溢出 / 超长文档 thumb 下限）、命中四态、拖拽映射
-  单调且端点对齐、抓取偏移不跳变、轨道上下翻页、零溢出不响应。
+### T0 决策更新与门禁准备
+- 在 `docs/decisions/2026-10-01-crate-selection.md` 追加「修正记录」：将"盒级布局"选型由
+  "自研"改为"**taffy 接管盒级几何 + 自研 inline/table**"，记录理由（taffy 0.14 已支持
+  Block/Flex/Grid、MIT、被 Servo/Blitz 采用；inline 与 text 仍自研因 taffy 不做文本布局；
+  table 维持现状待 taffy roadmap）、能力边界、与"不造轮子"方针的关系、风险。
+- `taffy` 加入 `crates/nexty-layout/Cargo.toml`（MIT，MSRV 1.71 < 本仓 1.90，兼容）；
+  跑 `cargo deny check` 确认其传递依赖许可证全过（白名单已含 MIT/Apache/BSD/ISC/MPL/Zlib/
+  CC0/Unicode/CDLA/LGPL）；`cargo about` 重生成 `docs/dependencies.html`。
+- 隔离策略落实：taffy 的 `Style` / `TaffyTree` / `Layout` 等类型**只出现在 nexty-layout
+  内部**，**绝不进入 pub 导出**（AGENTS.md「依赖类型不得外泄」硬规则）。
+- 退出条件：deny check 零新增失败（或仅已有放行项）；dependencies.html 更新；ADR 修正
+  记录就位。
 
-### T2 nexty-chrome/ui：地址栏编辑态
-- `AddressBar` 增加光标（`caret`，字节偏移且始终落在 char 边界）与选区（`anchor`）。
-- 编辑：`←`/`→`/Home/End 移动光标、Shift+方向扩选、Ctrl+A 全选、Backspace/Delete 删
-  选区或单字符、输入字符替换选区；点击输入框 = 聚焦并全选（Chrome 语义）。
-- 绘制：选区高亮带 + 光标竖线；文本超出输入框宽度时按光标位置横向滚动（用前缀整形
-  取光标 x），不再从头截断。
-- 退出条件：单测——上列每个编辑操作与边界（光标落 char 边界、选区归一化、删选区、
-  替换选区、Home/End、Shift 扩选）、点击聚焦 + 全选；draw 在聚焦/选中时产出光标与
-  高亮指令，整形失败仍降级不 panic。
+### T1 样式映射层（`style_map.rs`，新模块）
+- 实现 `ComputedStyle -> taffy::Style` 单向映射，覆盖已支持属性：
+  - `display` 计算值（block/inline/flex/grid/none/contents → taffy `Display` + 必要的
+    blockify；inline 由 `inline.rs` 处理，不在 taffy 建节点）；
+  - `position`（static/relative/absolute/fixed）；
+  - `box-sizing`；四边 `margin` / `padding` / `border`（edges，border 宽度计入盒模型）；
+  - `width` / `height`（auto / px / % / min-content / max-content 映射；% 相对包含块）；
+  - `min/max-width` / `min/max-height`；
+  - flex-*（`flex-direction` / `grow` / `shrink` / `basis` / `wrap` / `align-items` /
+    `justify-content` 及 align-self/justify-self）；
+  - grid-*（`grid-template-columns` / `rows` / `gap` / `align-items` / `justify-items` /
+    `grid-auto-flow` 等，视 taffy 0.14 支持面取舍）；
+  - `inset`（top/right/bottom/left，绝对定位用）。
+- 明确降级项（记入模块偏差清单）：`var()`、CSS 逻辑属性、`aspect-ratio` 等暂按 initial
+  处理；影响布局的（如 % 高度依赖父高度）按 taffy 语义走。
+- 退出条件：单测——典型取值映射正确（px/% / auto、flex basis、grid template、border
+  edges、box-sizing）；降级项有断言与偏差记录。
 
-### T3 nexty-chrome/ui + app：Chrome 快捷键
-- `ui::shortcut(key, modifiers) -> Option<Shortcut>` 纯映射：Alt+`←`/`→`（后退/前进）、
-  Ctrl+L（聚焦并全选地址栏）、Ctrl+R / F5（刷新）、Ctrl+A（地址栏全选）、Esc（失焦并
-  还原当前页 URL）。
-- app 用该映射替换现有 Alt+方向键硬编码；地址栏聚焦时方向键/Home/End 路由到光标，
-  未聚焦时按页面滚动。
-- 退出条件：映射单测（键 + 修饰 → 命令，未命中返回 `None`）；app 接线实机验收。
+### T2 盒树构建（`tree_build.rs`，新模块）
+- 遍历 arena DOM + computed style，按生成盒规则构造 taffy `TaffyTree<()>`：
+  - `display:none` 不建节点（跳过子树，Fragment 也不产）；
+  - `display:contents` 不产盒，子节点提升为父的参与盒；
+  - 块级替换元素 `<img>` 以 `image_sizes` 自然尺寸（或默认 300×150）作 definite size
+    建叶节点；
+  - **文本 / inline 内容暂不建 taffy 节点**，留待 T4 断行后包装成匿名块（taffy 不做
+    text，必须用 `measure` 机制提供 line box 的 intrinsic size）；
+  - 容器节点建立 children 关系（块级子盒 + 后续匿名块）。
+- 维护 `NodeId(DOM) ↔ taffy Node` 双向映射表，供 T5 回填 Fragment。
+- 退出条件：单测——已知 DOM 结构下，构造出的 taffy 树节点数 / 父子关系正确（含
+  none / contents / inline 提升 / `<img>` 替换元素）。
 
-### T4 nexty-chrome/pipeline + app：悬停光标
-- `hit_test_ex` 返回「节点 + 命中类型」（文本 run / 图片 / 盒）；`hit_test` 保留为薄封装。
-- `hover_kind(page, root, x, y)`：命中祖先链有 `<a href>` → 手型；文本 run → I 形；
-  其余 → 默认。
-- app 在光标移动时按结果设置系统光标（仅在种类变化时调用）；滚动条拖拽中不覆盖。
-- 退出条件：单测——链接文本 / 链接块 / 图片链接 → 手型，正文文本 → I 形，空白 → 默认；
-  实机验收。
+### T3 taffy 接管块级与 flex 几何（改造 `block.rs`）
+- 用 T1 的 `taffy::Style` 与 T2 的 `TaffyTree` 替换 `block.rs` 中"块级流几何解算"与
+  "单行 flex 主轴分配"的计算逻辑；`tree.compute_layout(root, available)` 后读回各节点
+  `Layout`（x/y/size）填入 `Fragment.border_box`。
+- 保留：宽度解析所需的根 available size（视口宽度入参）；`Fragment` 的 `border` /
+  `padding` / `style` 仍由 computed style 填充（taffy 只给几何，不重复造盒模型）。
+- **行为差异处理**：taffy 与自研在 margin 折叠、百分比高度、min/max 收束等处可能存在差异，
+  差异处**优先固化 taffy**（其 WPT 对齐更优），文档化并记录；不得引入 panic。
+- 退出条件：单测——与现有自研 block 测试等效的几何断言仍通过（块级垂直堆叠、宽度解析、
+  单行 flex grow/basis）；差异项有文档化比对结论。
 
-### T5 门禁与收尾
-- `cargo check --workspace` 零 warning；`cargo test --workspace` 全绿；clippy
-  `-D warnings` 零告警；`cargo fmt --all -- --check` 通过。
-- AGENTS.md「当前状态」与 chrome 模块偏差清单同步；无头不可测项注明实机验收。
+### T4 inline 内容前置排版（衔接 `inline.rs` 与 taffy）
+- 对每个 block/flex/grid 容器内的 inline 内容，先以容器 content width 跑 `inline.rs`
+  断行，得到若干 `LineFragment`（每行高度已知）；把每行包装为一个**匿名块 taffy 节点**，
+  用 taffy 的 **measure function** 提供其 intrinsic size（line box 尺寸由 nexty 断行
+  决定，非 taffy 计算），与真实块级子盒一起参与该容器的 taffy 块级流 / 弹性流。
+- 处理匿名块盒的 `Fragment` 标记（`anonymous = true`，`node` 指向父元素，绘制按透明处理）。
+- 退出条件：单测——inline 内容 + 块级子盒混排时，行盒垂直位置与块级子盒互不重叠、顺序
+  正确；与现有 inline 行为一致（字形 / 坐标不变）。
+
+### T5 几何回填与 Fragment 生成
+- 从 taffy `Layout` 读回每个节点几何，结合 computed style 生成 `Fragment` 树：`border_box`
+  相对包含块内容盒（与现有坐标约定一致）、`border` / `padding` edges、`style`、`children`
+  （块级 / 匿名块）、`lines`（来自 T4 的 `LineFragment`）。
+- 绝对定位盒：taffy 已相对其包含块定位，回填时坐标归一到 Fragment 约定。
+- 退出条件：单测——`Fragment` 结构与现有契约字段一致（node / anonymous / border_box /
+  border / padding / style / children / lines）；`display:none` / `contents` 产物断言。
+
+### T6 回归与专项测试
+- 复用现有静态页 fixture（Wikipedia 风格 / 博客类）做布局结构比对（`Fragment` 树 diff），
+  确保渲染**不退化**；新增布局专项单测：grid 双列模板、多行 flex wrap、绝对定位 inset、
+  `display:contents` 提升、匿名块混排。
+- inline 行为不变断言（沿用 `inline.rs` 现有测试）。
+- 退出条件：布局回归 fixture 无结构性退化（允许 T3 列明的 taffy 与自研已知差异，差异需
+  文档化且经人工核验）；全部单测绿。
+
+### T7 门禁与收尾
+- `cargo check --workspace` 零 warning；`cargo test --workspace` 全绿；clippy `-D warnings`
+  零告警；`cargo fmt --all -- --check` 通过。
+- AGENTS.md「当前状态」同步：`nexty-layout` 改为"**taffy 接管盒级几何（block/flex/grid/
+  absolute）+ 自研 inline 断行**"，记录偏差清单（inline / table 仍自研、`var()` / 逻辑
+  属性降级、UAX#14 完整断行未做）；更新布局完备度数字（约 35% → 约 70–75%）。
 - 分任务 commit，最终 push（本机无凭据时留给用户）。
 
 ## 非目标（本轮不做）
-- 页面文本选择与复制——需 text 层补 cluster→字符映射、layout 层 `TextRun` 携带原文，
-  跨三层，另轮立项
-- 多标签页、下载、右键菜单、表单交互
-- 平滑滚动 / 滚动动画、Ctrl+滚轮缩放、滚动条 hover 加宽
-- 地址栏按 x 落光标（需在事件层拿到整形度量；本轮「点击 = 聚焦 + 全选」，偏差记录在
-  `ui` 模块文档）
-- vello_hybrid GPU 光栅、paint 圆角/渐变/阴影
-- JS 运行时、cookie/缓存层、HTTP/2 以上特性调优
-- 触摸/手势输入、DPI 缩放策略（仍按物理像素 1:1）
+- table 布局（taffy roadmap 未覆盖，维持现状：按块级化或忽略；本轮不引入 taffy table）。
+- 完整 UAX#14 断行（仍是 `inline.rs` 偏差，不在范围）。
+- paint 层改动（圆角 / 渐变 / 阴影不引入）；`Fragment` 契约冻结，paint 零改动。
+- JS 引擎、交互基础（选择 / 表单 / 标签）、GPU 后端、网络缓存 / cookie（无关本轮）。
+- 把 inline 文本布局交给 taffy（taffy 不做文本布局，**永不在本轮范围**）。
+- 删除 `block.rs` 全部逻辑——保留宽度 §10.3.3 解析与 inline 衔接作为 taffy 前的预处理；
+  被 taffy 替代的仅是"几何解算"部分。
 
 ## 验证流（AGENTS.md Verification Flow）
 每层：cargo check 零 warning → cargo test 全绿 → fmt/clippy → commit。
-app 胶水（系统光标设置、拖拽事件路由、实机快捷键）无头不可测：纯逻辑（滚动条状态机、
-地址栏编辑、快捷键映射、悬停种类）进单测，其余列为实机验收待办并在模块文档注明。
+taffy 行为差异需人工核验处（margin 折叠 / 百分比高度 / min-max 收束）在 T3/T6 注明并文档化，
+列为人工核验待办。

@@ -1,7 +1,7 @@
 [package]
 name = "nexty-layout"
 description = "Nexty 自研盒级布局"
-version = "0.1.4"
+version = "0.1.5"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -11,6 +11,9 @@ rust-version.workspace = true
 nexty-dom = { path = "../nexty-dom", version = "0.1.0" }
 nexty-css = { path = "../nexty-css", version = "0.1.0" }
 nexty-text = { path = "../nexty-text", version = "0.1.0" }
+# taffy 接管盒级几何（block/flex/grid/absolute）；inline 与 table 仍自研。
+# 选型与边界见 docs/decisions/2026-10-01-crate-selection.md 修正记录。
+taffy = "0.14"
 
 [dev-dependencies]
 nexty-html = { path = "../nexty-html", version = "0.1.0" }
