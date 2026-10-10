@@ -17,16 +17,27 @@
 //!   自动化测试**，实机运行验证（`cargo run -p nexty-chrome --bin nexty`）。
 //!
 //! 上游类型一律不得出现在本 crate 的 pub 导出中（AGENTS.md 硬规则）。
+//!
+//! **Feature**：按上表的模块一一对应，默认全开。`window` 是二进制外壳本体
+//! （winit + wgpu），隐含其余全部模块与 winit/wgpu/pollster 依赖；关闭它之后
+//! 本 crate 只剩可在无头环境测试的纯逻辑模块，此时 `run()` 不再存在。
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "history")]
 pub mod history;
+#[cfg(feature = "pipeline")]
 pub mod pipeline;
+#[cfg(feature = "render")]
 pub mod render;
+#[cfg(feature = "resources")]
 pub mod resources;
+#[cfg(feature = "scrollbar")]
 pub mod scrollbar;
+#[cfg(feature = "ui")]
 pub mod ui;
 
+#[cfg(feature = "window")]
 mod app;
 
 /// 启动浏览器窗口（阻塞至关闭）。
@@ -34,6 +45,7 @@ mod app;
 /// # Errors
 ///
 /// 事件循环或 GPU 初始化失败时返回错误。
+#[cfg(feature = "window")]
 pub fn run() -> Result<(), crate::app::AppError> {
     crate::app::run()
 }

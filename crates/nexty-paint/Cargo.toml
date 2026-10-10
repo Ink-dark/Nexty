@@ -1,22 +1,31 @@
 [package]
 name = "nexty-paint"
 description = "Nexty 绘制 facade：自有绘制指令 + 可替换光栅后端（CPU 后端已落地，GPU 后端待 chrome 层接入）"
-version = "0.1.2"
+version = "0.1.3"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# 默认开启全部已实现能力；下游（nexty-chrome）依赖默认即可获得完整绘制栈。
+default = ["cpu"]
+# CPU 光栅后端（vello_cpu）+ 图片解码（image crate）。
+cpu = ["dep:vello_cpu", "dep:image"]
+# GPU 光栅后端（vello_hybrid），待 chrome 层接入 wgpu device/surface 后实现；
+# 当前仅为声明，预留 feature 槽位，见 docs/decisions/2026-10-01-crate-selection.md。
+gpu = []
+
 [dependencies]
 # vello_hybrid（GPU 后端）依赖 wgpu device/surface，由 chrome 层提供后引入；
 # Rasterizer trait 是双后端接缝，见 docs/decisions/2026-10-01-crate-selection.md
-vello_cpu = "0.2.0"
+vello_cpu = { version = "0.2.0", optional = true }
 # 字体解析归 text 层：DrawText 指令的族列表经 FontResolver 取字体数据
 nexty-text = { path = "../nexty-text", version = "0.1.3" }
 # 图片解码：只解码，不做编码/图像处理（裁剪缩放等由 layout/paint 表达）。
 # 显式关掉默认 feature——default-formats 含 AVIF（ravif/dav1d）等我们不需要的
 # 格式，会拖入 C 依赖拖累 CI；rayon 的多线程也无必要（解码在抓取线程串行做）。
-image = { version = "0.25.10", default-features = false, features = [
+image = { version = "0.25.10", default-features = false, optional = true, features = [
     "png",
     "jpeg",
     "gif",

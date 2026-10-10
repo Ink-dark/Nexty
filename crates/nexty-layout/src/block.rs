@@ -16,11 +16,15 @@ use std::collections::HashMap;
 use nexty_css::{
     BoxSizingValue, ComputedStyle, DisplayValue, MarginValue, PaddingValue, SizeValue,
 };
-use nexty_dom::{Document, Namespace, NodeId, NodeKind};
+#[cfg(feature = "replaced")]
+use nexty_dom::Namespace;
+use nexty_dom::{Document, NodeId, NodeKind};
 use nexty_text::TextShaper;
 
 use crate::fragment::{Edges, Fragment, Rect};
-use crate::inline::{InlineItem, InlineRun, build_lines, image_box_size};
+#[cfg(feature = "replaced")]
+use crate::inline::image_box_size;
+use crate::inline::{InlineItem, InlineRun, build_lines};
 
 /// 布局上下文。
 pub(crate) struct Context<'a> {
@@ -116,6 +120,7 @@ fn to_layout_edges(edges: nexty_css::Edges<f32>) -> Edges {
 }
 
 /// `node` 是否为 HTML 命名空间的 `<img>`（替换元素）。
+#[cfg(feature = "replaced")]
 fn is_image_element(document: &Document, node: NodeId) -> bool {
     matches!(
         document.node(node),
@@ -237,6 +242,7 @@ pub(crate) fn layout_block_box(
     // ---- 块级替换元素（块级 `<img>`）：§10.3.2 的最小近似 ----
     // 内容尺寸来自图片盒尺寸（属性/自然尺寸/默认对象尺寸），CSS width/height
     // 暂不参与；margin auto 视作 0（不做居中，偏差）。
+    #[cfg(feature = "replaced")]
     if is_image_element(ctx.document, node) {
         let border = to_layout_edges(style.border_width);
         let padding = resolve_padding(style.padding, containing_width);
@@ -333,6 +339,7 @@ pub(crate) fn layout_block_box(
     let specified_height = resolve_height(height, containing_height);
 
     // ---- 单行 flex（CSS Flexbox 子集：row、nowrap、stretch） ----
+    #[cfg(feature = "flex")]
     if matches!(style.display, DisplayValue::Flex | DisplayValue::InlineFlex) {
         return layout_flex_row(
             ctx,
@@ -627,6 +634,7 @@ fn resolve_height(height: SizeValue, containing_height: Option<f32>) -> Option<f
 /// 偏差：`flex-shrink` 不实现（超出的项溢出）；margin auto 不吸收剩余空间；
 /// stretch 不做二次布局（子项内容保持原位，仅盒高拉伸）；
 /// `flex-basis: auto` 回退到子项 width，再回退 max-content。
+#[cfg(feature = "flex")]
 #[allow(clippy::too_many_arguments)]
 fn layout_flex_row(
     ctx: &Context<'_>,

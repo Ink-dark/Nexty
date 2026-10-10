@@ -1,11 +1,32 @@
 [package]
 name = "nexty-chrome"
 description = "Nexty 浏览器外壳：窗口、输入、导航与自绘 UI"
-version = "0.1.14"
+version = "0.1.15"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+
+[features]
+# 默认开启全部已实现能力。`window` 是二进制外壳本体（winit+wgpu），
+# 关闭后本 crate 只剩可无头测试的纯逻辑模块（history/ui/scrollbar/pipeline）。
+default = ["pipeline", "resources", "render", "history", "ui", "scrollbar", "window"]
+# 导航管线：HTML → 级联 → 布局 → 片段树 → paint 显示列表（纯逻辑，可测试）。
+pipeline = []
+# 子资源清单解析、并发抓取与解码编排（纯逻辑，可测试）。
+resources = []
+# 渲染隔离线程：panic 兜底，线程存活可继续服务。
+render = []
+# 会话历史栈（纯逻辑，可测试）。
+history = []
+# 自绘工具带状态机（纯逻辑，可测试）。
+ui = []
+# 滚动几何与拖拽状态机（纯逻辑，可测试）。
+scrollbar = []
+# 浏览器外壳本体：winit 事件循环 + wgpu 呈现（`run()` 入口）。
+# 依赖 winit / wgpu / pollster 与下层各 crate，故隐含它们。
+window = ["pipeline", "resources", "render", "history", "ui", "scrollbar",
+    "dep:winit", "dep:wgpu", "dep:pollster"]
 
 [dependencies]
 nexty-dom = { path = "../nexty-dom", version = "0.1.0" }
@@ -15,15 +36,17 @@ nexty-layout = { path = "../nexty-layout", version = "0.1.0" }
 nexty-text = { path = "../nexty-text", version = "0.1.0" }
 nexty-paint = { path = "../nexty-paint", version = "0.1.0" }
 nexty-network = { path = "../nexty-network", version = "0.1.0" }
-winit = "0.30.13"
-wgpu = "29"
+winit = { version = "0.30.13", optional = true }
+wgpu = { version = "29", optional = true }
 # wgpu 的异步初始化在 winit 事件循环外的同步入口完成
-pollster = "0.4"
+pollster = { version = "0.4", optional = true }
 
 [dev-dependencies]
 # 仅测试用：构造 PNG 字节喂给资源编排测试（与 nexty-paint 同一依赖）
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 
+# 浏览器可执行入口，仅在 `window` feature 下构建（关闭 window 时无窗口可启）。
 [[bin]]
 name = "nexty"
 path = "src/bin/nexty.rs"
+required-features = ["window"]

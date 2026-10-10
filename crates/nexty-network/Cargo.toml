@@ -1,11 +1,19 @@
 [package]
 name = "nexty-network"
 description = "Nexty 网络 facade"
-version = "0.1.4"
+version = "0.1.5"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# 默认开启全部已实现能力；下游（nexty-chrome）依赖默认即可获得完整网络栈。
+default = ["fetch", "resolve"]
+# 抓取后端（reqwest）与 NetworkFetcher trait / Request / Response 类型。
+fetch = ["dep:reqwest"]
+# 相对 URL 解析（WHATWG basic URL parsing），不依赖 reqwest，仅用其 Url 类型。
+resolve = ["dep:reqwest"]
+
 [dependencies]
-reqwest = { version = "0.13.5", features = ["blocking"] }
+reqwest = { version = "0.13.5", features = ["blocking"], optional = true }

@@ -12,15 +12,23 @@
 //! 职责，进入本层的文本应已折叠。
 //!
 //! 上游类型一律不得出现在本 crate 的 pub 导出中（AGENTS.md 硬规则）。
+//!
+//! **Feature**：单行整形（`shaping`，含 `TextShaper` 与 parley 实现）与字体文件
+//! 解析（`font-resolution`，含 `FontResolver`）分别受feature 控制，默认全开；
+//! 二者共享 parley 依赖，故各自隐含 `dep:parley`。
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "shaping")]
 use std::cell::RefCell;
+#[cfg(feature = "font-resolution")]
 use std::sync::Mutex;
 
+#[cfg(feature = "shaping")]
 use parley::StyleProperty;
 
 /// 字体族与字号。
+#[cfg(feature = "shaping")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextStyle {
     /// 字体族列表，按 CSS `font-family` 优先顺序排列。
@@ -34,6 +42,7 @@ pub struct TextStyle {
 }
 
 /// 整形后的单个字形。
+#[cfg(feature = "shaping")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Glyph {
     /// 字体内部字形编号。
@@ -50,6 +59,7 @@ pub struct Glyph {
 ///
 /// 坐标系：`x` 从行首起算，`y` 以基线为 0、向下为正；[`ShapedText::height`]
 /// 是 parley 按字体度量算出的行高。
+#[cfg(feature = "shaping")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShapedText {
     /// 按绘制顺序排列的字形。
@@ -61,6 +71,7 @@ pub struct ShapedText {
 }
 
 /// 字体度量（CSS px；strut / 行盒计算用）。
+#[cfg(feature = "shaping")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FontMetrics {
     /// ascent：基线到行内最高点的距离（CSS px，正值）。
@@ -75,12 +86,14 @@ pub struct FontMetrics {
 ///
 /// 供光栅层（paint）构造字形渲染所需的字体数据；字节为共享快照，
 /// 解析结果可按族列表缓存。
+#[cfg(feature = "font-resolution")]
 #[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedFont {
     data: std::sync::Arc<[u8]>,
     index: u32,
 }
 
+#[cfg(feature = "font-resolution")]
 impl ResolvedFont {
     /// 字体文件字节（TTC 时为整个 collection）。
     #[must_use]
@@ -95,6 +108,7 @@ impl ResolvedFont {
     }
 }
 
+#[cfg(feature = "font-resolution")]
 impl std::fmt::Debug for ResolvedFont {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResolvedFont")
@@ -108,6 +122,7 @@ impl std::fmt::Debug for ResolvedFont {
 ///
 /// 实现方负责把 [`TextStyle`] 映射到具体字体选择与整形引擎，
 /// 只对外暴露本 crate 的类型。
+#[cfg(feature = "shaping")]
 pub trait TextShaper {
     /// 对一段文本整形。
     ///
@@ -125,6 +140,7 @@ pub trait TextShaper {
 }
 
 /// 文本整形错误。
+#[cfg(feature = "shaping")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextError {
     /// 请求的字体族列表为空，无法选择字体。
@@ -138,17 +154,20 @@ pub enum TextError {
 ///
 /// 独立于整形器（无布局上下文），内部用 `Mutex` 提供可变性，
 /// 可跨线程共享（`Send + Sync`）。
+#[cfg(feature = "font-resolution")]
 #[derive(Default)]
 pub struct FontResolver {
     context: Mutex<parley::FontContext>,
 }
 
+#[cfg(feature = "font-resolution")]
 impl std::fmt::Debug for FontResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FontResolver").finish()
     }
 }
 
+#[cfg(feature = "font-resolution")]
 impl FontResolver {
     /// 创建解析器并发现系统字体。
     #[must_use]
@@ -225,17 +244,20 @@ impl FontResolver {
 ///
 /// 持有 fontique 字体集合（系统字体）与 parley 布局上下文；上下文可复用，
 /// 用 `RefCell` 提供内部可变性（`shape` 只需 `&self`）。
+#[cfg(feature = "shaping")]
 pub struct ParleyTextShaper {
     font_context: RefCell<parley::FontContext>,
     layout_context: RefCell<parley::LayoutContext>,
 }
 
+#[cfg(feature = "shaping")]
 impl std::fmt::Debug for ParleyTextShaper {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ParleyTextShaper").finish()
     }
 }
 
+#[cfg(feature = "shaping")]
 impl Default for ParleyTextShaper {
     fn default() -> Self {
         Self {
@@ -245,6 +267,7 @@ impl Default for ParleyTextShaper {
     }
 }
 
+#[cfg(feature = "shaping")]
 impl ParleyTextShaper {
     /// 创建整形器并发现系统字体。
     #[must_use]
@@ -287,6 +310,7 @@ impl ParleyTextShaper {
     }
 }
 
+#[cfg(feature = "shaping")]
 impl TextShaper for ParleyTextShaper {
     fn shape(&self, text: &str, style: &TextStyle) -> Result<ShapedText, TextError> {
         if text.is_empty() {
@@ -339,7 +363,8 @@ impl TextShaper for ParleyTextShaper {
     }
 }
 
-#[cfg(test)]
+// 测试覆盖整形与字体解析（shaping 隐含 font-resolution）。
+#[cfg(all(test, feature = "shaping"))]
 mod tests {
     use super::*;
 

@@ -15,6 +15,12 @@
 //! **上游类型隔离**：`taffy` 的 `Style` / `TaffyTree` / `Layout` 等类型只在本 crate
 //! 内部流动，**绝不**出现在 pub 导出中（AGENTS.md 硬规则）。`style_map` 是唯一的
 //! 类型边界：输入 `ComputedStyle`、输出 `taffy::Style`，二者都不外泄。
+//!
+//! **Feature**：按布局能力一一对应，默认全开已实现能力——`block`（块级流）、
+//! `inline`（行内流）、`flex`（单行弹性布局）、`replaced`（`<img>` 替换盒）。
+//! `grid` / `table` / `absolute` 为预留槽位，当前未实现故不在 default，
+//! 待 T2–T5 由 taffy 接管后补全并加入 default。`taffy` 依赖常驻（feature 只切
+//! 能力开关，不切依赖），映射层 `style_map` 受 `taffy-map` 控制。
 
 #![forbid(unsafe_code)]
 
@@ -26,8 +32,11 @@ use nexty_text::TextShaper;
 
 mod block;
 mod fragment;
+#[cfg(any(feature = "inline", feature = "replaced"))]
 mod inline;
+#[cfg(any(feature = "inline", feature = "replaced"))]
 mod intrinsic;
+#[cfg(feature = "taffy-map")]
 mod style_map;
 
 pub use fragment::{Edges, Fragment, ImageRun, LineFragment, Rect, TextRun};

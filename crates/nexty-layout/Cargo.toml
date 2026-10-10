@@ -1,11 +1,37 @@
 [package]
 name = "nexty-layout"
 description = "Nexty 自研盒级布局"
-version = "0.1.5"
+version = "0.1.6"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+
+[features]
+# 默认开启全部已实现能力；下游 nexty-chrome 依赖默认即可获得完整布局栈。
+# 未实现的能力（grid / table / absolute）不在 default 中，feature 槽位已预留，
+# 待对应任务落地时补全实现并加入 default。
+default = ["block", "inline", "flex", "replaced", "taffy-map"]
+# 块级流：display: block 的宽度解析、盒模型与margin 折叠（CSS 2.1 §9.2 / §10.3）。
+# 块级流按 §9.2.1.1 必须生成匿名块来包裹行内内容，故依赖 inline。
+block = ["inline"]
+# 行内流：行内盒断行、行盒 strut、匿名块（CSS 2.1 §9.2.1.1 / §10.8）。
+inline = []
+# 弹性布局：display: flex / inline-flex 的单行 flex 几何（当前由自研实现，
+# T3 起改由 taffy 接管，feature 边界不变）。flex 容器是块级盒（display: flex
+# 参与块级流），且 flex-basis 回退需内在尺寸测量，故依赖 block。
+flex = ["block"]
+# 替换元素：块级与行内替换盒（<img>）的自然尺寸与内在尺寸测量。
+replaced = []
+# 预留：grid 布局（T2/T3 由 taffy 接管），当前未实现故不在 default。
+grid = []
+# 预留：表格布局，当前未实现故不在 default。
+table = []
+# 预留：绝对定位与inset 几何（T5 由 taffy 接管），当前未实现故不在 default。
+absolute = []
+# ComputedStyle → taffy::Style 映射层（T1 已落地）。taffy 依赖本身常驻，此 feature
+# 只切映射层代码的编译，供 T3 接线前单独裁剪。
+taffy-map = []
 
 [dependencies]
 nexty-dom = { path = "../nexty-dom", version = "0.1.0" }

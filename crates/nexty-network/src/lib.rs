@@ -9,12 +9,17 @@
 //! 上游类型一律不得出现在本 crate 的 pub 导出中（AGENTS.md 硬规则）；
 //! [`ReqwestFetcher`] 持有上游 client，对外只暴露 [`NetworkFetcher`] trait 与
 //! 自有请求 / 响应类型。
+//!
+//! **Feature**：抓取后端与 URL 解析分别由 `fetch` / `resolve` 两个 feature 控制，
+//! 默认全开。两者都依赖 reqwest 的 `Url` 类型，故 `resolve` 也隐含 `dep:reqwest`。
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "fetch")]
 use std::time::Duration;
 
 /// HTTP 方法。当前只覆盖导航与子资源抓取所需的最小集合。
+#[cfg(feature = "fetch")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
     /// GET。
@@ -24,6 +29,7 @@ pub enum Method {
 }
 
 /// 一次请求。
+#[cfg(feature = "fetch")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     /// 绝对 URL。
@@ -37,6 +43,7 @@ pub struct Request {
 }
 
 /// 一次响应。
+#[cfg(feature = "fetch")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Response {
     /// HTTP 状态码。
@@ -53,6 +60,7 @@ pub struct Response {
 ///
 /// `Send + Sync`：子资源抓取在 chrome 层并发执行（每资源一线程），
 /// fetcher 会被多线程共享引用，故把线程安全定为 trait 的组成要求。
+#[cfg(feature = "fetch")]
 pub trait NetworkFetcher: Send + Sync {
     /// 执行一次请求。
     ///
@@ -63,6 +71,7 @@ pub trait NetworkFetcher: Send + Sync {
 }
 
 /// 抓取错误。
+#[cfg(any(feature = "fetch", feature = "resolve"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkError {
     /// URL 无法解析，或协议不受支持。
@@ -97,6 +106,7 @@ pub enum NetworkError {
 ///
 /// base 无法解析，或 target 与 base 合起来仍不是合法 URL 时返回
 /// [`NetworkError::InvalidUrl`]。
+#[cfg(feature = "resolve")]
 pub fn resolve(base: &str, target: &str) -> Result<String, NetworkError> {
     let base = reqwest::Url::parse(base).map_err(|_| NetworkError::InvalidUrl)?;
     // 空 target 解析为 base 自身。opaque scheme（about: / data:）的
@@ -113,11 +123,13 @@ pub fn resolve(base: &str, target: &str) -> Result<String, NetworkError> {
 /// 重定向跟随使用 reqwest 默认策略（最多 10 次）；TLS 使用 reqwest 默认的
 /// rustls 配置。[`ReqwestFetcher::with_timeout`] 可设置整请求超时，超时映射为
 /// [`NetworkError::Timeout`]。
+#[cfg(feature = "fetch")]
 #[derive(Debug)]
 pub struct ReqwestFetcher {
     client: reqwest::blocking::Client,
 }
 
+#[cfg(feature = "fetch")]
 impl ReqwestFetcher {
     /// 创建使用 reqwest 默认配置（无超时限制）的抓取器。
     ///
@@ -147,6 +159,7 @@ impl ReqwestFetcher {
     }
 }
 
+#[cfg(feature = "fetch")]
 impl NetworkFetcher for ReqwestFetcher {
     fn fetch(&self, request: &Request) -> Result<Response, NetworkError> {
         // URL 先自行解析：区分 InvalidUrl 与传输错误；
@@ -187,11 +200,13 @@ impl NetworkFetcher for ReqwestFetcher {
 }
 
 /// client 构造失败归入传输错误。
+#[cfg(feature = "fetch")]
 fn transport_from_builder(_error: reqwest::Error) -> NetworkError {
     NetworkError::Transport
 }
 
 /// reqwest 请求错误 → 自有错误。
+#[cfg(feature = "fetch")]
 fn map_request_error(error: reqwest::Error) -> NetworkError {
     if error.is_timeout() {
         NetworkError::Timeout
@@ -200,7 +215,8 @@ fn map_request_error(error: reqwest::Error) -> NetworkError {
     }
 }
 
-#[cfg(test)]
+// 测试混合覆盖抓取与URL 解析，需两个 feature 同时开启。
+#[cfg(all(test, feature = "fetch", feature = "resolve"))]
 mod tests {
     use super::*;
     use std::io::{Read, Write};

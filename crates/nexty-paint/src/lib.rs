@@ -21,7 +21,9 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "cpu")]
 use std::collections::HashMap;
+#[cfg(feature = "cpu")]
 use std::sync::Arc;
 
 /// 图片解码错误。
@@ -47,6 +49,7 @@ pub enum DecodeError {
 ///
 /// 上游 `image` 系列的错误一律映射为 [`DecodeError::InvalidImage`]，不引入
 /// `image::error::ImageError`——依赖类型不得出现在 pub 导出中。
+#[cfg(feature = "cpu")]
 pub fn decode(bytes: &[u8]) -> Result<Image, DecodeError> {
     // 尺寸上限与光栅目标一致（vello 的渲染目标为 u16 像素），
     // 避免解出一幅无法绘制的巨图。
@@ -243,9 +246,11 @@ impl Pixmap {
 ///
 /// vello 的 `Blob` 要求 `AsRef<[u8]>`，但 trait 对象胖指针无法直接满足
 /// `Sized` 约束，故用这个 Sized 包装完成转换。字节按引用计数共享，不复制。
+#[cfg(feature = "cpu")]
 #[derive(Clone)]
 struct FontBytes(Arc<[u8]>);
 
+#[cfg(feature = "cpu")]
 impl AsRef<[u8]> for FontBytes {
     fn as_ref(&self) -> &[u8] {
         &self.0
@@ -284,11 +289,13 @@ pub enum RasterError {
 ///
 /// 文本渲染的字体解析经 text 层的 [`nexty_text::FontResolver`] 完成，
 /// 按族列表缓存解析结果。
+#[cfg(feature = "cpu")]
 #[derive(Debug, Default)]
 pub struct VelloCpuRasterizer {
     font_cache: std::sync::Mutex<HashMap<String, Option<std::sync::Arc<nexty_text::ResolvedFont>>>>,
 }
 
+#[cfg(feature = "cpu")]
 impl VelloCpuRasterizer {
     /// 创建 CPU 光栅后端。
     #[must_use]
@@ -311,6 +318,7 @@ impl VelloCpuRasterizer {
     }
 }
 
+#[cfg(feature = "cpu")]
 impl Rasterizer for VelloCpuRasterizer {
     fn rasterize(&self, scene: &Scene, size: Size) -> Result<Pixmap, RasterError> {
         if size.width == 0 || size.height == 0 {
@@ -415,6 +423,7 @@ impl Rasterizer for VelloCpuRasterizer {
 ///
 /// 尺寸越界（转 u16 失败）或数据长度不符时**直接返回不绘制**——绘制路径
 /// 无法返回错误，静默跳过优于让上游 panic（渲染隔离虽兜底，但会丢掉整帧）。
+#[cfg(feature = "cpu")]
 fn draw_image(
     context: &mut vello_cpu::RenderContext,
     resources: &mut vello_cpu::Resources,
@@ -492,7 +501,8 @@ fn draw_image(
     context.reset_paint_transform();
 }
 
-#[cfg(test)]
+// 测试需要 CPU 光栅后端与图片解码（`image`），二者同属 `cpu` feature。
+#[cfg(all(test, feature = "cpu"))]
 mod tests {
     use super::*;
 
