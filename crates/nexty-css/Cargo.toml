@@ -1,17 +1,31 @@
 [package]
 name = "nexty-css"
 description = "Nexty CSS 层：解析与选择器匹配复用 cssparser/selectors，cascade 自研"
-version = "0.1.7"
+version = "0.1.8"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# 默认开启全部已实现能力；下游（nexty-layout / nexty-chrome）依赖默认即可。
+default = ["values", "selectors", "stylesheets", "cascade", "ua-stylesheet"]
+# 属性值模型与逐属性解析（value 模块），依赖 cssparser。
+values = ["dep:cssparser"]
+# 选择器解析与 arena DOM 匹配（selector 模块），依赖 selectors 与 nexty-dom。
+selectors = ["dep:cssparser", "dep:selectors", "dep:nexty-dom", "dep:precomputed-hash"]
+# 样式表与声明块解析（parser 模块），依赖选择器与属性值模型。
+stylesheets = ["values", "selectors"]
+# 自研 cascade 与 computed style（cascade 模块）。
+cascade = ["values", "selectors", "stylesheets", "dep:nexty-dom"]
+# UA 默认样式表（ua 模块），依赖样式表解析。
+ua-stylesheet = ["stylesheets"]
+
 [dependencies]
-cssparser = "0.38.0"
-precomputed-hash = "0.1.1"
-nexty-dom = { path = "../nexty-dom", version = "0.1.0" }
-selectors = "0.41.0"
+cssparser = { version = "0.38.0", optional = true }
+precomputed-hash = { version = "0.1.1", optional = true }
+nexty-dom = { path = "../nexty-dom", version = "0.1.0", optional = true }
+selectors = { version = "0.41.0", optional = true }
 
 [dev-dependencies]
 nexty-html = { path = "../nexty-html", version = "0.1.0" }

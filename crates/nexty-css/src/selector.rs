@@ -11,6 +11,17 @@
 //!
 //! HTML 元素（HTML 命名空间）按 Selectors §3.1.3 在 HTML 文档中做 ASCII
 //! case-insensitive 的类型 / 属性名匹配。
+//!
+//! **Feature**：本模块受 `selectors` feature 控制（由 lib.rs 装配）。
+//! `NextySelector::specificity` 字段由 `cascade` 模块读取、`to_css_string` 由
+//! `parser` 消费，故上层 feature 关闭时它们暂无读取方——此时按模块整体抑制
+//! dead_code。
+
+#![cfg_attr(
+    not(any(feature = "stylesheets", feature = "cascade")),
+    allow(dead_code)
+)]
+#![cfg_attr(not(feature = "cascade"), allow(dead_code))]
 
 use std::borrow::Borrow;
 use std::fmt;

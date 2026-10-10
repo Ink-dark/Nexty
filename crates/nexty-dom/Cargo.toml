@@ -1,10 +1,19 @@
 [package]
 name = "nexty-dom"
 description = "Nexty 自研 arena DOM"
-version = "0.1.1"
+version = "0.1.2"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+
+[features]
+# 默认开启全部已实现能力；DOM 是所有层的地基，默认必须全开。
+default = ["node", "tree"]
+# 节点数据层：NodeKind / ElementData / Attribute / Namespace / QuirksMode 等。
+node = []
+# 树变更算法：Document / Children（pre-insert / insert / remove / replace /
+# clone / normalize）。依赖节点数据层，故隐含 node。
+tree = ["node"]
 
 [dependencies]

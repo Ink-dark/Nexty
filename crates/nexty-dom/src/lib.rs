@@ -10,19 +10,26 @@
 //!
 //! 已落地：节点类型（含 doctype / fragment / 处理指令）与元素命名空间、
 //! 树变更算法（insert / remove / replace / clone / normalize）。JS 绑定层尚未接入。
+//!
+//! **Feature**：节点数据层（`node`）与树变更算法（`tree`）分别受feature 控制，
+//! 默认全开；`tree` 隐含 `node`。
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "node")]
 mod node;
+#[cfg(feature = "tree")]
 mod tree;
 
+#[cfg(feature = "node")]
 pub use node::{
     Attribute, DocumentTypeData, DomError, ElementData, Namespace, NodeId, NodeKind,
     ProcessingInstructionData, QuirksMode,
 };
+#[cfg(feature = "tree")]
 pub use tree::{Children, Document};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tree"))]
 mod tests {
     use super::*;
 

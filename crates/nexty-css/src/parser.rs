@@ -13,6 +13,12 @@
 //!
 //! 已知偏差：`@supports` 等其余 at-rule 不求值（整体跳过）；媒体特性只认
 //! `min/max-width/height`（px）；嵌套 `@media` 不支持。
+//!
+//! **Feature**：本模块受 `stylesheets` feature 控制（由 lib.rs 装配）。`StyleRule`
+//! 的 `selectors` / `specificity` 字段由 `cascade` 模块读取，故关闭 cascade 时
+//! 它们暂无读取方——此时按模块整体抑制 dead_code。
+
+#![cfg_attr(not(feature = "cascade"), allow(dead_code))]
 
 use crate::selector::{NextySelector, parse_selector_list};
 use crate::value::{

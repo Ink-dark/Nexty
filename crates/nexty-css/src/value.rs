@@ -12,6 +12,12 @@
 //! 已知偏差（按需再补，见本轮 goal.md 非目标）：`rem` / `ex` / `ch` 等
 //! 相对单位、`currentcolor`、`color-mix()` 等函数色、`display` 的多关键字
 //! 语法与 ruby 内部盒、`var()` 均视为无效声明（浏览器会接受其中的合法值）。
+//!
+//! **Feature**：本模块受 `values` feature 控制（由 lib.rs 装配）。其中的
+//! `parse_*` 逐属性解析函数供 `parser` / `cascade` 模块消费，故当上层 feature
+//! 关闭时这些内部函数没有调用方——此时按模块整体抑制 dead_code。
+
+#![cfg_attr(not(feature = "stylesheets"), allow(dead_code))]
 
 use cssparser::{ParseError, Parser, Token, parse_important};
 

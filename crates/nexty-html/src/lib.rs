@@ -13,32 +13,53 @@
 //!
 //! 另提供 [`collect_style_resources`]：把 `<link rel=stylesheet>` 与 `<style>`
 //! 按树序收集为资源清单（只收集不解析），供上层抓取外链 CSS 后按源顺序级联。
+//!
+//! **Feature**：完整文档解析（`parse-document`）、片段解析（`parse-fragment`）、
+//! 子资源清单收集（`resources`）分别受 feature 控制，默认全开。前两者共享
+//! html5ever `TreeSink` 桥接（故依赖 `dep:html5ever`），`resources` 为纯自研遍历。
 
 #![forbid(unsafe_code)]
 
+#[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 use std::borrow::Cow;
+#[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 use std::cell::RefCell;
+#[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 use std::collections::HashSet;
 
+#[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 use html5ever::tendril::{StrTendril, TendrilSink};
+#[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 use html5ever::tree_builder::{
     AppendNode, AppendText, ElemName, ElementFlags, NodeOrText, QuirksMode, TreeSink,
 };
+#[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 use html5ever::{Attribute as HtmlAttribute, LocalName, Namespace as HtmlNamespace, QualName};
 
+#[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 use nexty_dom::{
     Attribute, Document, DocumentTypeData, ElementData, Namespace, NodeId, NodeKind,
     ProcessingInstructionData, QuirksMode as DocumentQuirksMode,
 };
+// 仅开resources（不开解析）时，只需要遍历用的类型。
+#[cfg(all(
+    feature = "resources",
+    not(any(feature = "parse-document", feature = "parse-fragment"))
+))]
+use nexty_dom::{Document, ElementData, Namespace, NodeId, NodeKind};
 
+#[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 const HTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
+#[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
+#[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 const MATHML_NAMESPACE: &str = "http://www.w3.org/1998/Math/MathML";
 
 /// 解析选项。
 ///
 /// 对应 WHATWG HTML §13.2.3 的
 /// [scripting flag](https://html.spec.whatwg.org/multipage/parsing.html#scripting-flag)。
+#[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParseOptions {
     /// 脚本是否启用。
@@ -48,6 +69,7 @@ pub struct ParseOptions {
     pub scripting_enabled: bool,
 }
 
+#[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 impl Default for ParseOptions {
     fn default() -> Self {
         Self {
@@ -61,6 +83,7 @@ impl Default for ParseOptions {
 /// 对应 WHATWG HTML §13.4
 /// [parsing HTML fragments](https://html.spec.whatwg.org/multipage/parsing.html#parsing-html-fragments)
 /// 里的 context element：决定 tokenizer 的初始状态与外来内容的命名空间切换。
+#[cfg(feature = "parse-fragment")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FragmentContext {
     /// 上下文元素局部名。
@@ -69,6 +92,7 @@ pub struct FragmentContext {
     pub namespace: Namespace,
 }
 
+#[cfg(feature = "parse-fragment")]
 impl FragmentContext {
     /// HTML 命名空间下的上下文元素。
     #[must_use]
@@ -105,6 +129,7 @@ impl FragmentContext {
 /// 补齐、表格结构重建、错误恢复等行为与浏览器一致。
 ///
 /// 文档的 quirks 模式由解析结果决定，见 [`Document::quirks_mode`]。
+#[cfg(feature = "parse-document")]
 #[must_use]
 pub fn parse_document(html: &str, options: ParseOptions) -> Document {
     let parser = html5ever::parse_document(HtmlTreeSink::new(), to_html_options(options));
@@ -119,6 +144,7 @@ pub fn parse_document(html: &str, options: ParseOptions) -> Document {
 ///
 /// 与完整文档不同，片段解析不补齐 `<html>` / `<head>` / `<body>`，也不产生
 /// doctype。
+#[cfg(feature = "parse-fragment")]
 #[must_use]
 pub fn parse_fragment(
     html: &str,
@@ -145,6 +171,7 @@ pub fn parse_fragment(
 ///
 /// html5ever 的片段解析把节点挂在合成的 `<html>` 根下；WHATWG HTML §13.4 规定
 /// 返回的是 root 的子节点列表，这里用 `DocumentFragment` 承载。
+#[cfg(feature = "parse-fragment")]
 fn extract_fragment(document: &mut Document) -> NodeId {
     let fragment = document.create_node(NodeKind::DocumentFragment);
     if let Some(html_root) = document.first_child(document.root()) {
@@ -162,6 +189,7 @@ fn extract_fragment(document: &mut Document) -> NodeId {
 /// 只收集不解析：外链的抓取与文本的解析由上层（network / css 层）负责。
 /// 偏差：`media` / `type` 属性与 alternate 样式表集暂不建模，凡
 /// `rel` 含 `stylesheet` token 的 `<link>` 一律收集。
+#[cfg(feature = "resources")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StyleResource {
     /// `<link rel=stylesheet href=…>` 声明的外链样式表，字节需另行抓取。
@@ -187,6 +215,7 @@ pub enum StyleResource {
 /// - `href` 缺失或为空串的 `<link>` 跳过（WHATWG HTML §4.6.6：空 href 不抓取）。
 /// - `<style>` 的内容是全部子文本节点的拼接；空元素产出空串。
 /// - `<template>` 内容游离于主树之外，天然不会被收集到。
+#[cfg(feature = "resources")]
 #[must_use]
 pub fn collect_style_resources(document: &Document) -> Vec<StyleResource> {
     let mut resources = Vec::new();
@@ -195,6 +224,7 @@ pub fn collect_style_resources(document: &Document) -> Vec<StyleResource> {
 }
 
 /// 以先序遍历收集子树里的样式表资源。
+#[cfg(feature = "resources")]
 fn collect_from(document: &Document, node: NodeId, resources: &mut Vec<StyleResource>) {
     for child in document.children(node) {
         let Some(NodeKind::Element(data)) = document.node(child) else {
@@ -229,6 +259,7 @@ fn collect_from(document: &Document, node: NodeId, resources: &mut Vec<StyleReso
 }
 
 /// `rel` 属性是否含 `stylesheet` token（ASCII 大小写不敏感）。
+#[cfg(feature = "resources")]
 fn is_stylesheet_link(data: &ElementData) -> bool {
     attribute_value(data, "rel").is_some_and(|rel| {
         rel.split_ascii_whitespace()
@@ -237,6 +268,7 @@ fn is_stylesheet_link(data: &ElementData) -> bool {
 }
 
 /// 取 HTML 元素的指定属性值。
+#[cfg(feature = "resources")]
 fn attribute_value<'a>(data: &'a ElementData, name: &str) -> Option<&'a str> {
     data.attributes
         .iter()
@@ -248,6 +280,7 @@ fn attribute_value<'a>(data: &'a ElementData, name: &str) -> Option<&'a str> {
 ///
 /// 带元素节点 id：同一 src 可出现在多个 `<img>` 上（抓取按 src 去重，
 /// 布局与绘制按 node 归位），节点身份不可丢。
+#[cfg(feature = "resources")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageResource {
     /// `<img>` 元素节点。
@@ -263,6 +296,7 @@ pub struct ImageResource {
 ///
 /// - 只认 HTML 命名空间的 `img`；`src` 缺失或为空串的跳过。
 /// - `srcset` / `<picture>` / `<source>` 暂不建模，只看 `src`（偏差）。
+#[cfg(feature = "resources")]
 #[must_use]
 pub fn collect_image_resources(document: &Document) -> Vec<ImageResource> {
     let mut resources = Vec::new();
@@ -271,6 +305,7 @@ pub fn collect_image_resources(document: &Document) -> Vec<ImageResource> {
 }
 
 /// 以先序遍历收集子树里的 `<img>`。
+#[cfg(feature = "resources")]
 fn collect_images_from(document: &Document, node: NodeId, resources: &mut Vec<ImageResource>) {
     for child in document.children(node) {
         let Some(NodeKind::Element(data)) = document.node(child) else {
@@ -292,6 +327,7 @@ fn collect_images_from(document: &Document, node: NodeId, resources: &mut Vec<Im
 }
 
 /// 自有解析选项 → 上游解析选项。
+#[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 fn to_html_options(options: ParseOptions) -> html5ever::ParseOpts {
     html5ever::ParseOpts {
         tree_builder: html5ever::tree_builder::TreeBuilderOpts {
@@ -305,6 +341,7 @@ fn to_html_options(options: ParseOptions) -> html5ever::ParseOpts {
 /// html5ever 的 `TreeSink` 实现：把解析事件写进 `nexty_dom` 的 arena。
 ///
 /// 该类型不对外暴露，避免上游类型越过本层边界。
+#[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 struct HtmlTreeSink {
     document: RefCell<Document>,
     /// MathML `annotation-xml` 集成点元素。
@@ -314,6 +351,7 @@ struct HtmlTreeSink {
     mathml_integration_points: RefCell<HashSet<NodeId>>,
 }
 
+#[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 impl HtmlTreeSink {
     fn new() -> Self {
         Self {
@@ -323,6 +361,7 @@ impl HtmlTreeSink {
     }
 }
 
+#[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 impl TreeSink for HtmlTreeSink {
     type Handle = NodeId;
     type Output = Document;
@@ -531,12 +570,14 @@ impl TreeSink for HtmlTreeSink {
 /// `TreeSink::elem_name` 的返回类型：元素局部名与命名空间。
 ///
 /// 上游要求返回借用形式，而 arena 里存的是字符串，故这里持有转换出的原子名。
+#[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 #[derive(Debug)]
 struct ElementName {
     namespace: HtmlNamespace,
     local: LocalName,
 }
 
+#[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 impl ElemName for ElementName {
     fn ns(&self) -> &HtmlNamespace {
         &self.namespace
@@ -548,6 +589,7 @@ impl ElemName for ElementName {
 }
 
 /// 上游命名空间 → 自有命名空间。
+#[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 fn to_dom_namespace(namespace: &HtmlNamespace) -> Namespace {
     match &**namespace {
         "" => Namespace::None,
@@ -559,6 +601,7 @@ fn to_dom_namespace(namespace: &HtmlNamespace) -> Namespace {
 }
 
 /// 自有命名空间 → 上游命名空间。
+#[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 fn to_html_namespace(namespace: &Namespace) -> HtmlNamespace {
     match namespace {
         Namespace::None => HtmlNamespace::from(""),
@@ -569,7 +612,13 @@ fn to_html_namespace(namespace: &Namespace) -> HtmlNamespace {
     }
 }
 
-#[cfg(test)]
+// 测试横跨解析与资源收集，需默认三feature 全开。
+#[cfg(all(
+    test,
+    feature = "parse-document",
+    feature = "parse-fragment",
+    feature = "resources"
+))]
 mod tests {
     use super::*;
 

@@ -12,14 +12,14 @@ MusKitty 的**不造轮子**分支。MusKitty 从零手写浏览器核心模块�
 
 已落地八层（全部骨架 crate 就位，管线端到端可跑）：
 
-- `nexty-dom`（v0.1.1）——自研 arena DOM：节点数据层、树变更算法（pre-insert/insert/remove/replace/clone/normalize）与文档模式控制。
-- `nexty-html`（v0.1.3）——html5ever 的 `TreeSink` 桥接到 arena DOM，提供 `parse_document` 与 `parse_fragment`（含片段上下文命名空间）；子资源清单收集（`collect_style_resources` 收集 `<link rel=stylesheet>` 与 `<style>`、`collect_image_resources` 收集 `<img>`，只收集不解析）。
-- `nexty-css`（v0.1.6）——cssparser/selectors 封装 + 自研 cascade：属性值解析（hex/rgb()/hsl()/命名色、font-size/weight、font-family、盒模型 margin/padding/border/width/height、line-height、box-sizing/overflow/min-width/min-height/max-width/max-height、flex-grow/flex-basis）、选择器匹配（Selectors 4，`:is()`/`:where()`/`:has()`/`:nth-child(of)`，HTML 大小写规则）、样式表解析（CSS Syntax §5 错误恢复 + 简写展开：margin/padding/border 系、1–4 值顺时针、`border` 按 `||` 语法；`@media` 按视口条件求值，不匹配的规则不参与级联）、cascade（UA/author 双 origin 重要性桶 → 内联样式 → 特异度 → 源顺序，多表按源顺序合并级联，UA 样式表见 `html_ua_stylesheet`）与 computed style（继承/initial、`em`/`%`/绝对尺寸关键字表、`bolder`/`lighter` 映射表、CSS-wide 关键字）。`var()`、user origin、伪元素等见 `crates/nexty-css` 模块文档的偏差清单。
-- `nexty-network`（v0.1.4）——reqwest blocking 实现 `NetworkFetcher`（`Send + Sync`，供并发抓取）：GET/HEAD、`Request.headers` 请求头逐条应用、错误映射（URL 解析/协议 → `InvalidUrl`、超时 → `Timeout`、其余 → `Transport`）；`resolve` 以文档 URL 为 base 解析相对子资源地址；回环离线测试覆盖全部错误路径与请求头到达。
-- `nexty-text`（v0.1.3）——parley 实现 `TextShaper`：fontique 选字（CSS 字体族列表语义 + 回退）、harfrust 整形，CSS px 单位；`FontMetrics` 供 strut 计算，`FontResolver::resolve_font` 给光栅层提供字体字节。单行整形（white-space 折叠归 layout 层）。注意：parley 0.11 的整形后端是 harfrust 而非 ADR 所列 swash，swash 已移出依赖树。
-- `nexty-paint`（v0.1.2）——vello_cpu 实现 `Rasterizer`：`FillRect`（src-over + 覆盖率抗锯齿）、`StrokeRect`（只描边）、`DrawText`（字形经 text 层字体解析，族列表缓存）、`DrawImage`（已解码 RGBA8 按矩形下发，1:1 整数缩放）；`decode` 提供最小图片解码路径（png 可选 feature，RGB/灰度归一为 RGBA8，不支持格式返回 `DecodeError` 而非 panic）；facade 输出非预乘 RGBA8。GPU 后端 `vello_hybrid` 依赖 wgpu surface 由 chrome 层提供后接入，`Rasterizer` trait 即双后端接缝。
-- `nexty-layout`（v0.1.4）——自研盒级布局（CSS 2.1 普通流）：块级流（宽度解析 §10.3.3、盒模型 content/padding/border/margin、margin 折叠 §8.3.1 含相邻/父子/空盒穿透、正负混合取值、box-sizing 与 min/max 收束 §10.4/§10.7）、匿名块盒（§9.2.1.1）、行内行盒（strut §10.8、混合样式 run、空白折叠与贪心断行）、行内原子盒（`inline-block`/`inline-flex`/`inline-table` 按 shrink-to-fit §10.3.7 独立布局，内在尺寸测量见 `intrinsic.rs` min-content/max-content，整体不拆行，行内下发走 `LineFragment.boxes`）、块级替换元素（`<img>` 属性/自然尺寸）、单行 flex（`display: flex`，row、nowrap 不换行、`flex-grow`/`flex-basis` 主轴分配、交叉轴 `stretch`）、`display: none/contents`。片段树输出（边框盒 + 盒模型 + 文本行）供 paint 消费。**未实现**：float/定位/grid/表格/多行 flex（wrap、flex-shrink、其余对齐值）/UAX#14 完整断行（偏差清单见 `crates/nexty-layout/src/block.rs` 模块文档）。
-- `nexty-chrome`（v0.1.14）——浏览器外壳：`pipeline`（HTML → 级联 → 布局 → 片段树 → paint 显示列表，含 CSS 边框转四条填充带、文本 run 绝对坐标与**行偏移累加**、行内/块级图片与行内原子盒的 `DrawImage`/递归下发、多表级联与子资源并发抓取编排、`hit_test`/`hit_test_ex`/`hover_kind` 悬停语义与 `link_target` 点击命中、`document_title` 提取）、`history`（会话历史栈：push/go_back/go_forward，新导航截断前进分支）、`render`（渲染隔离线程 + `catch_unwind` 兜底，panic 转 `RenderError::Panicked` 且线程存活可继续服务）、`ui`（自绘工具带状态机：后退/前进/刷新按钮（可用标志禁用态）、地址栏**编辑态**——光标/选区/`←→`/Home/End/Shift 扩选/Ctrl+A/Backspace/Delete、点击=聚焦+全选、超宽文本按光标横向滚动、`shortcut()` 纯映射 Chrome 快捷键）、`scrollbar`（滚动几何 + 拖拽状态机：thumb 抓取偏移拖动、轨道点击翻页、悬停配色）、`app`（winit 0.30 + wgpu 29 surface，Pixmap→纹理→全屏 blit 呈现，Rgba8Unorm 优先/BGRA 换色回退；页面滚动（滚轮/PageUp/PageDown/Home/End/方向键）+ 可拖滚动条、resize 重排、链接点击导航、悬停系统光标（链接手型/文本 I 形）、Ctrl+L/Ctrl+R/F5/Esc 与 Alt+方向键、`Arc<dyn NetworkFetcher>` 接驳缝 + 30s 超时 + User-Agent、窗口标题随 `<title>`；**无头环境不可自动化测试**，实机验证）。入口 `cargo run -p nexty-chrome --bin nexty`。
+- `nexty-dom`（v0.1.2）——自研 arena DOM：节点数据层、树变更算法（pre-insert/insert/remove/replace/clone/normalize）与文档模式控制。
+- `nexty-html`（v0.1.4）——html5ever 的 `TreeSink` 桥接到 arena DOM，提供 `parse_document` 与 `parse_fragment`（含片段上下文命名空间）；子资源清单收集（`collect_style_resources` 收集 `<link rel=stylesheet>` 与 `<style>`、`collect_image_resources` 收集 `<img>`，只收集不解析）。
+- `nexty-css`（v0.1.8）——cssparser/selectors 封装 + 自研 cascade：属性值解析（hex/rgb()/hsl()/命名色、font-size/weight、font-family、盒模型 margin/padding/border/width/height、line-height、box-sizing/overflow/min-width/min-height/max-width/max-height、flex-grow/flex-basis）、选择器匹配（Selectors 4，`:is()`/`:where()`/`:has()`/`:nth-child(of)`，HTML 大小写规则）、样式表解析（CSS Syntax §5 错误恢复 + 简写展开：margin/padding/border 系、1–4 值顺时针、`border` 按 `||` 语法；`@media` 按视口条件求值，不匹配的规则不参与级联）、cascade（UA/author 双 origin 重要性桶 → 内联样式 → 特异度 → 源顺序，多表按源顺序合并级联，UA 样式表见 `html_ua_stylesheet`）与 computed style（继承/initial、`em`/`%`/绝对尺寸关键字表、`bolder`/`lighter` 映射表、CSS-wide 关键字）。`var()`、user origin、伪元素等见 `crates/nexty-css` 模块文档的偏差清单。
+- `nexty-network`（v0.1.5）——reqwest blocking 实现 `NetworkFetcher`（`Send + Sync`，供并发抓取）：GET/HEAD、`Request.headers` 请求头逐条应用、错误映射（URL 解析/协议 → `InvalidUrl`、超时 → `Timeout`、其余 → `Transport`）；`resolve` 以文档 URL 为 base 解析相对子资源地址；回环离线测试覆盖全部错误路径与请求头到达。
+- `nexty-text`（v0.1.4）——parley 实现 `TextShaper`：fontique 选字（CSS 字体族列表语义 + 回退）、harfrust 整形，CSS px 单位；`FontMetrics` 供 strut 计算，`FontResolver::resolve_font` 给光栅层提供字体字节。单行整形（white-space 折叠归 layout 层）。注意：parley 0.11 的整形后端是 harfrust 而非 ADR 所列 swash，swash 已移出依赖树。
+- `nexty-paint`（v0.1.3）——vello_cpu 实现 `Rasterizer`：`FillRect`（src-over + 覆盖率抗锯齿）、`StrokeRect`（只描边）、`DrawText`（字形经 text 层字体解析，族列表缓存）、`DrawImage`（已解码 RGBA8 按矩形下发，1:1 整数缩放）；`decode` 提供最小图片解码路径（png 可选 feature，RGB/灰度归一为 RGBA8，不支持格式返回 `DecodeError` 而非 panic）；facade 输出非预乘 RGBA8。GPU 后端 `vello_hybrid` 依赖 wgpu surface 由 chrome 层提供后接入，`Rasterizer` trait 即双后端接缝。
+- `nexty-layout`（v0.1.6）——盒级几何（block / flex / grid / absolute）由 `taffy` 接管（MIT，Servo/Blitz 采用；`taffy` 依赖常驻，feature 只切能力开关），**inline / 文本布局与 table 仍自研**；已落地自研部分：块级流（宽度解析 §10.3.3、盒模型 content/padding/border/margin、margin 折叠 §8.3.1 含相邻/父子/空盒穿透、正负混合取值、box-sizing 与 min/max 收束 §10.4/§10.7）、匿名块盒（§9.2.1.1）、行内行盒（strut §10.8、混合样式 run、空白折叠与贪心断行）、行内原子盒（`inline-block`/`inline-flex`/`inline-table` 按 shrink-to-fit §10.3.7 独立布局，内在尺寸测量见 `intrinsic.rs`）、块级替换元素（`<img>` 属性/自然尺寸）、单行 flex（row、nowrap、`flex-grow`/`flex-basis` 主轴分配、交叉轴 `stretch`）、`display: none/contents`，以及 `style_map` 的 `ComputedStyle → taffy::Style` 映射层（T1）。片段树输出（边框盒 + 盒模型 + 文本行）供 paint 消费，`Fragment` 契约冻结。**未实现**：float/定位/grid/表格/多行 flex（wrap、flex-shrink、其余对齐值）/UAX#14 完整断行（偏差清单见 `crates/nexty-layout/src/block.rs` 模块文档）。模块功能按 feature 拆分（`block`/`inline`/`flex`/`replaced`/`taffy-map`，`grid`/`table`/`absolute` 为预留槽位），见下方Feature 映射表。
+- `nexty-chrome`（v0.1.15）——浏览器外壳：`pipeline`（HTML → 级联 → 布局 → 片段树 → paint 显示列表，含 CSS 边框转四条填充带、文本 run 绝对坐标与**行偏移累加**、行内/块级图片与行内原子盒的 `DrawImage`/递归下发、多表级联与子资源并发抓取编排、`hit_test`/`hit_test_ex`/`hover_kind` 悬停语义与 `link_target` 点击命中、`document_title` 提取）、`history`（会话历史栈：push/go_back/go_forward，新导航截断前进分支）、`render`（渲染隔离线程 + `catch_unwind` 兜底，panic 转 `RenderError::Panicked` 且线程存活可继续服务）、`ui`（自绘工具带状态机：后退/前进/刷新按钮（可用标志禁用态）、地址栏**编辑态**——光标/选区/`←→`/Home/End/Shift 扩选/Ctrl+A/Backspace/Delete、点击=聚焦+全选、超宽文本按光标横向滚动、`shortcut()` 纯映射 Chrome 快捷键）、`scrollbar`（滚动几何 + 拖拽状态机：thumb 抓取偏移拖动、轨道点击翻页、悬停配色）、`app`（winit 0.30 + wgpu 29 surface，Pixmap→纹理→全屏 blit 呈现，Rgba8Unorm 优先/BGRA 换色回退；页面滚动（滚轮/PageUp/PageDown/Home/End/方向键）+ 可拖滚动条、resize 重排、链接点击导航、悬停系统光标（链接手型/文本 I 形）、Ctrl+L/Ctrl+R/F5/Esc 与 Alt+方向键、`Arc<dyn NetworkFetcher>` 接驳缝 + 30s 超时 + User-Agent、窗口标题随 `<title>`；**无头环境不可自动化测试**，实机验证）。入口 `cargo run -p nexty-chrome --bin nexty`。
 
 `nexty-html` 带 WPT tree-construction 比对 harness：语料钉在 `web-platform-tests/wpt` commit `5cd8e3fa`，当前 **1854/1959 通过**。剩余 105 条已逐条入基线，分两类：**88 条语料过时**——`processing-instructions.dat` 等期望产出 PI 节点，而现行 WHATWG §13.2.5 已无处理指令词法状态（`<?…>` 在 tag open state 走 bogus comment），html5ever 的产出与规范一致；**17 条非语料问题**——11 条 html5ever 树构建未跟进规范（`in select` 模式、`<selectedcontent>` 克隆、`<template>` 的 frameset-ok/form 指针语义），6 条需 JSRT 的 scripted 用例。分词器不换：MusKitty 分词器的处理指令状态实现的是规范已删除的特性，评估与否决理由见 [docs/decisions/2026-10-01-muskitty-tokenizer-rejected.md](docs/decisions/2026-10-01-muskitty-tokenizer-rejected.md)。比对方式与基线见 `crates/nexty-html/tests/tree_construction.rs`。
 
@@ -92,7 +92,7 @@ Nexty/                                  # 主仓库 (Ink-dark/Nexty)，workspace
 | DOM | 自研 arena DOM | — | 已定（与 JSRT 绑定同处） |
 | CSS 解析 / 选择器 | `cssparser` + `selectors` | MPL-2.0 | 已定 |
 | Cascade | 自研 | — | 已定 |
-| 盒级布局 | 自研 | — | 已定 |
+| 盒级布局 | `taffy`（block/flex/grid/absolute）+ 自研 inline/table | MIT | 已定（双轨：taffy 接管盒级几何，自研保留 inline/文本布局与 table，见选型 ADR 修正记录） |
 | 文本整形 / 字体 | `parley`（内置 fontique 选字 + harfrust 整形） | Apache-2.0/MIT | 已定（swash 自 parley 0.11 起不参与整形，已移出依赖树） |
 | 绘制 / 光栅 | `vello_cpu`（已落地）+ `vello_hybrid`（待 chrome 接入） | Apache-2.0/MIT | 已定（双后端，API 同形不同名，facade 需适配层） |
 | 窗口 / 输入 | `winit` + `wgpu` | Apache-2.0/MIT | 已定 |
@@ -109,6 +109,7 @@ Nexty/                                  # 主仓库 (Ink-dark/Nexty)，workspace
 ## Hard Rules
 
 ### Technical
+- **Feature 拆分（硬约束）**：每个 facade crate 的模块功能必须以 Cargo feature 拆分，`mod` 声明与对应 `pub use` 一律挂`#[cfg(feature = "…")]`，**不得**出现「声明了 feature 但代码不与之联动」的空壳。具体映射见下方[Feature 映射表](#feature-映射表)，新增模块时同步登记该表
 - Rust stable，**仓库内代码严禁 unsafe**：本仓库自研代码一律不得出现 unsafe 块 / unsafe fn / unsafe impl，无例外、无 FFI 豁免。每个 crate 在 `lib.rs` 顶部用 `#![forbid(unsafe_code)]` 固化该约束。第三方 crate 内部的 unsafe 不由我们改写（`forbid` 也不作用于依赖），但选型时必须查其 unsafe 用量与边界
 - **依赖类型不得外泄**：每个 crate 的公共 API 只暴露自身抽象类型。依赖 crate（html5ever / cssparser / selectors / parley / vello_cpu / vello_hybrid / reqwest …）的类型不得出现在任何 `pub` 导出中——含 pub fn 签名、pub struct/enum 的 pub 字段、pub trait 的方法签名、`pub use` re-export。跨界传递依赖类型时，包一层自己的类型再暴露
 - **不造轮子优先**：已有成熟 crate 能覆盖的能力，直接依赖，不自己实现。参考优先级：**WHATWG 规范 > WPT 测试套件 > 成熟 crate > 自行实现**。**例外**：DOM / Cascade / 盒级布局三层已决策自研，理由与边界见选型 ADR，不得据此把自研扩大到其他层
@@ -152,6 +153,56 @@ Nexty/                                  # 主仓库 (Ink-dark/Nexty)，workspace
 4. 比对通过 → `git add <files>` + commit
 5. 比对不通过 → 根据差异修，回到步骤 1
 6. 你不许自行宣布"完成"
+
+### Feature Gating
+
+**约定（全 crate 统一，不得逐 crate 另立）**
+
+1. **feature 名 = 能力名 = 模块名**：一个 feature 对应一个模块或一项独立能力，命名用 kebab-case（`parse-fragment` / `font-resolution` / `ua-stylesheet`）。
+2. **`default` = 全部已实现能力**：下游 crate 依赖默认即可获得完整功能栈，无需逐个列举 feature。未实现的能力可声明 feature 占位，但**不进 default**，并在注释里写明落地任务。
+3. **依赖上拉用feature 依赖表达**（`flex = ["block"]`），不用编译期 `cfg` 兜底。真实的算法依赖才写：块级流按 CSS 2.1 §9.2.1.1 需匿名块故 `block = ["inline"]`；flex 容器参与块级流且 flex-basis 需内在尺寸故 `flex = ["block"]`。
+4. **可选依赖用 `dep:` 语法**：某 feature 才需要的 crate 写 `optional = true` + `cpu = ["dep:vello_cpu"]`。**例外**：nexty-layout 的 `taffy` **保持常驻**——feature 只切能力开关，不切依赖树。
+5. **模块整体抑制用条件 allow**：某模块的内部项仅被上层 feature 消费时，用 `#![cfg_attr(not(feature = "…"), allow(dead_code))]` 按模块整体抑制，禁止逐项 `#[allow]`。
+6. **部分 feature 构建必须能编译**：改动后至少验证「默认」+「逐个能力关闭」两种配置零warning（`cargo check -p <crate> --no-default-features --features <...>`）。
+7. **二进制目标用 `required-features`**：依赖某 feature 才存在的入口时，`[[bin]]` 须声明 `required-features`，否则无头构建会失败。
+
+**Feature 映射表**
+
+新增/删除模块时**必须**同步更新本表，这是硬约束。
+
+| crate | feature | 对应模块 / 能力 | 在 default |
+| --- | --- | --- | --- |
+| nexty-dom | `node` | `node` 节点数据层 | ✅ |
+| | `tree` | `tree` 树变更算法（`Document`/`Children`） | ✅ |
+| nexty-html | `parse-document` | `parse_document` + html5ever `TreeSink` 桥接 | ✅ |
+| | `parse-fragment` | `parse_fragment` / `FragmentContext`（§13.4） | ✅ |
+| | `resources` | `collect_style_resources` / `collect_image_resources` | ✅ |
+| nexty-css | `values` | `value` 属性值模型与逐属性解析 | ✅ |
+| | `selectors` | `selector` 选择器解析与 arena DOM 匹配 | ✅ |
+| | `stylesheets` | `parser` 样式表与声明块解析 | ✅ |
+| | `cascade` | `cascade` 自研级联与 computed style | ✅ |
+| | `ua-stylesheet` | `ua` UA 默认样式表 | ✅ |
+| nexty-text | `shaping` | `TextShaper` / `ParleyTextShaper`（隐含 `font-resolution`） | ✅ |
+| | `font-resolution` | `FontResolver` / `ResolvedFont` | ✅ |
+| nexty-layout | `block` | `block` 块级流（隐含 `inline`） | ✅ |
+| | `inline` | `inline` 行内流与匿名块 | ✅ |
+| | `flex` | `block::layout_flex_row` 单行弹性布局（隐含 `block`） | ✅ |
+| | `replaced` | `block::is_image_element` 块级 `<img>` 替换盒 | ✅ |
+| | `taffy-map` | `style_map` `ComputedStyle → taffy::Style` 映射层 | ✅ |
+| | `grid` | 预留：T2/T3 由 taffy 接管 | ❌ 未实现 |
+| | `table` | 预留：表格布局 | ❌ 未实现 |
+| | `absolute` | 预留：T5 由 taffy 接管 | ❌ 未实现 |
+| nexty-paint | `cpu` | `VelloCpuRasterizer` + `decode`（`vello_cpu`/`image`） | ✅ |
+| | `gpu` | 预留：`vello_hybrid`，待 chrome 接入 wgpu surface | ❌ 未实现 |
+| nexty-network | `fetch` | `ReqwestFetcher` / `NetworkFetcher` | ✅ |
+| | `resolve` | `resolve` 相对 URL 解析（WHATWG basic URL） | ✅ |
+| nexty-chrome | `pipeline` | `pipeline` 导航管线 | ✅ |
+| | `resources` | `resources` 子资源抓取与解码编排 | ✅ |
+| | `render` | `render` 渲染隔离线程 | ✅ |
+| | `history` | `history` 会话历史栈 | ✅ |
+| | `ui` | `ui` 自绘工具带状态机 | ✅ |
+| | `scrollbar` | `scrollbar` 滚动几何与拖拽状态机 | ✅ |
+| | `window` | `app` winit 事件循环 + wgpu 呈现，隐含其余全部模块 | ✅ |
 
 ### Goal-Driven Execution (本轮任务)
 - 每轮任务有显式 `goal.md`，列明任务清单与每个任务的退出条件

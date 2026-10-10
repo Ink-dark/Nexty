@@ -1,12 +1,22 @@
 ﻿[package]
 name = "nexty-html"
 description = "Nexty HTML 解析层：html5ever 到自有 DOM 的桥接"
-version = "0.1.3"
+version = "0.1.4"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# 默认开启全部已实现能力；下游（nexty-css / nexty-chrome）依赖默认即可。
+default = ["parse-document", "parse-fragment", "resources"]
+# 完整文档解析（parse_document），依赖 html5ever TreeSink 桥接。
+parse-document = ["dep:html5ever"]
+# 片段解析（parse_fragment，含上下文命名空间切换），依赖 TreeSink 桥接。
+parse-fragment = ["dep:html5ever"]
+# 子资源清单收集（样式表 / 图片），只收集不解析，纯遍历自研 DOM。
+resources = []
+
 [dependencies]
-html5ever = "0.40.1"
+html5ever = { version = "0.40.1", optional = true }
 nexty-dom = { path = "../nexty-dom", version = "0.1.0" }
