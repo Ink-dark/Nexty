@@ -342,9 +342,16 @@ impl TextShaper for ParleyTextShaper {
             }
         }
 
+        let width = layout
+            .width()
+            .max(glyphs.last().map_or(0.0, |glyph| glyph.x + glyph.advance));
+
         Ok(ShapedText {
             glyphs,
-            width: layout.width(),
+            // parley 的行宽按断行测量语义**不含行尾空白**，而本层契约是含
+            // （调用方按 ShapedText.width 计词间空白的步进，见 inline 模块的
+            // space_after_previous）——取字形右缘与行宽的较大者。
+            width,
             height: layout.height(),
         })
     }
@@ -466,6 +473,41 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{family} should shape: {error:?}"));
             assert!(!shaped.glyphs.is_empty(), "{family} produced glyphs");
         }
+    }
+
+    #[test]
+    fn trailing_whitespace_is_included_in_width() {
+        // parley 行宽裁剪行尾空白；ShapedText.width 契约是含行尾空白
+        // （空格的步进供行内布局计词间距，见下一测试）
+        let shaper = shaper();
+        let style = style(&["serif"], 16.0);
+        let space = shaper.shape(" ", &style).expect("shape space");
+        assert!(space.width > 0.0, "行尾空白计入宽度：width={}", space.width);
+        let word = shaper.shape("a", &style).expect("shape a");
+        let trailing = shaper.shape("a ", &style).expect("shape a-space");
+        assert!(
+            trailing.width > word.width,
+            "a 加行尾空格应更宽：{} vs {}",
+            trailing.width,
+            word.width
+        );
+    }
+
+    #[test]
+    fn inter_word_space_advances_position() {
+        // 词间空白的宽度 = 后词起点与前词右缘之差（行内布局的空格语义）
+        let shaper = shaper();
+        let style = style(&["serif"], 16.0);
+        let space = shaper.shape(" ", &style).expect("shape space");
+        let text = shaper.shape("a b", &style).expect("shape a b");
+        let b = text.glyphs.last().expect("b glyph");
+        let a = text.glyphs.first().expect("a glyph");
+        let gap = b.x - (a.x + a.advance);
+        assert!(
+            (gap - space.width).abs() < 1e-3,
+            "词间空隙 {gap} 应等于空格宽 {}",
+            space.width
+        );
     }
 
     #[test]

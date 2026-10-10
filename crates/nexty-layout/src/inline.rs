@@ -490,7 +490,8 @@ pub(crate) fn build_lines(
             0.0
         };
 
-        let item_width = match item {
+        // (项宽, 是否发生了断行)：断行后本项是新行首项，前导空白不落入新行
+        let (item_width, broke) = match item {
             InlineItem::Text(word) => {
                 let shaped = cache
                     .entry((word.node, word.text.clone()))
@@ -514,10 +515,10 @@ pub(crate) fn build_lines(
                 let word_width = shaped.width;
                 placed.push(PlacedItem {
                     item_index: index,
-                    x: cursor + space_width,
+                    x: cursor + if needs_break { 0.0 } else { space_width },
                     shaped: Some(shaped),
                 });
-                word_width
+                (word_width, needs_break)
             }
             InlineItem::Image(image) => {
                 // 图片不可拆：放不下先换行，行首仍放不下则溢出放置
@@ -529,10 +530,10 @@ pub(crate) fn build_lines(
                 }
                 placed.push(PlacedItem {
                     item_index: index,
-                    x: cursor + space_width,
+                    x: cursor + if needs_break { 0.0 } else { space_width },
                     shaped: None,
                 });
-                image.width
+                (image.width, needs_break)
             }
             InlineItem::Block(atomic) => {
                 // 原子盒不可拆：放不下先换行，行首仍放不下则溢出放置
@@ -544,13 +545,13 @@ pub(crate) fn build_lines(
                 }
                 placed.push(PlacedItem {
                     item_index: index,
-                    x: cursor + space_width,
+                    x: cursor + if needs_break { 0.0 } else { space_width },
                     shaped: None,
                 });
-                width
+                (width, needs_break)
             }
         };
-        cursor += space_width + item_width;
+        cursor += if broke { 0.0 } else { space_width } + item_width;
     }
     flush(&mut placed, &mut lines);
     lines
