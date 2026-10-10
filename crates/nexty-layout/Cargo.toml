@@ -1,7 +1,7 @@
 [package]
 name = "nexty-layout"
 description = "Nexty 自研盒级布局"
-version = "0.1.6"
+version = "0.1.7"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -29,9 +29,10 @@ grid = []
 table = []
 # 预留：绝对定位与inset 几何（T5 由 taffy 接管），当前未实现故不在 default。
 absolute = []
-# ComputedStyle → taffy::Style 映射层（T1 已落地）。taffy 依赖本身常驻，此 feature
-# 只切映射层代码的编译，供 T3 接线前单独裁剪。
-taffy-map = []
+# ComputedStyle → taffy::Style 映射层与盒树构建（T1/T2 已落地）。taffy 依赖本身
+# 常驻，此 feature 只切这两层代码的编译，供 T3 接线前单独裁剪。盒树构建复用
+# inline 模块的 image_box_size 解算 <img> 尺寸，故依赖 inline。
+taffy-map = ["inline"]
 
 [dependencies]
 nexty-dom = { path = "../nexty-dom", version = "0.1.0" }

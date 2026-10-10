@@ -38,6 +38,8 @@ mod inline;
 mod intrinsic;
 #[cfg(feature = "taffy-map")]
 mod style_map;
+#[cfg(feature = "taffy-map")]
+mod tree_build;
 
 pub use fragment::{Edges, Fragment, ImageRun, LineFragment, Rect, TextRun};
 
