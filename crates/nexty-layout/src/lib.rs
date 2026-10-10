@@ -26,9 +26,10 @@
 //!
 //! **Feature**：按布局能力一一对应——`block`（块级流，隐含 `inline` 与
 //! `taffy-map`：taffy 管线是块级流的唯一实现）、`inline`（行内断行）、
-//! `flex`（flex 容器 blockify 与 taffy Display::Flex 映射）、`replaced`（`<img>`
-//! 替换盒）、`taffy-map`（`ComputedStyle → taffy::Style` 映射层与盒树构建）。
-//! `grid` / `table` / `absolute` 为预留槽位，当前未实现故不在 default。`taffy`
+//! `flex`（flex 容器 blockify 与 taffy Display::Flex 映射，含 wrap/shrink/对齐）、
+//! `replaced`（`<img>` 替换盒）、`taffy-map`（`ComputedStyle → taffy::Style` 映射层
+//! 与盒树构建）、`grid`（grid-* 样式映射与 Display::Grid）、`absolute`（position
+//! 与 inset 映射）。`table` 为预留槽位，当前未实现故不在 default。`taffy`
 //! 依赖常驻（feature 只切能力开关，不切依赖）。
 
 #![forbid(unsafe_code)]

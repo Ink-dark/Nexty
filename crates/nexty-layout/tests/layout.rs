@@ -703,3 +703,167 @@ fn inline_flex_participates_in_line_box_as_atomic_box() {
     );
     assert!(approx(flex.children[1].border_box.x, 50.0));
 }
+
+// ---------------------------------------------------------------------------
+// T6 专项：grid / 多行 flex / 绝对定位 / contents 提升 / 匿名块混排
+// ---------------------------------------------------------------------------
+
+/// grid 双列模板：固定列 + `fr` 列（CSS Grid §7.1 轨道尺寸）。
+#[test]
+fn grid_two_column_template_places_items() {
+    let (document, root) = layout(
+        "<body><div style=\"display: grid; grid-template-columns: 100px 1fr\">\
+         <div>a</div><div>b</div></div></body>",
+        "",
+        300.0,
+    );
+    let grid = &body(&document, &root).children[0];
+    assert_eq!(grid.children.len(), 2, "块级子元素成为 grid item");
+    assert!(approx(grid.children[0].border_box.x, 0.0));
+    assert!(approx(grid.children[0].border_box.width, 100.0), "固定列宽");
+    assert!(
+        approx(grid.children[1].border_box.x, 100.0),
+        "1fr 列从固定列之后开始"
+    );
+    assert!(
+        approx(grid.children[1].border_box.width, 200.0),
+        "1fr 分得剩余宽度（视口 300 - 100）"
+    );
+    assert!(
+        approx(grid.children[1].border_box.y, 0.0),
+        "单行 grid：两项同一行"
+    );
+}
+
+/// 多行 flex wrap：放不下的项换到第二行，容器高度随行数增长（CSS Flexbox §6）。
+#[test]
+fn flex_wrap_moves_overflow_items_to_second_line() {
+    let (document, root) = layout(
+        "<body><div style=\"display: flex; flex-wrap: wrap; width: 250px\">\
+         <div style=\"width: 100px; height: 20px\"></div>\
+         <div style=\"width: 100px; height: 20px\"></div>\
+         <div style=\"width: 100px; height: 20px\"></div></div></body>",
+        "",
+        400.0,
+    );
+    let container = &body(&document, &root).children[0];
+    assert_eq!(container.children.len(), 3);
+    assert!(approx(container.children[0].border_box.y, 0.0));
+    assert!(
+        approx(container.children[1].border_box.y, 0.0),
+        "前两项同处第一行"
+    );
+    assert!(approx(container.children[2].border_box.x, 0.0));
+    assert!(
+        approx(container.children[2].border_box.y, 20.0),
+        "放不下的项换到第二行"
+    );
+    assert!(
+        approx(container.border_box.height, 40.0),
+        "容器高度 = 两行交叉尺寸之和"
+    );
+}
+
+/// 绝对定位 inset：left/top 从包含块（此处即树内父盒）padding 盒起算；
+/// right/bottom 负向定位；绝对定位子盒不占流空间。
+///
+/// 坐标约定：Fragment border_box 相对父内容盒，无 padding 时与 padding 盒重合。
+#[test]
+fn absolute_inset_positions_box_relative_to_containing_block() {
+    let (document, root) = layout(
+        "<body><div style=\"position: relative; width: 200px; height: 100px\">\
+         <div style=\"position: absolute; left: 30px; top: 10px; width: 50px; height: 20px\"></div>\
+         <div style=\"position: absolute; right: 0px; bottom: 0px; width: 40px; height: 20px\">\
+         </div></div></body>",
+        "",
+        400.0,
+    );
+    let wrap = &body(&document, &root).children[0];
+    assert_eq!(wrap.children.len(), 2);
+    let top_left = &wrap.children[0];
+    let bottom_right = &wrap.children[1];
+    assert!(
+        approx(top_left.border_box.x, 30.0),
+        "left:30 从包含块左缘起算"
+    );
+    assert!(approx(top_left.border_box.y, 10.0));
+    assert!(
+        approx(bottom_right.border_box.x, 160.0),
+        "right:0 贴包含块右缘"
+    );
+    assert!(
+        approx(bottom_right.border_box.y, 80.0),
+        "bottom:0 贴包含块底缘"
+    );
+    assert!(
+        approx(wrap.border_box.height, 100.0),
+        "绝对定位子盒不把父盒撑高（不占流空间）"
+    );
+}
+
+/// `display: contents`：元素自身无片段，子盒提升为父盒的直接子盒（CSS Display §3.2）。
+#[test]
+fn display_contents_children_appear_in_parent_fragment() {
+    let (document, root) = layout(
+        "<body><div style=\"height: 30px\"></div>\
+         <section style=\"display: contents\">\
+         <div style=\"height: 40px\"></div></section></body>",
+        "",
+        400.0,
+    );
+    let body_fragment = body(&document, &root);
+    assert!(
+        find(&document, &root, "section").is_none(),
+        "contents 元素自身不产片段"
+    );
+    assert_eq!(
+        body_fragment.children.len(),
+        2,
+        "contents 的子盒提升为 body 的直接子盒"
+    );
+    let lifted = &body_fragment.children[1];
+    assert!(
+        approx(lifted.border_box.y, 30.0),
+        "提升的子盒接在首个子盒下方"
+    );
+    assert!(approx(lifted.border_box.height, 40.0));
+}
+
+/// 行内流与块级子盒混排：两段行内流各成匿名块（CSS 2.1 §9.2.1.1），三者按
+/// DOM 序垂直排列、互不重叠；行盒由匿名块片段承接而非并入容器。
+#[test]
+fn mixed_inline_and_block_content_does_not_overlap() {
+    let (document, root) = layout(
+        "<body>intro line<div style=\"height: 25px\"></div>tail line</body>",
+        "",
+        400.0,
+    );
+    let body_fragment = body(&document, &root);
+    assert!(
+        body_fragment.lines.is_empty(),
+        "混排容器：行盒不并入容器，由匿名块承接"
+    );
+    assert_eq!(
+        body_fragment.children.len(),
+        3,
+        "匿名块 + 块级子盒 + 匿名块按 DOM 序排列"
+    );
+    let intro = &body_fragment.children[0];
+    let mid = &body_fragment.children[1];
+    let tail = &body_fragment.children[2];
+    assert!(intro.anonymous && tail.anonymous, "行内流片段为匿名块");
+    assert!(!mid.anonymous, "真实元素片段非匿名");
+    assert!(
+        approx(mid.border_box.y, intro.border_box.height),
+        "块级子盒接在首段行内流（匿名块）下方"
+    );
+    assert!(
+        approx(tail.border_box.y, intro.border_box.height + 25.0),
+        "末段行内流接在块级子盒下方"
+    );
+    assert!(
+        intro.border_box.y + intro.border_box.height <= mid.border_box.y + 0.01
+            && mid.border_box.y + mid.border_box.height <= tail.border_box.y + 0.01,
+        "三者垂直堆叠、互不重叠"
+    );
+}

@@ -24,21 +24,32 @@
 //! - grid `min` 尺寸函数中出现 `fr`（非法 CSS）：降级为 `auto`。
 //! - `overflow` 仅 `visible` / `hidden` 被建模（`auto`/`scroll`/`clip` 在 cascade 已丢弃），
 //!   影响 taffy 的 flex/grid item 自动最小尺寸。
+//! - `position: fixed`：映射为 taffy `Absolute`。taffy 不做「最近定位祖先」包含块
+//!   搜索，绝对定位盒相对其**树内父盒**定位——父盒自身定位（relative/absolute）时
+//!   与 CSS 一致；父盒 static 时 CSS 应上溯定位祖先，此处偏差（见 `block` 模块文档
+//!   差异 8）。视口锚定（fixed 相对初始包含块）同样未建模。
 //! - `text-align` 不映射：taffy 的 `TextAlign::Legacy*` 是 legacy 块级子盒对齐
 //!   （`<center>` 语义），映射 `center` 会让块级子盒居中，偏离现代 CSS 语义
 //!   （行内内容的对齐由 `inline` 模块处理，本轮未做）。
 
+#[cfg(feature = "absolute")]
+use nexty_css::InsetValue;
 use nexty_css::{
     AlignItemsValue, AlignSelfValue, BoxSizingValue, ComputedStyle, DisplayValue,
-    FlexDirectionValue, FlexWrapValue, GapValue, GridAutoFlowValue, GridTrack, GridTrackList,
-    InsetValue, JustifyContentValue, MarginValue, OverflowValue, PaddingValue, PositionValue,
-    SizeValue,
+    FlexDirectionValue, FlexWrapValue, GapValue, JustifyContentValue, MarginValue, OverflowValue,
+    PaddingValue, PositionValue, SizeValue,
 };
+#[cfg(feature = "grid")]
+use nexty_css::{GridAutoFlowValue, GridTrack, GridTrackList};
 use taffy::{
-    AlignItems, AlignSelf, BoxSizing, CheapCloneStr, Dimension, Display, FlexDirection, FlexWrap,
-    GridAutoFlow, GridTemplateComponent, JustifyContent, LengthPercentage, LengthPercentageAuto,
-    MaxTrackSizingFunction, MinTrackSizingFunction, Overflow, Point, Position, Rect, Size, Style,
+    AlignItems, AlignSelf, BoxSizing, Dimension, Display, FlexDirection, FlexWrap, JustifyContent,
+    LengthPercentage, LengthPercentageAuto, Overflow, Point, Position, Rect, Size, Style,
     style_helpers as sh,
+};
+#[cfg(feature = "grid")]
+use taffy::{
+    CheapCloneStr, GridAutoFlow, GridTemplateComponent, MaxTrackSizingFunction,
+    MinTrackSizingFunction,
 };
 
 /// 把 computed style 映射为 taffy 的盒级几何样式。
@@ -53,17 +64,25 @@ pub(crate) fn map_style(style: &ComputedStyle) -> Style {
         BoxSizingValue::ContentBox => BoxSizing::ContentBox,
         BoxSizingValue::BorderBox => BoxSizing::BorderBox,
     };
-    // taffy 无 `Static`：Relative 在 inset 全 auto 时等价于 CSS static。
+    // taffy 无 `Static`：Relative 在 inset 全 auto 时等价于 CSS static。绝对/固定
+    // 定位由 feature `absolute` 门控（关闭时降级为 static 等价，与 flex 关闭时
+    // 降级为块级流的模式一致）。
     s.position = match style.position {
         PositionValue::Static | PositionValue::Relative => Position::Relative,
+        #[cfg(feature = "absolute")]
         PositionValue::Absolute | PositionValue::Fixed => Position::Absolute,
+        #[cfg(not(feature = "absolute"))]
+        PositionValue::Absolute | PositionValue::Fixed => Position::Relative,
     };
-    s.inset = Rect {
-        left: inset_side(style.inset.left),
-        right: inset_side(style.inset.right),
-        top: inset_side(style.inset.top),
-        bottom: inset_side(style.inset.bottom),
-    };
+    #[cfg(feature = "absolute")]
+    {
+        s.inset = Rect {
+            left: inset_side(style.inset.left),
+            right: inset_side(style.inset.right),
+            top: inset_side(style.inset.top),
+            bottom: inset_side(style.inset.bottom),
+        };
+    }
     s.size = Size {
         width: map_dimension(style.width),
         height: map_dimension(style.height),
@@ -123,20 +142,13 @@ pub(crate) fn map_style(style: &ComputedStyle) -> Style {
     s.align_self = map_align_self(style.align_self);
     s.justify_content = Some(map_justify_content(style.justify_content));
 
-    // Grid 容器。
-    s.grid_template_columns = map_grid_tracks(&style.grid_template_columns);
-    s.grid_template_rows = map_grid_tracks(&style.grid_template_rows);
+    // gap：对 flex / grid 通用（taffy gap：width = column-gap，height = row-gap）。
     s.gap = Size {
-        // taffy gap：width = column-gap，height = row-gap。
         width: gap_side(style.column_gap),
         height: gap_side(style.row_gap),
     };
-    s.grid_auto_flow = match style.grid_auto_flow {
-        GridAutoFlowValue::Row => GridAutoFlow::Row,
-        GridAutoFlowValue::Column => GridAutoFlow::Column,
-        GridAutoFlowValue::RowDense => GridAutoFlow::RowDense,
-        GridAutoFlowValue::ColumnDense => GridAutoFlow::ColumnDense,
-    };
+    // Grid 容器（feature `grid` 门控；gap 对 flex/grid 通用，不随门控）。
+    apply_grid_style(style, &mut s);
 
     s
 }
@@ -147,8 +159,8 @@ pub(crate) fn map_style(style: &ComputedStyle) -> Style {
 
 /// `display` → taffy `Display`，含必要 blockify（见模块文档偏差）。
 ///
-/// flex 映射由 feature `flex` 门控：关闭时 flex 容器按 `Display::Block` 走
-/// 块级流（与自研时代 feature 关闭的行为一致）。
+/// flex / grid 映射由对应 feature 门控：关闭时容器按 `Display::Block` 走块级流
+/// （与自研时代 feature 关闭的行为一致）。
 fn map_display(d: DisplayValue) -> Display {
     match d {
         DisplayValue::Block
@@ -162,7 +174,10 @@ fn map_display(d: DisplayValue) -> Display {
         DisplayValue::Flex | DisplayValue::InlineFlex => Display::Flex,
         #[cfg(not(feature = "flex"))]
         DisplayValue::Flex | DisplayValue::InlineFlex => Display::Block,
+        #[cfg(feature = "grid")]
         DisplayValue::Grid | DisplayValue::InlineGrid => Display::Grid,
+        #[cfg(not(feature = "grid"))]
+        DisplayValue::Grid | DisplayValue::InlineGrid => Display::Block,
         DisplayValue::None => Display::None,
         // 偏差兜底：见模块文档。
         DisplayValue::Inline | DisplayValue::Contents => Display::Block,
@@ -202,6 +217,8 @@ fn padding_side(v: PaddingValue) -> LengthPercentage {
     }
 }
 
+/// `inset` 单边映射（feature `absolute` 专用）。
+#[cfg(feature = "absolute")]
 fn inset_side(v: InsetValue) -> LengthPercentageAuto {
     match v {
         InsetValue::Length(f) => sh::length(f),
@@ -261,14 +278,33 @@ fn map_justify_content(v: JustifyContentValue) -> JustifyContent {
 }
 
 // ---------------------------------------------------------------------------
-// grid 轨道映射
+// grid 轨道映射（feature `grid`）
 // ---------------------------------------------------------------------------
 
+/// grid 轨道与 auto-flow 映射。关闭 `grid` 时容器按 `Display::Block` 走块级流
+/// （与 flex 关闭时的降级模式一致），无需映射。
+#[cfg(feature = "grid")]
+fn apply_grid_style(style: &ComputedStyle, s: &mut Style) {
+    s.grid_template_columns = map_grid_tracks(&style.grid_template_columns);
+    s.grid_template_rows = map_grid_tracks(&style.grid_template_rows);
+    s.grid_auto_flow = match style.grid_auto_flow {
+        GridAutoFlowValue::Row => GridAutoFlow::Row,
+        GridAutoFlowValue::Column => GridAutoFlow::Column,
+        GridAutoFlowValue::RowDense => GridAutoFlow::RowDense,
+        GridAutoFlowValue::ColumnDense => GridAutoFlow::ColumnDense,
+    };
+}
+
+#[cfg(not(feature = "grid"))]
+fn apply_grid_style(_style: &ComputedStyle, _s: &mut Style) {}
+
 /// `GridTrackList` → taffy 轨道序列。`S` 由目标字段（`Style::<DefaultCheapStr>`）推断。
+#[cfg(feature = "grid")]
 fn map_grid_tracks<S: CheapCloneStr>(list: &GridTrackList) -> Vec<GridTemplateComponent<S>> {
     list.tracks.iter().map(map_grid_track).collect()
 }
 
+#[cfg(feature = "grid")]
 fn map_grid_track<S: CheapCloneStr>(t: &GridTrack) -> GridTemplateComponent<S> {
     let tsf = match t {
         GridTrack::Length(f) => sh::length(*f),
@@ -281,6 +317,7 @@ fn map_grid_track<S: CheapCloneStr>(t: &GridTrack) -> GridTemplateComponent<S> {
 }
 
 /// `minmax()` 的 min 段：长度 / 百分比 / auto；`fr` 非法降级为 auto。
+#[cfg(feature = "grid")]
 fn map_track_inner_min(t: &GridTrack) -> MinTrackSizingFunction {
     match t {
         GridTrack::Length(f) => sh::length(*f),
@@ -292,6 +329,7 @@ fn map_track_inner_min(t: &GridTrack) -> MinTrackSizingFunction {
 }
 
 /// `minmax()` 的 max 段：长度 / 百分比 / auto / `fr`。
+#[cfg(feature = "grid")]
 fn map_track_inner_max(t: &GridTrack) -> MaxTrackSizingFunction {
     match t {
         GridTrack::Length(f) => sh::length(*f),

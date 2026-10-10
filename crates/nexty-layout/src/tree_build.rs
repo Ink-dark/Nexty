@@ -23,8 +23,8 @@
 //! `Fragment` 时定位几何与行盒。DOM `NodeId` 与 taffy `Node` 是不同类型，taffy
 //! 的 `NodeId` 只在本 crate 内部流转，绝不外泄（AGENTS.md 硬规则）。
 //!
-//! **已知限制**（T5 处理）：grid 容器暂按块容器走法收集子盒（行内子节点进 run
-//! 叶而非 grid item），待 grid item 生成接线后改为 blockify。
+//! **grid 容器**：沿用块容器走法收集子盒——块级子盒成为 grid item；行内内容
+//! 经 run 叶（匿名块）成为一个匿名 item（CSS Grid §3.2 匿名项语义）。
 //!
 //! feature `block` 关闭时本模块无生产调用方（盒树构建的下游是 taffy 管线），
 //! 按模块整体抑制 dead_code（裁剪配置仅供编译验证）。

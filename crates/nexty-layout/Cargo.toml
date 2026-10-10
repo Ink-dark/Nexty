@@ -1,7 +1,7 @@
 [package]
 name = "nexty-layout"
 description = "Nexty 自研盒级布局"
-version = "0.1.9"
+version = "0.1.10"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -9,9 +9,9 @@ rust-version.workspace = true
 
 [features]
 # 默认开启全部已实现能力；下游 nexty-chrome 依赖默认即可获得完整布局栈。
-# 未实现的能力（grid / table / absolute）不在 default 中，feature 槽位已预留，
-# 待对应任务落地时补全实现并加入 default。
-default = ["block", "inline", "flex", "replaced", "taffy-map"]
+# 未实现的能力（table）不在 default 中，feature 槽位已预留，待对应任务落地时
+# 补全实现并加入 default。
+default = ["block", "inline", "flex", "replaced", "taffy-map", "grid", "absolute"]
 # 块级流：几何解算由 taffy 接管（CSS 2.1 §9.2 / §10.3 / §10.5–10.7）。taffy
 # 管线是块级流的唯一实现，故隐含 inline（行内断行喂给匿名块 measure 节点）与
 # taffy-map（盒树构建 + 样式映射）。
@@ -20,15 +20,19 @@ block = ["inline", "taffy-map"]
 # 永久自研；CSS 2.1 §9.2.2 / §10.8、CSS Text §3/§7）。
 inline = []
 # 弹性布局：flex 容器的子项 blockify（tree_build）与 taffy Display::Flex 映射
-# （style_map）；主轴/交叉轴几何由 taffy 的 flexbox 算法解算（CSS Flexbox）。
+# （style_map）；主轴/交叉轴几何（含 wrap/shrink/对齐值）由 taffy 的 flexbox
+# 算法解算（CSS Flexbox）。
 flex = ["block"]
 # 替换元素：块级与行内替换盒（<img>）的自然尺寸与内在尺寸测量。
 replaced = []
-# 预留：grid 布局（taffy 已实现 grid 算法，待接线 grid item 生成），不在 default。
+# Grid 布局：grid-* 样式映射与 Display::Grid 映射（style_map）；轨道/放置几何
+# 由 taffy 的 grid 算法解算（CSS Grid）。grid item 生成沿用盒树构建的收集走法：
+# 块级子盒成 item，行内内容经匿名块成 item（CSS Grid §3.2 匿名项）。
 grid = []
 # 预留：表格布局，当前未实现故不在 default。
 table = []
-# 预留：绝对定位与inset 几何（taffy 支持，待接线包含块判定），不在 default。
+# 绝对/固定定位：position 与 inset 样式映射（style_map）；几何由 taffy 解算
+# （taffy 相对树内父盒定位，不做「最近定位祖先」搜索，偏差见 style_map 文档）。
 absolute = []
 # ComputedStyle → taffy::Style 映射层（style_map）与盒树构建（tree_build）。
 # 块级流的 taffy 管线复用 inline 模块断行，故依赖 inline。

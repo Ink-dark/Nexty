@@ -42,6 +42,11 @@
 //!    列为已知限制（T4/后续补）。
 //! 7. **`display: contents` 的根**：根元素无自身盒，其 margin 不再参与定位
 //!    （旧自研会给根加 margin 偏移，规范上无盒元素无 margin 可言）。
+//! 8. **绝对定位的包含块**（T6）：taffy 不做「最近定位祖先」搜索，绝对定位盒
+//!    相对其**树内父盒**定位（CSS Position §6 应上溯最近的定位祖先）。父盒自身
+//!    定位（relative/absolute）时与 CSS 一致——这是常见用法；父盒 static 时
+//!    偏差，列为已知限制。`position: fixed` 同样映射为 taffy `Absolute`
+//!    （视口锚定未建模）。
 
 use nexty_css::{ComputedStyle, MarginValue};
 use nexty_dom::NodeId;
