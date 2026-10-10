@@ -17,10 +17,11 @@ use nexty_dom::{Document, NodeId, NodeKind};
 use crate::parser::{Declaration, Stylesheet, parse_inline_style};
 use crate::selector::match_element_selectors;
 use crate::value::{
-    AbsoluteSize, BorderColorValue, BorderStyle, BorderWidthValue, BoxSizingValue, CssWideKeyword,
-    DeclaredValue, DisplayValue, FontFamilyValue, FontSizeValue, FontStyleValue, FontWeightValue,
-    LineHeightValue, MarginValue, OverflowValue, PaddingValue, PropertyId, PropertyValue, Rgba,
-    SizeValue, TextAlignValue,
+    AbsoluteSize, AlignItemsValue, AlignSelfValue, BorderColorValue, BorderStyle, BorderWidthValue,
+    BoxSizingValue, CssWideKeyword, DeclaredValue, DisplayValue, FlexDirectionValue, FlexWrapValue,
+    FontFamilyValue, FontSizeValue, FontStyleValue, FontWeightValue, GapValue, GridAutoFlowValue,
+    GridTrackList, InsetValue, JustifyContentValue, LineHeightValue, MarginValue, OverflowValue,
+    PaddingValue, PositionValue, PropertyId, PropertyValue, Rgba, SizeValue, TextAlignValue,
 };
 
 /// 本层 UA 的 medium 字号基准（CSS Fonts 4 §2.5：initial 值由 UA 决定，
@@ -69,6 +70,32 @@ pub struct ComputedStyle {
     pub flex_grow: f32,
     /// `flex-basis`（CSS Flexbox §7.2，initial auto）。
     pub flex_basis: SizeValue,
+    /// `position`（CSS Position 3 §2，initial static）。
+    pub position: PositionValue,
+    /// 四边 inset（top / right / bottom / left；百分比与 auto 由 layout 解析）。
+    pub inset: Edges<InsetValue>,
+    /// `flex-direction`（CSS Flexbox §8.3.1，initial row）。
+    pub flex_direction: FlexDirectionValue,
+    /// `flex-wrap`（CSS Flexbox §8.4.1，initial nowrap）。
+    pub flex_wrap: FlexWrapValue,
+    /// `flex-shrink`（CSS Flexbox §7.2，initial 1）。
+    pub flex_shrink: f32,
+    /// `align-items`（CSS Box Alignment §7，initial stretch）。
+    pub align_items: AlignItemsValue,
+    /// `justify-content`（CSS Box Alignment §8，initial flex-start）。
+    pub justify_content: JustifyContentValue,
+    /// `align-self`（CSS Box Alignment §7，initial auto）。
+    pub align_self: AlignSelfValue,
+    /// `grid-template-columns`（CSS Grid §7.2，initial 空）。
+    pub grid_template_columns: GridTrackList,
+    /// `grid-template-rows`（CSS Grid §7.3，initial 空）。
+    pub grid_template_rows: GridTrackList,
+    /// `row-gap`（CSS Box Alignment §6，initial normal）。
+    pub row_gap: GapValue,
+    /// `column-gap`（CSS Box Alignment §6，initial normal）。
+    pub column_gap: GapValue,
+    /// `grid-auto-flow`（CSS Grid §7.7，initial row）。
+    pub grid_auto_flow: GridAutoFlowValue,
     /// 四边 margin（百分比与 auto 由 layout 解析）。
     pub margin: Edges<MarginValue>,
     /// 四边 padding（百分比由 layout 解析）。
@@ -135,6 +162,19 @@ impl ComputedStyle {
             overflow: OverflowValue::Visible,
             flex_grow: 0.0,
             flex_basis: SizeValue::Auto,
+            position: PositionValue::Static,
+            inset: Edges::splat(InsetValue::Auto),
+            flex_direction: FlexDirectionValue::Row,
+            flex_wrap: FlexWrapValue::NoWrap,
+            flex_shrink: 1.0,
+            align_items: AlignItemsValue::Stretch,
+            justify_content: JustifyContentValue::FlexStart,
+            align_self: AlignSelfValue::Auto,
+            grid_template_columns: GridTrackList::default(),
+            grid_template_rows: GridTrackList::default(),
+            row_gap: GapValue::Normal,
+            column_gap: GapValue::Normal,
+            grid_auto_flow: GridAutoFlowValue::Row,
             margin: Edges::splat(MarginValue::Length(0.0)),
             padding: Edges::splat(PaddingValue::Length(0.0)),
             border_width: Edges::splat(0.0),
@@ -166,7 +206,7 @@ impl PropertyId {
 /// 顺序承载计算依赖：`FontSize` 先于 `LineHeight`（百分比按自身字号折算）、
 /// `Color` 先于 border 颜色（currentcolor）、border style 先于 width
 /// （none/hidden 时宽度归零）。
-const PROPERTY_ORDER: [PropertyId; 39] = [
+const PROPERTY_ORDER: [PropertyId; 55] = [
     PropertyId::Display,
     PropertyId::Color,
     PropertyId::BackgroundColor,
@@ -186,6 +226,22 @@ const PROPERTY_ORDER: [PropertyId; 39] = [
     PropertyId::Overflow,
     PropertyId::FlexGrow,
     PropertyId::FlexBasis,
+    PropertyId::Position,
+    PropertyId::Top,
+    PropertyId::Right,
+    PropertyId::Bottom,
+    PropertyId::Left,
+    PropertyId::FlexDirection,
+    PropertyId::FlexWrap,
+    PropertyId::FlexShrink,
+    PropertyId::AlignItems,
+    PropertyId::JustifyContent,
+    PropertyId::AlignSelf,
+    PropertyId::GridTemplateColumns,
+    PropertyId::GridTemplateRows,
+    PropertyId::RowGap,
+    PropertyId::ColumnGap,
+    PropertyId::GridAutoFlow,
     PropertyId::MarginTop,
     PropertyId::MarginRight,
     PropertyId::MarginBottom,
@@ -542,6 +598,54 @@ fn resolve_all(
             (PropertyId::FlexBasis, Decision::Use(PropertyValue::FlexBasis(value))) => {
                 style.flex_basis = *value;
             }
+            (PropertyId::Position, Decision::Use(PropertyValue::Position(value))) => {
+                style.position = *value;
+            }
+            (PropertyId::Top, Decision::Use(PropertyValue::Inset(value))) => {
+                style.inset.top = *value;
+            }
+            (PropertyId::Right, Decision::Use(PropertyValue::Inset(value))) => {
+                style.inset.right = *value;
+            }
+            (PropertyId::Bottom, Decision::Use(PropertyValue::Inset(value))) => {
+                style.inset.bottom = *value;
+            }
+            (PropertyId::Left, Decision::Use(PropertyValue::Inset(value))) => {
+                style.inset.left = *value;
+            }
+            (PropertyId::FlexDirection, Decision::Use(PropertyValue::FlexDirection(value))) => {
+                style.flex_direction = *value;
+            }
+            (PropertyId::FlexWrap, Decision::Use(PropertyValue::FlexWrap(value))) => {
+                style.flex_wrap = *value;
+            }
+            (PropertyId::FlexShrink, Decision::Use(PropertyValue::FlexShrink(value))) => {
+                style.flex_shrink = *value;
+            }
+            (PropertyId::AlignItems, Decision::Use(PropertyValue::AlignItems(value))) => {
+                style.align_items = *value;
+            }
+            (PropertyId::JustifyContent, Decision::Use(PropertyValue::JustifyContent(value))) => {
+                style.justify_content = *value;
+            }
+            (PropertyId::AlignSelf, Decision::Use(PropertyValue::AlignSelf(value))) => {
+                style.align_self = *value;
+            }
+            (PropertyId::GridTemplateColumns, Decision::Use(PropertyValue::GridTrack(value))) => {
+                style.grid_template_columns = value.clone();
+            }
+            (PropertyId::GridTemplateRows, Decision::Use(PropertyValue::GridTrack(value))) => {
+                style.grid_template_rows = value.clone();
+            }
+            (PropertyId::RowGap, Decision::Use(PropertyValue::Gap(value))) => {
+                style.row_gap = *value;
+            }
+            (PropertyId::ColumnGap, Decision::Use(PropertyValue::Gap(value))) => {
+                style.column_gap = *value;
+            }
+            (PropertyId::GridAutoFlow, Decision::Use(PropertyValue::GridAutoFlow(value))) => {
+                style.grid_auto_flow = *value;
+            }
             (PropertyId::MarginTop, Decision::Use(PropertyValue::Margin(value))) => {
                 style.margin.top = *value;
             }
@@ -628,6 +732,26 @@ fn resolve_all(
                     PropertyId::Overflow => style.overflow = source.overflow,
                     PropertyId::FlexGrow => style.flex_grow = source.flex_grow,
                     PropertyId::FlexBasis => style.flex_basis = source.flex_basis,
+                    PropertyId::Position => style.position = source.position,
+                    PropertyId::Top => style.inset.top = source.inset.top,
+                    PropertyId::Right => style.inset.right = source.inset.right,
+                    PropertyId::Bottom => style.inset.bottom = source.inset.bottom,
+                    PropertyId::Left => style.inset.left = source.inset.left,
+                    PropertyId::FlexDirection => style.flex_direction = source.flex_direction,
+                    PropertyId::FlexWrap => style.flex_wrap = source.flex_wrap,
+                    PropertyId::FlexShrink => style.flex_shrink = source.flex_shrink,
+                    PropertyId::AlignItems => style.align_items = source.align_items,
+                    PropertyId::JustifyContent => style.justify_content = source.justify_content,
+                    PropertyId::AlignSelf => style.align_self = source.align_self,
+                    PropertyId::GridTemplateColumns => {
+                        style.grid_template_columns = source.grid_template_columns.clone()
+                    }
+                    PropertyId::GridTemplateRows => {
+                        style.grid_template_rows = source.grid_template_rows.clone()
+                    }
+                    PropertyId::RowGap => style.row_gap = source.row_gap,
+                    PropertyId::ColumnGap => style.column_gap = source.column_gap,
+                    PropertyId::GridAutoFlow => style.grid_auto_flow = source.grid_auto_flow,
                     PropertyId::MarginTop => style.margin.top = source.margin.top,
                     PropertyId::MarginRight => style.margin.right = source.margin.right,
                     PropertyId::MarginBottom => style.margin.bottom = source.margin.bottom,
@@ -762,6 +886,7 @@ mod tests {
     use super::*;
     use crate::html_ua_stylesheet;
     use crate::test_support::{build_document, find_first_by_name};
+    use crate::value::GridTrack;
 
     fn style_of(html: &str, sheets: &[&str], name: &str) -> ComputedStyle {
         let document = build_document(html);
@@ -1264,5 +1389,49 @@ mod tests {
         assert_eq!(style.padding, Edges::splat(PaddingValue::Length(5.0)));
         assert_eq!(style.width, SizeValue::Length(300.0));
         assert_eq!(style.height, SizeValue::Percent(0.5));
+    }
+
+    #[test]
+    fn layout_properties_reach_computed_style() {
+        let style = style_of(
+            "<div style=\"position: absolute; top: 10px; right: 20%; bottom: auto; left: 5px;\
+                flex-direction: column; flex-wrap: wrap; flex-shrink: 2;\
+                align-items: center; justify-content: space-between; align-self: flex-end;\
+                row-gap: 8px; column-gap: 4px; grid-auto-flow: row dense;\
+                grid-template-columns: 100px 1fr; grid-template-rows: auto\">x</div>",
+            &[],
+            "div",
+        );
+        assert_eq!(style.position, PositionValue::Absolute);
+        assert_eq!(
+            style.inset,
+            Edges {
+                top: InsetValue::Length(10.0),
+                right: InsetValue::Percent(0.2),
+                bottom: InsetValue::Auto,
+                left: InsetValue::Length(5.0),
+            }
+        );
+        assert_eq!(style.flex_direction, FlexDirectionValue::Column);
+        assert_eq!(style.flex_wrap, FlexWrapValue::Wrap);
+        assert_eq!(style.flex_shrink, 2.0);
+        assert_eq!(style.align_items, AlignItemsValue::Center);
+        assert_eq!(style.justify_content, JustifyContentValue::SpaceBetween);
+        assert_eq!(style.align_self, AlignSelfValue::FlexEnd);
+        assert_eq!(style.row_gap, GapValue::Length(8.0));
+        assert_eq!(style.column_gap, GapValue::Length(4.0));
+        assert_eq!(style.grid_auto_flow, GridAutoFlowValue::RowDense);
+        assert_eq!(
+            style.grid_template_columns,
+            GridTrackList {
+                tracks: vec![GridTrack::Length(100.0), GridTrack::Fr(1.0)]
+            }
+        );
+        assert_eq!(
+            style.grid_template_rows,
+            GridTrackList {
+                tracks: vec![GridTrack::Auto]
+            }
+        );
     }
 }

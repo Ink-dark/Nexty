@@ -25,8 +25,10 @@ pub use parser::{Declaration, MediaViewport, StyleRule, Stylesheet, parse_inline
 pub use selector::{SelectorError, matches_selector};
 pub use ua::html_ua_stylesheet;
 pub use value::{
-    AbsoluteSize, BorderColorValue, BorderStyle, BorderWidthValue, BoxSizingValue, CssWideKeyword,
-    DeclaredValue, DisplayValue, FontFamilyValue, FontSizeValue, FontStyleValue, FontWeightValue,
-    LineHeightValue, MarginValue, OverflowValue, PaddingValue, PropertyId, PropertyValue, Rgba,
-    SizeValue, TextAlignValue,
+    AbsoluteSize, AlignItemsValue, AlignSelfValue, BorderColorValue, BorderStyle, BorderWidthValue,
+    BoxSizingValue, CssWideKeyword, DeclaredValue, DisplayValue, FlexDirectionValue, FlexWrapValue,
+    FontFamilyValue, FontSizeValue, FontStyleValue, FontWeightValue, GapValue, GridAutoFlowValue,
+    GridTrack, GridTrackList, InsetValue, JustifyContentValue, LineHeightValue, MarginValue,
+    OverflowValue, PaddingValue, PositionValue, PropertyId, PropertyValue, Rgba, SizeValue,
+    TextAlignValue,
 };

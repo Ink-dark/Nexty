@@ -95,6 +95,38 @@ pub enum PropertyId {
     FlexGrow,
     /// `flex-basis`。
     FlexBasis,
+    /// `position`。
+    Position,
+    /// `top`。
+    Top,
+    /// `right`。
+    Right,
+    /// `bottom`。
+    Bottom,
+    /// `left`。
+    Left,
+    /// `flex-direction`。
+    FlexDirection,
+    /// `flex-wrap`。
+    FlexWrap,
+    /// `flex-shrink`。
+    FlexShrink,
+    /// `align-items`。
+    AlignItems,
+    /// `justify-content`。
+    JustifyContent,
+    /// `align-self`。
+    AlignSelf,
+    /// `grid-template-columns`。
+    GridTemplateColumns,
+    /// `grid-template-rows`。
+    GridTemplateRows,
+    /// `row-gap`。
+    RowGap,
+    /// `column-gap`。
+    ColumnGap,
+    /// `grid-auto-flow`。
+    GridAutoFlow,
     /// `margin-top`。
     MarginTop,
     /// `margin-right`。
@@ -161,6 +193,22 @@ impl PropertyId {
             PropertyId::Overflow => "overflow",
             PropertyId::FlexGrow => "flex-grow",
             PropertyId::FlexBasis => "flex-basis",
+            PropertyId::Position => "position",
+            PropertyId::Top => "top",
+            PropertyId::Right => "right",
+            PropertyId::Bottom => "bottom",
+            PropertyId::Left => "left",
+            PropertyId::FlexDirection => "flex-direction",
+            PropertyId::FlexWrap => "flex-wrap",
+            PropertyId::FlexShrink => "flex-shrink",
+            PropertyId::AlignItems => "align-items",
+            PropertyId::JustifyContent => "justify-content",
+            PropertyId::AlignSelf => "align-self",
+            PropertyId::GridTemplateColumns => "grid-template-columns",
+            PropertyId::GridTemplateRows => "grid-template-rows",
+            PropertyId::RowGap => "row-gap",
+            PropertyId::ColumnGap => "column-gap",
+            PropertyId::GridAutoFlow => "grid-auto-flow",
             PropertyId::MarginTop => "margin-top",
             PropertyId::MarginRight => "margin-right",
             PropertyId::MarginBottom => "margin-bottom",
@@ -188,7 +236,7 @@ impl PropertyId {
     /// （CSS Syntax：声明名匹配大小写不敏感）。
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
-        const ALL: [PropertyId; 39] = [
+        const ALL: [PropertyId; 55] = [
             PropertyId::Display,
             PropertyId::Color,
             PropertyId::BackgroundColor,
@@ -208,6 +256,22 @@ impl PropertyId {
             PropertyId::Overflow,
             PropertyId::FlexGrow,
             PropertyId::FlexBasis,
+            PropertyId::Position,
+            PropertyId::Top,
+            PropertyId::Right,
+            PropertyId::Bottom,
+            PropertyId::Left,
+            PropertyId::FlexDirection,
+            PropertyId::FlexWrap,
+            PropertyId::FlexShrink,
+            PropertyId::AlignItems,
+            PropertyId::JustifyContent,
+            PropertyId::AlignSelf,
+            PropertyId::GridTemplateColumns,
+            PropertyId::GridTemplateRows,
+            PropertyId::RowGap,
+            PropertyId::ColumnGap,
+            PropertyId::GridAutoFlow,
             PropertyId::MarginTop,
             PropertyId::MarginRight,
             PropertyId::MarginBottom,
@@ -292,6 +356,28 @@ pub enum PropertyValue {
     FlexGrow(f32),
     /// `flex-basis` 值（auto | <length-percentage>）。
     FlexBasis(SizeValue),
+    /// `position` 关键字。
+    Position(PositionValue),
+    /// `top` / `right` / `bottom` / `left` 值。
+    Inset(InsetValue),
+    /// `flex-direction` 关键字。
+    FlexDirection(FlexDirectionValue),
+    /// `flex-wrap` 关键字。
+    FlexWrap(FlexWrapValue),
+    /// `flex-shrink` 数值。
+    FlexShrink(f32),
+    /// `align-items` 关键字。
+    AlignItems(AlignItemsValue),
+    /// `justify-content` 关键字。
+    JustifyContent(JustifyContentValue),
+    /// `align-self` 关键字。
+    AlignSelf(AlignSelfValue),
+    /// `grid-template-columns` / `grid-template-rows` 轨道列表。
+    GridTrack(GridTrackList),
+    /// `row-gap` / `column-gap` 值。
+    Gap(GapValue),
+    /// `grid-auto-flow` 关键字。
+    GridAutoFlow(GridAutoFlowValue),
     /// margin 值（四边共用）。
     Margin(MarginValue),
     /// padding 值（四边共用）。
@@ -528,6 +614,161 @@ pub enum OverflowValue {
     Hidden,
 }
 
+/// `position` 值
+/// （[CSS Position 3 §2](https://drafts.csswg.org/css-position-3/#position-properties)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionValue {
+    /// `static`（initial）：常规流，不建立包含块。
+    Static,
+    /// `relative`：相对自身偏移，仍占常规流空间。
+    Relative,
+    /// `absolute`：相对最近定位祖先（无则视口）定位，脱离常规流。
+    Absolute,
+    /// `fixed`：相对视口定位（本布局层按 absolute 处理）。
+    Fixed,
+}
+
+/// `top` / `right` / `bottom` / `left` 值（inset）
+/// （[CSS Position 3 §3](https://drafts.csswg.org/css-position-3/#insets)）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InsetValue {
+    /// 绝对长度（CSS px）。
+    Length(f32),
+    /// 百分比（相对包含块对应轴尺寸；本层仅垂直相对高度，水平相对宽度，
+    /// 由 layout 解析）。
+    Percent(f32),
+    /// `auto`（initial）。
+    Auto,
+}
+
+/// `flex-direction` 值
+/// （[CSS Flexbox §8.3.1](https://drafts.csswg.org/css-flexbox/#flex-direction-property)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlexDirectionValue {
+    /// `row`（initial）。
+    Row,
+    /// `row-reverse`。
+    RowReverse,
+    /// `column`。
+    Column,
+    /// `column-reverse`。
+    ColumnReverse,
+}
+
+/// `flex-wrap` 值
+/// （[CSS Flexbox §8.4.1](https://drafts.csswg.org/css-flexbox/#flex-wrap-property)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlexWrapValue {
+    /// `nowrap`（initial）：单行。
+    NoWrap,
+    /// `wrap`：多行。
+    Wrap,
+    /// `wrap-reverse`：多行反向。
+    WrapReverse,
+}
+
+/// `align-items` / `align-self` 的 cross-axis 对齐值
+/// （[CSS Box Alignment §7](https://drafts.csswg.org/css-align-3/#align-items-property)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignItemsValue {
+    /// `stretch`（initial）。
+    Stretch,
+    /// `flex-start` / `start`。
+    FlexStart,
+    /// `flex-end` / `end`。
+    FlexEnd,
+    /// `center`。
+    Center,
+    /// `baseline`。
+    Baseline,
+}
+
+/// `justify-content` 的主轴对齐值
+/// （[CSS Box Alignment §8](https://drafts.csswg.org/css-align-3/#justify-content-property)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JustifyContentValue {
+    /// `flex-start` / `start`（initial）。
+    FlexStart,
+    /// `flex-end` / `end`。
+    FlexEnd,
+    /// `center`。
+    Center,
+    /// `space-between`。
+    SpaceBetween,
+    /// `space-around`。
+    SpaceAround,
+    /// `space-evenly`。
+    SpaceEvenly,
+}
+
+/// `align-self` 值（在 `align-items` 基础上多一个 `auto` 回退父值）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignSelfValue {
+    /// `auto`（initial）：回退到父 `align-items`。
+    Auto,
+    /// 同 [`AlignItemsValue::Stretch`]。
+    Stretch,
+    /// 同 [`AlignItemsValue::FlexStart`]。
+    FlexStart,
+    /// 同 [`AlignItemsValue::FlexEnd`]。
+    FlexEnd,
+    /// 同 [`AlignItemsValue::Center`]。
+    Center,
+    /// 同 [`AlignItemsValue::Baseline`]。
+    Baseline,
+}
+
+/// `gap` 值
+/// （[CSS Box Alignment §6](https://drafts.csswg.org/css-align-3/#gap-shorthand)）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GapValue {
+    /// 绝对长度（CSS px）。
+    Length(f32),
+    /// 百分比（相对包含块对应轴尺寸）。
+    Percent(f32),
+    /// `normal`（initial）：退化为 0。
+    Normal,
+}
+
+/// `grid-auto-flow` 值
+/// （[CSS Grid §7.7](https://drafts.csswg.org/css-grid/#grid-auto-flow-property)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GridAutoFlowValue {
+    /// `row`（initial）。
+    Row,
+    /// `column`。
+    Column,
+    /// `row dense`。
+    RowDense,
+    /// `column dense`。
+    ColumnDense,
+}
+
+/// 一条 grid 轨道的轨道尺寸函数（简化版）。
+///
+/// 仅覆盖布局几何需要的子集：固定长度、百分比、弹性系数 `fr`、自适应
+/// `auto`、以及两段式 `minmax(a, b)`（a/b 各为长度/百分比/fr/auto）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum GridTrack {
+    /// 固定长度（CSS px）。
+    Length(f32),
+    /// 百分比（相对网格容器尺寸）。
+    Percent(f32),
+    /// 弹性系数 `fr`（参与剩余空间分配）。
+    Fr(f32),
+    /// `auto`：内容驱动尺寸。
+    Auto,
+    /// `minmax(a, b)`。
+    MinMax(Box<GridTrack>, Box<GridTrack>),
+}
+
+/// `grid-template-columns` / `grid-template-rows` 的轨道列表。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GridTrackList {
+    /// 轨道序列；空表示未显式指定（用隐式轨道）。
+    pub tracks: Vec<GridTrack>,
+}
+
 /// `margin-*` 值
 /// （[CSS 2.1 §8.3](https://www.w3.org/TR/CSS21/box.html#margin-properties)）。
 ///
@@ -699,6 +940,23 @@ fn parse_property_value(property: PropertyId, input: &mut Parser<'_>) -> Result<
         PropertyId::Overflow => parse_overflow(input).map(PropertyValue::Overflow),
         PropertyId::FlexGrow => parse_flex_grow(input).map(PropertyValue::FlexGrow),
         PropertyId::FlexBasis => parse_size(input).map(PropertyValue::FlexBasis),
+        PropertyId::Position => parse_position(input).map(PropertyValue::Position),
+        PropertyId::Top | PropertyId::Right | PropertyId::Bottom | PropertyId::Left => {
+            parse_inset(input).map(PropertyValue::Inset)
+        }
+        PropertyId::FlexDirection => parse_flex_direction(input).map(PropertyValue::FlexDirection),
+        PropertyId::FlexWrap => parse_flex_wrap(input).map(PropertyValue::FlexWrap),
+        PropertyId::FlexShrink => parse_flex_shrink(input).map(PropertyValue::FlexShrink),
+        PropertyId::AlignItems => parse_align_items(input).map(PropertyValue::AlignItems),
+        PropertyId::JustifyContent => {
+            parse_justify_content(input).map(PropertyValue::JustifyContent)
+        }
+        PropertyId::AlignSelf => parse_align_self(input).map(PropertyValue::AlignSelf),
+        PropertyId::GridTemplateColumns | PropertyId::GridTemplateRows => {
+            parse_grid_track_list(input).map(PropertyValue::GridTrack)
+        }
+        PropertyId::RowGap | PropertyId::ColumnGap => parse_gap(input).map(PropertyValue::Gap),
+        PropertyId::GridAutoFlow => parse_grid_auto_flow(input).map(PropertyValue::GridAutoFlow),
         PropertyId::MarginTop
         | PropertyId::MarginRight
         | PropertyId::MarginBottom
@@ -790,6 +1048,243 @@ fn parse_overflow(input: &mut Parser<'_>) -> Result<OverflowValue, ()> {
 fn parse_flex_grow(input: &mut Parser<'_>) -> Result<f32, ()> {
     match input.next().map_err(|_| ())? {
         Token::Number { value, .. } if *value >= 0.0 => Ok(*value),
+        _ => Err(()),
+    }
+}
+
+/// `position`：static | relative | absolute | fixed（ASCII case-insensitive）。
+///
+/// `fixed` 在本布局层按 `absolute` 处理（相对视口定位的包含块由 layout 提供）。
+fn parse_position(input: &mut Parser<'_>) -> Result<PositionValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("static") {
+        Ok(PositionValue::Static)
+    } else if name.eq_ignore_ascii_case("relative") {
+        Ok(PositionValue::Relative)
+    } else if name.eq_ignore_ascii_case("absolute") {
+        Ok(PositionValue::Absolute)
+    } else if name.eq_ignore_ascii_case("fixed") {
+        Ok(PositionValue::Fixed)
+    } else {
+        Err(())
+    }
+}
+
+/// `top` / `right` / `bottom` / `left`：<length> | <percentage> | auto。
+fn parse_inset(input: &mut Parser<'_>) -> Result<InsetValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("auto") => Ok(InsetValue::Auto),
+        Token::Number { value: 0.0, .. } => Ok(InsetValue::Length(0.0)),
+        Token::Percentage { unit_value, .. } => Ok(InsetValue::Percent(*unit_value)),
+        Token::Dimension { value, unit, .. } => {
+            length_to_px(*value, unit).map(InsetValue::Length).ok_or(())
+        }
+        _ => Err(()),
+    }
+}
+
+/// `flex-direction`：row | row-reverse | column | column-reverse。
+fn parse_flex_direction(input: &mut Parser<'_>) -> Result<FlexDirectionValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("row") {
+        Ok(FlexDirectionValue::Row)
+    } else if name.eq_ignore_ascii_case("row-reverse") {
+        Ok(FlexDirectionValue::RowReverse)
+    } else if name.eq_ignore_ascii_case("column") {
+        Ok(FlexDirectionValue::Column)
+    } else if name.eq_ignore_ascii_case("column-reverse") {
+        Ok(FlexDirectionValue::ColumnReverse)
+    } else {
+        Err(())
+    }
+}
+
+/// `flex-wrap`：nowrap | wrap | wrap-reverse。
+fn parse_flex_wrap(input: &mut Parser<'_>) -> Result<FlexWrapValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("nowrap") {
+        Ok(FlexWrapValue::NoWrap)
+    } else if name.eq_ignore_ascii_case("wrap") {
+        Ok(FlexWrapValue::Wrap)
+    } else if name.eq_ignore_ascii_case("wrap-reverse") {
+        Ok(FlexWrapValue::WrapReverse)
+    } else {
+        Err(())
+    }
+}
+
+/// `flex-shrink`：<number [0,∞]>（CSS Flexbox §7.2；负数非法）。
+fn parse_flex_shrink(input: &mut Parser<'_>) -> Result<f32, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Number { value, .. } if *value >= 0.0 => Ok(*value),
+        _ => Err(()),
+    }
+}
+
+/// `align-items`：stretch | flex-start | flex-end | center | baseline
+/// （兼容 `start` / `end` 取 flex-* 语义；CSS Box Alignment §7）。
+fn parse_align_items(input: &mut Parser<'_>) -> Result<AlignItemsValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("stretch") {
+        Ok(AlignItemsValue::Stretch)
+    } else if name.eq_ignore_ascii_case("flex-start") || name.eq_ignore_ascii_case("start") {
+        Ok(AlignItemsValue::FlexStart)
+    } else if name.eq_ignore_ascii_case("flex-end") || name.eq_ignore_ascii_case("end") {
+        Ok(AlignItemsValue::FlexEnd)
+    } else if name.eq_ignore_ascii_case("center") {
+        Ok(AlignItemsValue::Center)
+    } else if name.eq_ignore_ascii_case("baseline") {
+        Ok(AlignItemsValue::Baseline)
+    } else {
+        Err(())
+    }
+}
+
+/// `justify-content`：flex-start | flex-end | center | space-between |
+/// space-around | space-evenly（兼容 `start` / `end`）。
+fn parse_justify_content(input: &mut Parser<'_>) -> Result<JustifyContentValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("flex-start") || name.eq_ignore_ascii_case("start") {
+        Ok(JustifyContentValue::FlexStart)
+    } else if name.eq_ignore_ascii_case("flex-end") || name.eq_ignore_ascii_case("end") {
+        Ok(JustifyContentValue::FlexEnd)
+    } else if name.eq_ignore_ascii_case("center") {
+        Ok(JustifyContentValue::Center)
+    } else if name.eq_ignore_ascii_case("space-between") {
+        Ok(JustifyContentValue::SpaceBetween)
+    } else if name.eq_ignore_ascii_case("space-around") {
+        Ok(JustifyContentValue::SpaceAround)
+    } else if name.eq_ignore_ascii_case("space-evenly") {
+        Ok(JustifyContentValue::SpaceEvenly)
+    } else {
+        Err(())
+    }
+}
+
+/// `align-self`：auto | stretch | flex-start | flex-end | center | baseline。
+fn parse_align_self(input: &mut Parser<'_>) -> Result<AlignSelfValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("auto") {
+        Ok(AlignSelfValue::Auto)
+    } else if name.eq_ignore_ascii_case("stretch") {
+        Ok(AlignSelfValue::Stretch)
+    } else if name.eq_ignore_ascii_case("flex-start") || name.eq_ignore_ascii_case("start") {
+        Ok(AlignSelfValue::FlexStart)
+    } else if name.eq_ignore_ascii_case("flex-end") || name.eq_ignore_ascii_case("end") {
+        Ok(AlignSelfValue::FlexEnd)
+    } else if name.eq_ignore_ascii_case("center") {
+        Ok(AlignSelfValue::Center)
+    } else if name.eq_ignore_ascii_case("baseline") {
+        Ok(AlignSelfValue::Baseline)
+    } else {
+        Err(())
+    }
+}
+
+/// `row-gap` / `column-gap`：<length> | <percentage> | normal
+/// （CSS Box Alignment §6；`auto` 不是合法 gap 值，按无效声明丢弃）。
+fn parse_gap(input: &mut Parser<'_>) -> Result<GapValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("normal") => Ok(GapValue::Normal),
+        Token::Number { value: 0.0, .. } => Ok(GapValue::Length(0.0)),
+        Token::Percentage { unit_value, .. } => Ok(GapValue::Percent(*unit_value)),
+        Token::Dimension { value, unit, .. } => {
+            length_to_px(*value, unit).map(GapValue::Length).ok_or(())
+        }
+        _ => Err(()),
+    }
+}
+
+/// `grid-auto-flow`：row | column | row dense | column dense。
+fn parse_grid_auto_flow(input: &mut Parser<'_>) -> Result<GridAutoFlowValue, ()> {
+    let first = match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("row") => GridAutoFlowValue::Row,
+        Token::Ident(name) if name.eq_ignore_ascii_case("column") => GridAutoFlowValue::Column,
+        _ => return Err(()),
+    };
+    // 可选 `dense` 后缀
+    if input
+        .try_parse(|i| i.expect_ident_matching("dense").map(|_| ()))
+        .is_ok()
+    {
+        if input.expect_exhausted().is_err() {
+            return Err(());
+        }
+        return Ok(match first {
+            GridAutoFlowValue::Row => GridAutoFlowValue::RowDense,
+            GridAutoFlowValue::Column => GridAutoFlowValue::ColumnDense,
+            _ => unreachable!(),
+        });
+    }
+    if input.expect_exhausted().is_err() {
+        return Err(());
+    }
+    Ok(first)
+}
+
+/// `grid-template-columns` / `grid-template-rows` 的轨道列表解析
+/// （CSS Grid §7.2/§7.3；空白分隔轨道，支持 `minmax()`）。
+fn parse_grid_track_list(input: &mut Parser<'_>) -> Result<GridTrackList, ()> {
+    let mut tracks = Vec::new();
+    let mut first = true;
+    while !input.is_exhausted() {
+        if !first && input.try_parse(|i| i.expect_whitespace()).is_err() {
+            return Err(());
+        }
+        first = false;
+        tracks.push(parse_grid_track(input)?);
+    }
+    Ok(GridTrackList { tracks })
+}
+
+/// 单条 grid 轨道尺寸函数。
+fn parse_grid_track(input: &mut Parser<'_>) -> Result<GridTrack, ()> {
+    if input
+        .try_parse(|i| i.expect_function_matching("minmax").map(|_| ()))
+        .is_ok()
+    {
+        return input
+            .parse_nested_block(|i| {
+                let a =
+                    parse_grid_track_size(i).map_err(|_| ParseError::<()>::unexpected_token())?;
+                i.expect_comma()
+                    .map_err(|_| ParseError::<()>::unexpected_token())?;
+                let b =
+                    parse_grid_track_size(i).map_err(|_| ParseError::<()>::unexpected_token())?;
+                i.expect_exhausted()
+                    .map_err(|_| ParseError::<()>::unexpected_token())?;
+                Ok(GridTrack::MinMax(Box::new(a), Box::new(b)))
+            })
+            .map_err(|_| ());
+    }
+    parse_grid_track_size(input)
+}
+
+/// 单段轨道尺寸（`minmax` 内的一段）：<length> | <percentage> | <flex> | auto。
+fn parse_grid_track_size(input: &mut Parser<'_>) -> Result<GridTrack, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("auto") => Ok(GridTrack::Auto),
+        Token::Number { value: 0.0, .. } => Ok(GridTrack::Length(0.0)),
+        Token::Percentage { unit_value, .. } => Ok(GridTrack::Percent(*unit_value)),
+        Token::Dimension { value, unit, .. } => {
+            if unit.eq_ignore_ascii_case("fr") {
+                Ok(GridTrack::Fr(*value))
+            } else {
+                length_to_px(*value, unit).map(GridTrack::Length).ok_or(())
+            }
+        }
         _ => Err(()),
     }
 }
@@ -899,6 +1394,16 @@ pub(crate) fn parse_border_style_value(input: &mut Parser<'_>) -> Result<BorderS
 
 pub(crate) fn parse_border_color_value(input: &mut Parser<'_>) -> Result<BorderColorValue, ()> {
     parse_border_color(input)
+}
+
+/// `inset` 简写复用单值解析入口。
+pub(crate) fn parse_inset_value(input: &mut Parser<'_>) -> Result<InsetValue, ()> {
+    parse_inset(input)
+}
+
+/// `gap` 简写复用单值解析入口。
+pub(crate) fn parse_gap_value(input: &mut Parser<'_>) -> Result<GapValue, ()> {
+    parse_gap(input)
 }
 
 fn parse_display(input: &mut Parser<'_>) -> Result<DisplayValue, ()> {
@@ -1638,6 +2143,152 @@ mod tests {
         assert!(
             parse_typed(property, text).is_err(),
             "{text} should not parse"
+        );
+    }
+
+    #[test]
+    fn position_inset_flex_grid_properties_parse() {
+        use PropertyValue::{
+            AlignItems, AlignSelf, FlexDirection, FlexShrink, FlexWrap, Gap, GridAutoFlow,
+            GridTrack as GridTrackValue, Inset, JustifyContent, Position,
+        };
+        // position
+        assert_eq!(
+            parse_one(PropertyId::Position, "absolute"),
+            Position(PositionValue::Absolute)
+        );
+        assert_eq!(
+            parse_one(PropertyId::Position, "FIXED"),
+            Position(PositionValue::Fixed)
+        );
+        parse_err(PropertyId::Position, "sticky");
+
+        // inset（四边 longhand 共用 InsetValue）
+        assert_eq!(
+            parse_one(PropertyId::Top, "10px"),
+            Inset(InsetValue::Length(10.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::Left, "50%"),
+            Inset(InsetValue::Percent(0.5))
+        );
+        assert_eq!(
+            parse_one(PropertyId::Bottom, "auto"),
+            Inset(InsetValue::Auto)
+        );
+
+        // flex-direction / flex-wrap / flex-shrink
+        assert_eq!(
+            parse_one(PropertyId::FlexDirection, "column"),
+            FlexDirection(FlexDirectionValue::Column)
+        );
+        assert_eq!(
+            parse_one(PropertyId::FlexWrap, "wrap-reverse"),
+            FlexWrap(FlexWrapValue::WrapReverse)
+        );
+        assert_eq!(parse_one(PropertyId::FlexShrink, "2"), FlexShrink(2.0));
+        parse_err(PropertyId::FlexShrink, "-1");
+
+        // align-items / justify-content / align-self（兼容 start/end）
+        assert_eq!(
+            parse_one(PropertyId::AlignItems, "center"),
+            AlignItems(AlignItemsValue::Center)
+        );
+        assert_eq!(
+            parse_one(PropertyId::AlignItems, "start"),
+            AlignItems(AlignItemsValue::FlexStart)
+        );
+        assert_eq!(
+            parse_one(PropertyId::JustifyContent, "space-between"),
+            JustifyContent(JustifyContentValue::SpaceBetween)
+        );
+        assert_eq!(
+            parse_one(PropertyId::AlignSelf, "auto"),
+            AlignSelf(AlignSelfValue::Auto)
+        );
+
+        // gap（auto 非法）
+        assert_eq!(
+            parse_one(PropertyId::RowGap, "8px"),
+            Gap(GapValue::Length(8.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::ColumnGap, "normal"),
+            Gap(GapValue::Normal)
+        );
+        parse_err(PropertyId::RowGap, "auto");
+
+        // grid-auto-flow（可选 dense 后缀）
+        assert_eq!(
+            parse_one(PropertyId::GridAutoFlow, "row dense"),
+            GridAutoFlow(GridAutoFlowValue::RowDense)
+        );
+        assert_eq!(
+            parse_one(PropertyId::GridAutoFlow, "column"),
+            GridAutoFlow(GridAutoFlowValue::Column)
+        );
+
+        // grid 轨道列表（含 minmax 与 fr）
+        assert_eq!(
+            parse_one(PropertyId::GridTemplateColumns, "100px 1fr auto"),
+            GridTrackValue(GridTrackList {
+                tracks: vec![
+                    GridTrack::Length(100.0),
+                    GridTrack::Fr(1.0),
+                    GridTrack::Auto,
+                ]
+            })
+        );
+        assert_eq!(
+            parse_one(PropertyId::GridTemplateRows, "minmax(50px, 1fr)"),
+            GridTrackValue(GridTrackList {
+                tracks: vec![GridTrack::MinMax(
+                    Box::new(GridTrack::Length(50.0)),
+                    Box::new(GridTrack::Fr(1.0)),
+                )]
+            })
+        );
+        // 无空白分隔 / 未知轨道关键字 → 整条声明无效
+        parse_err(PropertyId::GridTemplateColumns, "100px2px");
+        parse_err(PropertyId::GridTemplateColumns, "auto bogus");
+        // gridshorthand：gap 两值、inset 四值
+    }
+
+    #[test]
+    fn gap_and_inset_shorthands_expand() {
+        let sheet =
+            crate::parser::Stylesheet::parse("div { gap: 10px 20px; inset: 1px 2px 3px 4px; }");
+        let declarations = &sheet.rules()[0].declarations();
+        assert_eq!(declarations.len(), 6);
+        let get = |property: PropertyId| {
+            declarations
+                .iter()
+                .find(|d| d.property == property)
+                .map(|d| &d.value)
+        };
+        assert_eq!(
+            get(PropertyId::RowGap),
+            Some(&DeclaredValue::Typed(PropertyValue::Gap(GapValue::Length(
+                10.0
+            ))))
+        );
+        assert_eq!(
+            get(PropertyId::ColumnGap),
+            Some(&DeclaredValue::Typed(PropertyValue::Gap(GapValue::Length(
+                20.0
+            ))))
+        );
+        assert_eq!(
+            get(PropertyId::Top),
+            Some(&DeclaredValue::Typed(PropertyValue::Inset(
+                InsetValue::Length(1.0)
+            )))
+        );
+        assert_eq!(
+            get(PropertyId::Left),
+            Some(&DeclaredValue::Typed(PropertyValue::Inset(
+                InsetValue::Length(4.0)
+            )))
         );
     }
 

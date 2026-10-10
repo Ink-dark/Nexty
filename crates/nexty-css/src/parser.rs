@@ -18,7 +18,8 @@ use crate::selector::{NextySelector, parse_selector_list};
 use crate::value::{
     BorderColorValue, BorderStyle, BorderWidthValue, DeclaredValue, PropertyId, PropertyValue,
     parse_border_color_value, parse_border_style_value, parse_border_width_value,
-    parse_css_wide_keyword, parse_declared_value, parse_margin_value, parse_padding_value,
+    parse_css_wide_keyword, parse_declared_value, parse_gap_value, parse_inset_value,
+    parse_margin_value, parse_padding_value,
 };
 use cssparser::{
     AtRuleParser, DeclarationParser, ParseError, Parser, QualifiedRuleParser, RuleBodyItemParser,
@@ -467,6 +468,25 @@ type ShorthandExpansion = (Vec<(PropertyId, DeclaredValue)>, bool);
 /// 返回 `None` 表示 `name` 不是本层支持的简写；`Some(Err)` 表示简写值无效
 /// （整条声明丢弃）。CSS-wide 关键字作用于全部 longhand。
 fn expand_shorthand(name: &str, input: &mut Parser<'_>) -> Option<Result<ShorthandExpansion, ()>> {
+    // gap 简写：row-gap || column-gap（两值：行优先，缺省列取行）。
+    if name.eq_ignore_ascii_case("gap") {
+        if let Ok(keyword) = input.try_parse(parse_css_wide_keyword) {
+            let important = input.try_parse(cssparser::parse_important).is_ok();
+            if input.expect_exhausted().is_err() {
+                return Some(Err(()));
+            }
+            let longhands = [PropertyId::RowGap, PropertyId::ColumnGap];
+            return Some(Ok((
+                longhands
+                    .into_iter()
+                    .map(|property| (property, DeclaredValue::CssWide(keyword)))
+                    .collect(),
+                important,
+            )));
+        }
+        return Some(parse_gap_shorthand(input));
+    }
+
     // 先确认是简写名，再试 CSS-wide 关键字（否则关键字会被误吞且不复位）
     let is_border = name.eq_ignore_ascii_case("border");
     let edges = box_shorthand_edges(name);
@@ -488,6 +508,7 @@ fn expand_shorthand(name: &str, input: &mut Parser<'_>) -> Option<Result<Shortha
                 Some(BoxEdges::BorderWidth) => border_width_longhands(),
                 Some(BoxEdges::BorderStyle) => border_style_longhands(),
                 Some(BoxEdges::BorderColor) => border_color_longhands(),
+                Some(BoxEdges::Inset) => inset_longhands(),
                 None => border_longhands(),
             }
         };
@@ -514,6 +535,8 @@ fn expand_shorthand(name: &str, input: &mut Parser<'_>) -> Option<Result<Shortha
             .map(|values| zip_edges(values, border_style_longhands(), PropertyValue::BorderStyle)),
         BoxEdges::BorderColor => expand_box_values(input, parse_border_color_value)
             .map(|values| zip_edges(values, border_color_longhands(), PropertyValue::BorderColor)),
+        BoxEdges::Inset => expand_box_values(input, parse_inset_value)
+            .map(|values| zip_edges(values, inset_longhands(), PropertyValue::Inset)),
     }
     .ok()?;
     let important = input.try_parse(cssparser::parse_important).is_ok();
@@ -545,6 +568,7 @@ enum BoxEdges {
     BorderWidth,
     BorderStyle,
     BorderColor,
+    Inset,
 }
 
 fn box_shorthand_edges(name: &str) -> Option<BoxEdges> {
@@ -558,6 +582,8 @@ fn box_shorthand_edges(name: &str) -> Option<BoxEdges> {
         Some(BoxEdges::BorderStyle)
     } else if name.eq_ignore_ascii_case("border-color") {
         Some(BoxEdges::BorderColor)
+    } else if name.eq_ignore_ascii_case("inset") {
+        Some(BoxEdges::Inset)
     } else {
         None
     }
@@ -690,6 +716,44 @@ fn border_color_longhands() -> Vec<PropertyId> {
         PropertyId::BorderBottomColor,
         PropertyId::BorderLeftColor,
     ]
+}
+
+/// `inset` 简写的四边 longhand（top / right / bottom / left）。
+fn inset_longhands() -> Vec<PropertyId> {
+    vec![
+        PropertyId::Top,
+        PropertyId::Right,
+        PropertyId::Bottom,
+        PropertyId::Left,
+    ]
+}
+
+/// `gap` 简写：`<row-gap> <column-gap>?`（CSS Box Alignment §6）。
+///
+/// 单值同时作用于行与列；双值行领先、列取第二项。`normal` 不是合法 gap 值，
+/// 由 `parse_gap` 按无效声明丢弃。
+fn parse_gap_shorthand(
+    input: &mut Parser<'_>,
+) -> Result<(Vec<(PropertyId, DeclaredValue)>, bool), ()> {
+    let row = parse_gap_value(input)?;
+    let column = input.try_parse(parse_gap_value).unwrap_or(row);
+    let important = input.try_parse(cssparser::parse_important).is_ok();
+    if input.expect_exhausted().is_err() {
+        return Err(());
+    }
+    Ok((
+        vec![
+            (
+                PropertyId::RowGap,
+                DeclaredValue::Typed(PropertyValue::Gap(row)),
+            ),
+            (
+                PropertyId::ColumnGap,
+                DeclaredValue::Typed(PropertyValue::Gap(column)),
+            ),
+        ],
+        important,
+    ))
 }
 
 fn border_longhands() -> Vec<PropertyId> {
