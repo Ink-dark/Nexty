@@ -223,10 +223,11 @@ fn emit(
                         id: glyph.id,
                         x: content_x + glyph.x,
                         y: glyph.y,
+                        font: glyph.font,
                     })
                     .collect(),
                 baseline,
-                families: run.style.families.clone(),
+                fonts: run.fonts.clone(),
                 size: run.style.size,
                 color: to_color(run.color),
             });

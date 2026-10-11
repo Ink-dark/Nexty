@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use nexty_css::{ComputedStyle, DisplayValue, LineHeightValue};
 use nexty_dom::{Document, ElementData, Namespace, NodeId, NodeKind};
-use nexty_text::{FontMetrics, Glyph, ShapedText, TextShaper, TextStyle};
+use nexty_text::{FontMetrics, Glyph, ResolvedFont, ShapedText, TextShaper, TextStyle};
 
 use crate::Context;
 use crate::fragment::{Fragment, ImageRun, LineFragment, TextRun};
@@ -397,6 +397,24 @@ pub(crate) fn build_lines(
         let mut boxes: Vec<Fragment> = Vec::new();
         // 同源词合并进同一 run，但不得跨越中间的图片（绘制顺序会被打乱）
         let mut mergeable = false;
+        // 把字形（font 指向源 ShapedText 的字体表）并入 run：按实例 id
+        // 重映射到 run 自己的字体表（跨 run 合并时避免字节比较）
+        fn remap_glyph(
+            mut glyph: Glyph,
+            source_fonts: &[ResolvedFont],
+            run_fonts: &mut Vec<ResolvedFont>,
+        ) -> Glyph {
+            let source = &source_fonts[glyph.font as usize];
+            let index = run_fonts
+                .iter()
+                .position(|font| font.id() == source.id())
+                .unwrap_or_else(|| {
+                    run_fonts.push(source.clone());
+                    run_fonts.len() - 1
+                });
+            glyph.font = index as u32;
+            glyph
+        }
         for placed_item in placed.iter() {
             match &items[placed_item.item_index] {
                 InlineItem::Text(word) => {
@@ -412,16 +430,21 @@ pub(crate) fn build_lines(
                             x: glyph.x + placed_item.x,
                             y: glyph.y,
                             advance: glyph.advance,
+                            font: glyph.font,
                         })
                         .collect();
                     match runs.last_mut() {
                         Some(run) if mergeable && run.node == word.node => {
-                            run.glyphs.extend(glyphs)
+                            for glyph in glyphs {
+                                run.glyphs
+                                    .push(remap_glyph(glyph, &shaped.fonts, &mut run.fonts));
+                            }
                         }
                         _ => runs.push(TextRun {
                             node: word.node,
                             style: text_style(&word.style),
                             color: word.style.color,
+                            fonts: shaped.fonts.clone(),
                             glyphs,
                         }),
                     }
@@ -500,6 +523,7 @@ pub(crate) fn build_lines(
                             .shape(&word.text, &text_style(&word.style))
                             .unwrap_or(ShapedText {
                                 glyphs: Vec::new(),
+                                fonts: Vec::new(),
                                 width: 0.0,
                                 height: 0.0,
                             })

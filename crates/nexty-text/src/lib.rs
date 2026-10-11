@@ -8,6 +8,10 @@
 //! 行为 ground truth：CSS Text、CSS Fonts 与 Unicode 断行算法；字形定位遵循
 //! OpenType 度量（units_per_em 归一到 CSS px，scale = 1）。
 //!
+//! 字体选择：族列表匹配由 parley/fontique 完成；主族缺字形的码点按脚本
+//! 回退到系统字体（CJK 在 Windows 命中 YaHei 等）。[`ShapedText::fonts`]
+//! 记录实际用到的字体、每个 [`Glyph::font`] 指明归属，光栅层按此渲染。
+//!
 //! 本层只整形**单行**文本：white-space 折叠（含换行符处理）是 layout 层的
 //! 职责，进入本层的文本应已折叠。
 //!
@@ -53,6 +57,9 @@ pub struct Glyph {
     pub y: f32,
     /// 步进宽度，CSS px。
     pub advance: f32,
+    /// 所属字体在 [`ShapedText::fonts`] 中的下标（按脚本回退后一段文本
+    /// 可能用到多个字体）。
+    pub font: u32,
 }
 
 /// 一段文本的整形结果。
@@ -62,8 +69,10 @@ pub struct Glyph {
 #[cfg(feature = "shaping")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShapedText {
-    /// 按绘制顺序排列的字形。
+    /// 按绘制顺序排列的字形（`glyph.font` 指向 [`ShapedText::fonts`]）。
     pub glyphs: Vec<Glyph>,
+    /// 本次整形实际用到的字体（parley/fontique 按脚本回退后可能多于一个）。
+    pub fonts: Vec<ResolvedFont>,
     /// 行宽（含行尾空白），CSS px。
     pub width: f32,
     /// 行高，CSS px。
@@ -91,6 +100,9 @@ pub struct FontMetrics {
 pub struct ResolvedFont {
     data: std::sync::Arc<[u8]>,
     index: u32,
+    /// 字体实例标识（fontique blob id）。同一实例判等用它而非字节比较
+    /// （字体文件可达数 MB）。
+    id: u64,
 }
 
 #[cfg(feature = "font-resolution")]
@@ -106,6 +118,12 @@ impl ResolvedFont {
     pub fn index(&self) -> u32 {
         self.index
     }
+
+    /// 字体实例标识：同一来源字体的多次解析共享同一 id。
+    #[must_use]
+    pub fn id(&self) -> u64 {
+        self.id
+    }
 }
 
 #[cfg(feature = "font-resolution")]
@@ -114,6 +132,7 @@ impl std::fmt::Debug for ResolvedFont {
         f.debug_struct("ResolvedFont")
             .field("bytes", &self.data.len())
             .field("index", &self.index)
+            .field("id", &self.id)
             .finish()
     }
 }
@@ -221,10 +240,12 @@ impl FontResolver {
             query.set_families(items);
             let mut found = None;
             query.matches_with(|font| {
-                // Blob 是共享引用计数，字节取快照供跨线程使用
+                // Blob 是共享引用计数，字节取快照供跨线程使用；
+                // blob id 作实例标识（判等免去字节比较）
                 found = Some(ResolvedFont {
                     data: std::sync::Arc::from(font.blob.as_ref()),
                     index: font.index,
+                    id: font.blob.id(),
                 });
                 parley::fontique::QueryStatus::Stop
             });
@@ -316,6 +337,7 @@ impl TextShaper for ParleyTextShaper {
         if text.is_empty() {
             return Ok(ShapedText {
                 glyphs: Vec::new(),
+                fonts: Vec::new(),
                 width: 0.0,
                 height: 0.0,
             });
@@ -323,6 +345,9 @@ impl TextShaper for ParleyTextShaper {
 
         let layout = self.build_layout(text, style)?;
 
+        // 按脚本回退后一个 layout 可能含多个字体 run：收集去重成字体表，
+        // 每个字形带自己在表中的下标（供光栅层用正确字体渲染字形 id）
+        let mut fonts: Vec<ResolvedFont> = Vec::new();
         let mut glyphs = Vec::new();
         for line in layout.lines() {
             let baseline = line.metrics().baseline;
@@ -330,6 +355,19 @@ impl TextShaper for ParleyTextShaper {
                 let parley::PositionedLayoutItem::GlyphRun(glyph_run) = item else {
                     continue;
                 };
+                let run_font = glyph_run.run().font();
+                let resolved = ResolvedFont {
+                    data: std::sync::Arc::from(run_font.data.as_ref()),
+                    index: run_font.index,
+                    id: run_font.data.id(),
+                };
+                let font_index = fonts
+                    .iter()
+                    .position(|font| *font == resolved)
+                    .unwrap_or_else(|| {
+                        fonts.push(resolved);
+                        fonts.len() - 1
+                    }) as u32;
                 for glyph in glyph_run.positioned_glyphs() {
                     glyphs.push(Glyph {
                         id: glyph.id,
@@ -337,6 +375,7 @@ impl TextShaper for ParleyTextShaper {
                         x: glyph.x,
                         y: glyph.y - baseline,
                         advance: glyph.advance,
+                        font: font_index,
                     });
                 }
             }
@@ -348,6 +387,7 @@ impl TextShaper for ParleyTextShaper {
 
         Ok(ShapedText {
             glyphs,
+            fonts,
             // parley 的行宽按断行测量语义**不含行尾空白**，而本层契约是含
             // （调用方按 ShapedText.width 计词间空白的步进，见 inline 模块的
             // space_after_previous）——取字形右缘与行宽的较大者。
@@ -567,5 +607,44 @@ mod tests {
             .map(|_| 1)
             .unwrap_or(0);
         assert_eq!(face_count, 1, "字节可被 skrifa 解析");
+    }
+
+    #[test]
+    fn cjk_text_shapes_without_notdef_glyphs() {
+        // fontique 回退应把缺字码点交给系统 CJK 字体（Windows YaHei 等），
+        // 不得产出 .notdef（字形 id 0）豆腐块
+        let shaper = shaper();
+        let shaped = shaper
+            .shape("中文测试", &style(&["sans-serif"], 16.0))
+            .expect("CJK shaping");
+        assert!(!shaped.glyphs.is_empty());
+        assert!(!shaped.fonts.is_empty(), "字体表非空");
+        let notdef = shaped.glyphs.iter().filter(|glyph| glyph.id == 0).count();
+        assert_eq!(notdef, 0, "中文字形不得有 notdef 豆腐块");
+        assert!(
+            shaped
+                .glyphs
+                .iter()
+                .all(|glyph| (glyph.font as usize) < shaped.fonts.len()),
+            "font 下标均在字体表内"
+        );
+    }
+
+    #[test]
+    fn mixed_script_text_keeps_valid_font_indices() {
+        let shaper = shaper();
+        let shaped = shaper
+            .shape("Ab中cd", &style(&["sans-serif"], 16.0))
+            .expect("mixed-script shaping");
+        assert_eq!(shaped.glyphs.len(), 5, "每个字符一个字形");
+        let notdef = shaped.glyphs.iter().filter(|glyph| glyph.id == 0).count();
+        assert_eq!(notdef, 0, "混排文本不得有 notdef");
+        assert!(
+            shaped
+                .glyphs
+                .iter()
+                .all(|glyph| (glyph.font as usize) < shaped.fonts.len()),
+            "font 下标均在字体表内"
+        );
     }
 }

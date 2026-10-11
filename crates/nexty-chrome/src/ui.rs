@@ -487,10 +487,11 @@ impl AddressBar {
                         id: glyph.id,
                         x: rect.x + centering + glyph.x,
                         y: glyph.y,
+                        font: glyph.font,
                     })
                     .collect(),
                 baseline: rect.y + rect.height - 8.0,
-                families: families.clone(),
+                fonts: shaped.fonts.clone(),
                 size: FONT_SIZE,
                 color: Color::opaque(0x30, 0x30, 0x30),
             });
@@ -513,7 +514,7 @@ impl AddressBar {
             width: 1.5,
         });
 
-        self.draw_text(shaper, scene, &style, &families, input);
+        self.draw_text(shaper, scene, &style, input);
     }
 
     /// 输入框内的文本、选区高亮与光标。
@@ -526,7 +527,6 @@ impl AddressBar {
         shaper: &dyn TextShaper,
         scene: &mut Scene,
         style: &TextStyle,
-        families: &[String],
         input: Rect,
     ) {
         let Ok(shaped) = shaper.shape(&self.url, style) else {
@@ -581,13 +581,14 @@ impl AddressBar {
                 id: glyph.id,
                 x: origin_x + glyph.x,
                 y: glyph.y,
+                font: glyph.font,
             })
             .collect();
         if !glyphs.is_empty() {
             scene.commands.push(Command::DrawText {
                 glyphs,
                 baseline,
-                families: families.to_vec(),
+                fonts: shaped.fonts.clone(),
                 size: FONT_SIZE,
                 color: Color::opaque(0x20, 0x20, 0x20),
             });

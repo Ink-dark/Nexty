@@ -7,7 +7,7 @@
 
 use nexty_css::{ComputedStyle, Rgba};
 use nexty_dom::NodeId;
-use nexty_text::{Glyph, TextStyle};
+use nexty_text::{Glyph, ResolvedFont, TextStyle};
 
 /// 几何矩形（CSS px）。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -95,10 +95,13 @@ pub struct ImageRun {
 pub struct TextRun {
     /// 产生这些字形的元素节点（样式来源）。
     pub node: NodeId,
-    /// 该 run 的文本样式（字体族/字号，供 paint 选字体）。
+    /// 该 run 的文本样式（字体族/字号，供 paint 兜底与调试）。
     pub style: TextStyle,
     /// 文本颜色（run 元素的 computed `color`）。
     pub color: Rgba,
-    /// 字形：x 相对片段内容盒左缘，y 相对**行基线**。
+    /// 字形：x 相对片段内容盒左缘，y 相对**行基线**；`glyph.font` 指向
+    /// [`TextRun::fonts`]。
     pub glyphs: Vec<Glyph>,
+    /// 本 run 实际用到的字体（text 层按脚本回退后可能多于一个）。
+    pub fonts: Vec<ResolvedFont>,
 }

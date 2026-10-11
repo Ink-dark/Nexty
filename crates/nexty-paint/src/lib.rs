@@ -22,9 +22,9 @@
 #![forbid(unsafe_code)]
 
 #[cfg(feature = "cpu")]
-use std::collections::HashMap;
-#[cfg(feature = "cpu")]
 use std::sync::Arc;
+
+use nexty_text::ResolvedFont;
 
 /// 图片解码错误。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +122,9 @@ pub struct TextGlyph {
     pub x: f32,
     /// 相对基线的垂直偏移，px。
     pub y: f32,
+    /// 所属字体在 [`Command::DrawText::fonts`] 中的下标（text 层按脚本
+    /// 回退后一条 run 可能跨多个字体）。
+    pub font: u32,
 }
 
 /// 一条绘制指令。
@@ -145,15 +148,15 @@ pub enum Command {
     },
     /// 绘制一行字形。
     ///
-    /// 字形必须已经过 text 层整形（字形 id 对应 [`Command::DrawText::families`]
-    /// 解析出的字体）；`glyphs[i].y` 相对基线，`baseline` 是基线的绝对 y。
+    /// 字形必须已经过 text 层整形（字形 id 对应 `fonts[glyph.font]` 字体）；
+    /// `glyphs[i].y` 相对基线，`baseline` 是基线的绝对 y。
     DrawText {
         /// 字形序列（x 为绝对坐标，y 相对基线）。
         glyphs: Vec<TextGlyph>,
         /// 基线的绝对 y，px。
         baseline: f32,
-        /// 字体族列表（CSS font-family 语义），经 text 层解析为字体数据。
-        families: Vec<String>,
+        /// 本次整形实际用到的字体（按脚本回退后可能多于一个）。
+        fonts: Vec<ResolvedFont>,
         /// 字号，px。
         size: f32,
         /// 文本颜色。
@@ -287,34 +290,19 @@ pub enum RasterError {
 /// `vello_cpu` 对未支持特性是 panic 而非返回错误；按渲染隔离规则，
 /// 调用方须把本实现放进独立线程并以 `catch_unwind` 兜底。
 ///
-/// 文本渲染的字体解析经 text 层的 [`nexty_text::FontResolver`] 完成，
-/// 按族列表缓存解析结果。
+/// 文本渲染的字体数据由 text 层整形结果直接提供（[`Command::DrawText::fonts`]）：
+/// 按脚本回退后一条 run 可跨多个字体，字形归属在整形期已确定，光栅层按
+/// `glyph.font` 分组用对应字体渲染。
 #[cfg(feature = "cpu")]
 #[derive(Debug, Default)]
-pub struct VelloCpuRasterizer {
-    font_cache: std::sync::Mutex<HashMap<String, Option<std::sync::Arc<nexty_text::ResolvedFont>>>>,
-}
+pub struct VelloCpuRasterizer;
 
 #[cfg(feature = "cpu")]
 impl VelloCpuRasterizer {
     /// 创建 CPU 光栅后端。
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// 解析并缓存字体（族列表 → 字体数据）。
-    fn font_for(&self, families: &[String]) -> Option<std::sync::Arc<nexty_text::ResolvedFont>> {
-        let key = families.join(", ");
-        let mut cache = self.font_cache.lock().expect("font cache poisoned");
-        if let Some(cached) = cache.get(&key) {
-            return cached.clone();
-        }
-        let resolved = nexty_text::FontResolver::new()
-            .resolve_font(families)
-            .map(Arc::from);
-        cache.insert(key, resolved.clone());
-        resolved
+        Self
     }
 }
 
@@ -364,32 +352,46 @@ impl Rasterizer for VelloCpuRasterizer {
                 Command::DrawText {
                     glyphs,
                     baseline,
-                    families,
+                    fonts,
                     size,
                     color,
                 } => {
-                    let Some(font) = self.font_for(families) else {
-                        continue;
-                    };
                     context.set_paint(vello_cpu::peniko::Color::from_rgba8(
                         color.r, color.g, color.b, color.a,
                     ));
-                    // 字体数据按引用计数共享给 vello 的 Blob
-                    let bytes: Arc<dyn AsRef<[u8]> + Send + Sync> =
-                        Arc::new(FontBytes(font.data().clone()));
-                    let font_data = vello_cpu::peniko::FontData::new(
-                        vello_cpu::peniko::Blob::new(bytes),
-                        font.index(),
-                    );
-                    let glyphs = glyphs.iter().map(|glyph| vello_cpu::Glyph {
-                        id: glyph.id,
-                        x: glyph.x,
-                        y: baseline + glyph.y,
-                    });
-                    context
-                        .glyph_run(&mut resources, &font_data)
-                        .font_size(*size)
-                        .fill_glyphs(glyphs);
+                    // 按字体下标分组（组内字形连续，通常只有一组）：回退后
+                    // 一条 run 可跨多个字体，字形 id 只对所属字体有意义
+                    let mut groups: Vec<(u32, Vec<&TextGlyph>)> = Vec::new();
+                    for glyph in glyphs {
+                        match groups.last_mut() {
+                            Some((index, group)) if *index == glyph.font => {
+                                group.push(glyph);
+                            }
+                            _ => groups.push((glyph.font, vec![glyph])),
+                        }
+                    }
+                    for (font_index, group) in groups {
+                        // 下标越界（调用方构造错误）时跳过该组而非 panic
+                        let Some(font) = fonts.get(font_index as usize) else {
+                            continue;
+                        };
+                        // 字体数据按引用计数共享给 vello 的 Blob
+                        let bytes: Arc<dyn AsRef<[u8]> + Send + Sync> =
+                            Arc::new(FontBytes(font.data().clone()));
+                        let font_data = vello_cpu::peniko::FontData::new(
+                            vello_cpu::peniko::Blob::new(bytes),
+                            font.index(),
+                        );
+                        let glyphs = group.iter().map(|glyph| vello_cpu::Glyph {
+                            id: glyph.id,
+                            x: glyph.x,
+                            y: baseline + glyph.y,
+                        });
+                        context
+                            .glyph_run(&mut resources, &font_data)
+                            .font_size(*size)
+                            .fill_glyphs(glyphs);
+                    }
                 }
                 Command::DrawImage { rect, image } => {
                     // 下标越界（资源表被改过）时跳过该指令而不是 panic：
@@ -505,6 +507,7 @@ fn draw_image(
 #[cfg(all(test, feature = "cpu"))]
 mod tests {
     use super::*;
+    use nexty_text::ResolvedFont;
 
     fn size(width: u32, height: u32) -> Size {
         Size { width, height }
@@ -658,7 +661,7 @@ mod tests {
     }
 
     /// 用 text 层整形一个字符，返回其字形与基线度量。
-    fn shape_char(character: char) -> (Vec<TextGlyph>, f32) {
+    fn shape_char(character: char) -> (Vec<TextGlyph>, Vec<ResolvedFont>, f32) {
         use nexty_text::TextShaper;
         let shaper = nexty_text::ParleyTextShaper::new();
         let style = nexty_text::TextStyle {
@@ -675,19 +678,20 @@ mod tests {
                 id: glyph.id,
                 x: glyph.x,
                 y: glyph.y,
+                font: glyph.font,
             })
             .collect();
-        (glyphs, metrics.ascent)
+        (glyphs, shaped.fonts, metrics.ascent)
     }
 
     #[test]
     fn draw_text_produces_opaque_pixels() {
-        let (glyphs, ascent) = shape_char('A');
+        let (glyphs, fonts, ascent) = shape_char('A');
         let scene = Scene {
             commands: vec![Command::DrawText {
                 glyphs,
                 baseline: 40.0,
-                families: vec!["serif".to_owned()],
+                fonts,
                 size: 32.0,
                 color: Color::opaque(0, 0, 0),
             }],
@@ -707,7 +711,7 @@ mod tests {
 
     #[test]
     fn draw_text_honors_color_and_draw_order() {
-        let (glyphs, _) = shape_char('A');
+        let (glyphs, fonts, _) = shape_char('A');
         let scene = Scene {
             commands: vec![
                 Command::FillRect {
@@ -717,7 +721,7 @@ mod tests {
                 Command::DrawText {
                     glyphs,
                     baseline: 40.0,
-                    families: vec!["serif".to_owned()],
+                    fonts,
                     size: 32.0,
                     color: Color::opaque(255, 0, 0),
                 },
