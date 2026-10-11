@@ -1,5 +1,16 @@
 # goal.md — 本轮任务：行内呈现与文本能力补齐（text-align / font 简写 / 视口单位 / CJK 回退 / flex baseline）
 
+> **状态（2026-10-11）：已完成。** T1（`font` 简写展开 + 族名列表在 `!important`
+> 前停止的修复）、T2（视口单位 vw/vh/vmin/vmax 在 computed 阶段折算，chrome
+> `recascade` 以实际视口重级联）、T3（`text-align` center/right 行盒对齐，溢出
+> 行防负偏移，justify 降级）、T4（**诊断修正**：整形层按脚本回退本就正常，豆腐块
+> 根因是 paint 用主字体渲染回退字形——`ShapedText.fonts` + `Glyph.font` +
+> `TextRun.fonts` + `DrawText` 按字体分组渲染贯通四层修复）、T5（run 叶手动构造
+> `LayoutOutput` 上报首行 baseline，flex/grid baseline 对齐生效；`margins_can_
+> collapse_through` 保持「实测高度 0 才可穿透」语义）均见 `[css]`/`[layout]`/
+> `[text]` 系列提交。T6 门禁与文档同步见 `[docs]` 提交。下一轮 goal 待用户指派
+> （首选候选：页面文本选择与复制）。
+
 日期：2026-10-11。前置：taffy 轮完成（盒级几何 block/flex/grid/absolute 由 taffy 接管，
 `nexty-layout` 0.1.10，布局完备度约 70–75%），旧 goal 归档于
 [docs/plans/2026-10-10-round-taffy-layout.md](docs/plans/2026-10-10-round-taffy-layout.md)。
