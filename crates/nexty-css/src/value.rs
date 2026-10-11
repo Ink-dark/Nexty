@@ -13,6 +13,9 @@
 //! 已知偏差（按需再补，见本轮 goal.md 非目标）：`rem` / `ex` / `ch` 等
 //! 相对单位、`currentcolor`、`color-mix()` 等函数色、`display` 的多关键字
 //! 语法与 ruby 内部盒、`var()` 均视为无效声明（浏览器会接受其中的合法值）。
+//! 视口单位（`vw`/`vh`/`vmin`/`vmax`）只在盒级长度属性（width/height/min/max、
+//! inset、margin、padding、gap）上接受；`font-size` / `border-width` /
+//! `line-height` 上的视口单位视为无效声明。
 //! `font` 简写里无对应 longhand 的成分——`<font-variant-css2>`（`small-caps`）
 //! 与 `<font-width-css3>`（宽度关键字/百分比）——按语法接受后丢弃（无渲染
 //! 效果但声明不整体失效）；系统字体关键字（`caption` / `menu` 等）整条无效。
@@ -599,6 +602,9 @@ pub enum SizeValue {
     Length(f32),
     /// 百分比（以小数存储）。
     Percent(f32),
+    /// 视口单位（`50vw` → `Viewport(50.0, Vw)`）；cascade 在 computed 阶段
+    /// 按视口尺寸折算为 [`SizeValue::Length`]，无视口信息时原样保留。
+    Viewport(f32, ViewportUnit),
 }
 
 /// `box-sizing` 值
@@ -649,6 +655,8 @@ pub enum InsetValue {
     Percent(f32),
     /// `auto`（initial）。
     Auto,
+    /// 视口单位；cascade 在 computed 阶段折算（同 [`SizeValue::Viewport`]）。
+    Viewport(f32, ViewportUnit),
 }
 
 /// `flex-direction` 值
@@ -738,6 +746,8 @@ pub enum GapValue {
     Percent(f32),
     /// `normal`（initial）：退化为 0。
     Normal,
+    /// 视口单位；cascade 在 computed 阶段折算（同 [`SizeValue::Viewport`]）。
+    Viewport(f32, ViewportUnit),
 }
 
 /// `grid-auto-flow` 值
@@ -791,6 +801,8 @@ pub enum MarginValue {
     Percent(f32),
     /// `auto`（initial；块级布局中解析为 0 或剩余空间）。
     Auto,
+    /// 视口单位；cascade 在 computed 阶段折算（同 [`SizeValue::Viewport`]）。
+    Viewport(f32, ViewportUnit),
 }
 
 /// `padding-*` 值
@@ -803,6 +815,8 @@ pub enum PaddingValue {
     Length(f32),
     /// 百分比（以小数存储）。
     Percent(f32),
+    /// 视口单位；cascade 在 computed 阶段折算（同 [`SizeValue::Viewport`]）。
+    Viewport(f32, ViewportUnit),
 }
 
 /// `border-*-width` 值
@@ -1026,6 +1040,9 @@ fn parse_size(input: &mut Parser<'_>) -> Result<SizeValue, ()> {
             if *value < 0.0 {
                 return Err(());
             }
+            if let Some((amount, unit)) = viewport_length(*value, unit) {
+                return Ok(SizeValue::Viewport(amount, unit));
+            }
             length_to_px(*value, unit).map(SizeValue::Length).ok_or(())
         }
         _ => Err(()),
@@ -1089,6 +1106,9 @@ fn parse_inset(input: &mut Parser<'_>) -> Result<InsetValue, ()> {
         Token::Number { value: 0.0, .. } => Ok(InsetValue::Length(0.0)),
         Token::Percentage { unit_value, .. } => Ok(InsetValue::Percent(*unit_value)),
         Token::Dimension { value, unit, .. } => {
+            if let Some((amount, unit)) = viewport_length(*value, unit) {
+                return Ok(InsetValue::Viewport(amount, unit));
+            }
             length_to_px(*value, unit).map(InsetValue::Length).ok_or(())
         }
         _ => Err(()),
@@ -1211,6 +1231,9 @@ fn parse_gap(input: &mut Parser<'_>) -> Result<GapValue, ()> {
         Token::Number { value: 0.0, .. } => Ok(GapValue::Length(0.0)),
         Token::Percentage { unit_value, .. } => Ok(GapValue::Percent(*unit_value)),
         Token::Dimension { value, unit, .. } => {
+            if let Some((amount, unit)) = viewport_length(*value, unit) {
+                return Ok(GapValue::Viewport(amount, unit));
+            }
             length_to_px(*value, unit).map(GapValue::Length).ok_or(())
         }
         _ => Err(()),
@@ -1305,9 +1328,14 @@ fn parse_margin(input: &mut Parser<'_>) -> Result<MarginValue, ()> {
         Token::Ident(name) if name.eq_ignore_ascii_case("auto") => Ok(MarginValue::Auto),
         Token::Number { value: 0.0, .. } => Ok(MarginValue::Length(0.0)),
         Token::Percentage { unit_value, .. } => Ok(MarginValue::Percent(*unit_value)),
-        Token::Dimension { value, unit, .. } => length_to_px(*value, unit)
-            .map(MarginValue::Length)
-            .ok_or(()),
+        Token::Dimension { value, unit, .. } => {
+            if let Some((amount, unit)) = viewport_length(*value, unit) {
+                return Ok(MarginValue::Viewport(amount, unit));
+            }
+            length_to_px(*value, unit)
+                .map(MarginValue::Length)
+                .ok_or(())
+        }
         _ => Err(()),
     }
 }
@@ -1320,6 +1348,9 @@ fn parse_padding(input: &mut Parser<'_>) -> Result<PaddingValue, ()> {
         Token::Dimension { value, unit, .. } => {
             if *value < 0.0 {
                 return Err(());
+            }
+            if let Some((amount, unit)) = viewport_length(*value, unit) {
+                return Ok(PaddingValue::Viewport(amount, unit));
             }
             length_to_px(*value, unit)
                 .map(PaddingValue::Length)
@@ -1572,6 +1603,36 @@ fn length_to_px(value: f32, unit: &str) -> Option<f32> {
     } else {
         None
     }
+}
+
+/// 视口单位（[CSS Values 4 §6.2](https://drafts.csswg.org/css-values-4/#viewport-relative-units)）：
+/// 相对初始包含块（视口）对应边的小数百分比基数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewportUnit {
+    /// `vw`：视口宽的 1%。
+    Vw,
+    /// `vh`：视口高的 1%。
+    Vh,
+    /// `vmin`：视口短边的 1%。
+    Vmin,
+    /// `vmax`：视口长边的 1%。
+    Vmax,
+}
+
+/// 维度 token 的单位是否为视口单位；是则返回 `(数量, 单位)`。
+fn viewport_length(value: f32, unit: &str) -> Option<(f32, ViewportUnit)> {
+    let unit = if unit.eq_ignore_ascii_case("vw") {
+        ViewportUnit::Vw
+    } else if unit.eq_ignore_ascii_case("vh") {
+        ViewportUnit::Vh
+    } else if unit.eq_ignore_ascii_case("vmin") {
+        ViewportUnit::Vmin
+    } else if unit.eq_ignore_ascii_case("vmax") {
+        ViewportUnit::Vmax
+    } else {
+        return None;
+    };
+    Some((value, unit))
 }
 
 fn parse_font_size(input: &mut Parser<'_>) -> Result<FontSizeValue, ()> {

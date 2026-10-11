@@ -30,7 +30,9 @@ mod ua;
 mod value;
 
 #[cfg(feature = "cascade")]
-pub use cascade::{ComputedStyle, Edges, cascade, compute_document_styles};
+pub use cascade::{
+    ComputedStyle, Edges, cascade, cascade_in, compute_document_styles, compute_document_styles_in,
+};
 #[cfg(feature = "stylesheets")]
 pub use parser::{Declaration, MediaViewport, StyleRule, Stylesheet, parse_inline_style};
 #[cfg(feature = "selectors")]
@@ -44,5 +46,5 @@ pub use value::{
     FontFamilyValue, FontSizeValue, FontStyleValue, FontWeightValue, GapValue, GridAutoFlowValue,
     GridTrack, GridTrackList, InsetValue, JustifyContentValue, LineHeightValue, MarginValue,
     OverflowValue, PaddingValue, PositionValue, PropertyId, PropertyValue, Rgba, SizeValue,
-    TextAlignValue,
+    TextAlignValue, ViewportUnit,
 };

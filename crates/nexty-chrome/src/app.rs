@@ -194,16 +194,28 @@ impl BrowserApp {
         }
     }
 
-    /// 把已解析页面按当前视口布局。
+    /// 把已解析页面按当前视口级联并布局。
     ///
-    /// `reset_scroll` 为 false 时保留滚动量（resize 重排场景），但按新
-    /// 视口与内容高重新 clamp。
+    /// 每次都重级联：视口单位（vw/vh）在 computed 阶段折算，resize 后
+    /// 必须取新视口。`reset_scroll` 为 false 时保留滚动量（resize 重排
+    /// 场景），但按新视口与内容高重新 clamp。
     fn set_page(&mut self, page: Page, reset_scroll: bool) {
-        let viewport_width = self
+        let (viewport_width, viewport_height) = self
             .window
             .as_ref()
-            .map(|window| window.inner_size().width as f32)
-            .unwrap_or(800.0);
+            .map(|window| {
+                let size = window.inner_size();
+                (size.width as f32, size.height as f32)
+            })
+            .unwrap_or((800.0, 600.0));
+        let mut page = page;
+        pipeline::recascade(
+            &mut page,
+            nexty_css::MediaViewport {
+                width: viewport_width,
+                height: viewport_height,
+            },
+        );
         let root = pipeline::layout_page(&page, &self.shaper, viewport_width);
         self.content_height = root
             .as_ref()

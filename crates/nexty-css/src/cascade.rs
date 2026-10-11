@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use nexty_dom::{Document, NodeId, NodeKind};
 
-use crate::parser::{Declaration, Stylesheet, parse_inline_style};
+use crate::parser::{Declaration, MediaViewport, Stylesheet, parse_inline_style};
 use crate::selector::match_element_selectors;
 use crate::value::{
     AbsoluteSize, AlignItemsValue, AlignSelfValue, BorderColorValue, BorderStyle, BorderWidthValue,
@@ -22,6 +22,7 @@ use crate::value::{
     FontFamilyValue, FontSizeValue, FontStyleValue, FontWeightValue, GapValue, GridAutoFlowValue,
     GridTrackList, InsetValue, JustifyContentValue, LineHeightValue, MarginValue, OverflowValue,
     PaddingValue, PositionValue, PropertyId, PropertyValue, Rgba, SizeValue, TextAlignValue,
+    ViewportUnit,
 };
 
 /// 本层 UA 的 medium 字号基准（CSS Fonts 4 §2.5：initial 值由 UA 决定，
@@ -350,6 +351,7 @@ fn collect_origin_declarations(
 /// 低于 author 声明（UA `!important` 最高，见 [`OriginBucket`]）。
 /// `parent` 是树序父元素的 computed style（元素没有元素祖先时为 `None`）。
 /// 各属性：级联胜者 → CSS-wide 关键字 → 继承 → initial。
+/// 无视口信息：视口单位原样保留（见 [`cascade_in`]）。
 #[must_use]
 pub fn cascade(
     document: &Document,
@@ -357,6 +359,21 @@ pub fn cascade(
     stylesheets: &[&Stylesheet],
     ua_sheet: Option<&Stylesheet>,
     parent: Option<&ComputedStyle>,
+) -> ComputedStyle {
+    cascade_in(document, element, stylesheets, ua_sheet, parent, None)
+}
+
+/// [`cascade`] 的带视口版本：视口单位（vw/vh/vmin/vmax）在 computed 阶段
+/// 按给定视口折算为绝对 px（CSS Values 4 §6.2：1v* = 视口对应边的 1%）。
+/// 未提供视口时视口单位原样保留，由消费方按降级值处理。
+#[must_use]
+pub fn cascade_in(
+    document: &Document,
+    element: NodeId,
+    stylesheets: &[&Stylesheet],
+    ua_sheet: Option<&Stylesheet>,
+    parent: Option<&ComputedStyle>,
+    viewport: Option<MediaViewport>,
 ) -> ComputedStyle {
     let mut matched: Vec<(CascadeKey, Declaration)> = Vec::new();
 
@@ -411,7 +428,7 @@ pub fn cascade(
         }
     }
 
-    resolve_all(&matched, parent)
+    resolve_all(&matched, parent, viewport)
 }
 
 /// 按树序计算整份文档的 computed style（父先于子）。
@@ -423,6 +440,19 @@ pub fn compute_document_styles(
     stylesheets: &[&Stylesheet],
     ua_sheet: Option<&Stylesheet>,
 ) -> HashMap<NodeId, ComputedStyle> {
+    compute_document_styles_in(document, stylesheets, ua_sheet, None)
+}
+
+/// [`compute_document_styles`] 的带视口版本：视口单位（vw/vh/vmin/vmax）
+/// 在 computed 阶段按给定视口折算为绝对 px（CSS Values 4 §6.2）。
+/// 未提供视口时视口单位原样保留，由消费方按降级值处理。
+#[must_use]
+pub fn compute_document_styles_in(
+    document: &Document,
+    stylesheets: &[&Stylesheet],
+    ua_sheet: Option<&Stylesheet>,
+    viewport: Option<MediaViewport>,
+) -> HashMap<NodeId, ComputedStyle> {
     let mut styles = HashMap::new();
     walk(
         document,
@@ -430,6 +460,7 @@ pub fn compute_document_styles(
         None,
         stylesheets,
         ua_sheet,
+        viewport,
         &mut styles,
     );
     styles
@@ -441,12 +472,21 @@ fn walk(
     parent: Option<&ComputedStyle>,
     stylesheets: &[&Stylesheet],
     ua_sheet: Option<&Stylesheet>,
+    viewport: Option<MediaViewport>,
     out: &mut HashMap<NodeId, ComputedStyle>,
 ) {
     for child in document.children(node) {
         if matches!(document.node(child), Some(NodeKind::Element(_))) {
-            let style = cascade(document, child, stylesheets, ua_sheet, parent);
-            walk(document, child, Some(&style), stylesheets, ua_sheet, out);
+            let style = cascade_in(document, child, stylesheets, ua_sheet, parent, viewport);
+            walk(
+                document,
+                child,
+                Some(&style),
+                stylesheets,
+                ua_sheet,
+                viewport,
+                out,
+            );
             out.insert(child, style);
         }
     }
@@ -520,10 +560,42 @@ fn decide<'a>(
     }
 }
 
+/// 视口单位折算为 px：1v* = 视口对应边的 1%（CSS Values 4 §6.2）。
+fn viewport_px(amount: f32, unit: ViewportUnit, viewport: MediaViewport) -> f32 {
+    let base = match unit {
+        ViewportUnit::Vw => viewport.width,
+        ViewportUnit::Vh => viewport.height,
+        ViewportUnit::Vmin => viewport.width.min(viewport.height),
+        ViewportUnit::Vmax => viewport.width.max(viewport.height),
+    };
+    amount * base / 100.0
+}
+
+macro_rules! resolve_viewport {
+    ($fn_name:ident, $enum:ident) => {
+        fn $fn_name(value: $enum, viewport: Option<MediaViewport>) -> $enum {
+            match value {
+                $enum::Viewport(amount, unit) => match viewport {
+                    Some(vp) => $enum::Length(viewport_px(amount, unit, vp)),
+                    None => $enum::Viewport(amount, unit),
+                },
+                other => other,
+            }
+        }
+    };
+}
+
+resolve_viewport!(resolve_size, SizeValue);
+resolve_viewport!(resolve_inset, InsetValue);
+resolve_viewport!(resolve_margin, MarginValue);
+resolve_viewport!(resolve_padding, PaddingValue);
+resolve_viewport!(resolve_gap, GapValue);
+
 /// 逐属性解析出 computed style。
 fn resolve_all(
     matched: &[(CascadeKey, Declaration)],
     parent: Option<&ComputedStyle>,
+    viewport: Option<MediaViewport>,
 ) -> ComputedStyle {
     let initial = ComputedStyle::initial();
     let mut style = initial.clone();
@@ -569,22 +641,22 @@ fn resolve_all(
                 };
             }
             (PropertyId::Width, Decision::Use(PropertyValue::Size(value))) => {
-                style.width = *value;
+                style.width = resolve_size(*value, viewport);
             }
             (PropertyId::Height, Decision::Use(PropertyValue::Size(value))) => {
-                style.height = *value;
+                style.height = resolve_size(*value, viewport);
             }
             (PropertyId::MinWidth, Decision::Use(PropertyValue::Size(value))) => {
-                style.min_width = *value;
+                style.min_width = resolve_size(*value, viewport);
             }
             (PropertyId::MaxWidth, Decision::Use(PropertyValue::Size(value))) => {
-                style.max_width = *value;
+                style.max_width = resolve_size(*value, viewport);
             }
             (PropertyId::MinHeight, Decision::Use(PropertyValue::Size(value))) => {
-                style.min_height = *value;
+                style.min_height = resolve_size(*value, viewport);
             }
             (PropertyId::MaxHeight, Decision::Use(PropertyValue::Size(value))) => {
-                style.max_height = *value;
+                style.max_height = resolve_size(*value, viewport);
             }
             (PropertyId::BoxSizing, Decision::Use(PropertyValue::BoxSizing(value))) => {
                 style.box_sizing = *value;
@@ -602,16 +674,16 @@ fn resolve_all(
                 style.position = *value;
             }
             (PropertyId::Top, Decision::Use(PropertyValue::Inset(value))) => {
-                style.inset.top = *value;
+                style.inset.top = resolve_inset(*value, viewport);
             }
             (PropertyId::Right, Decision::Use(PropertyValue::Inset(value))) => {
-                style.inset.right = *value;
+                style.inset.right = resolve_inset(*value, viewport);
             }
             (PropertyId::Bottom, Decision::Use(PropertyValue::Inset(value))) => {
-                style.inset.bottom = *value;
+                style.inset.bottom = resolve_inset(*value, viewport);
             }
             (PropertyId::Left, Decision::Use(PropertyValue::Inset(value))) => {
-                style.inset.left = *value;
+                style.inset.left = resolve_inset(*value, viewport);
             }
             (PropertyId::FlexDirection, Decision::Use(PropertyValue::FlexDirection(value))) => {
                 style.flex_direction = *value;
@@ -638,37 +710,37 @@ fn resolve_all(
                 style.grid_template_rows = value.clone();
             }
             (PropertyId::RowGap, Decision::Use(PropertyValue::Gap(value))) => {
-                style.row_gap = *value;
+                style.row_gap = resolve_gap(*value, viewport);
             }
             (PropertyId::ColumnGap, Decision::Use(PropertyValue::Gap(value))) => {
-                style.column_gap = *value;
+                style.column_gap = resolve_gap(*value, viewport);
             }
             (PropertyId::GridAutoFlow, Decision::Use(PropertyValue::GridAutoFlow(value))) => {
                 style.grid_auto_flow = *value;
             }
             (PropertyId::MarginTop, Decision::Use(PropertyValue::Margin(value))) => {
-                style.margin.top = *value;
+                style.margin.top = resolve_margin(*value, viewport);
             }
             (PropertyId::MarginRight, Decision::Use(PropertyValue::Margin(value))) => {
-                style.margin.right = *value;
+                style.margin.right = resolve_margin(*value, viewport);
             }
             (PropertyId::MarginBottom, Decision::Use(PropertyValue::Margin(value))) => {
-                style.margin.bottom = *value;
+                style.margin.bottom = resolve_margin(*value, viewport);
             }
             (PropertyId::MarginLeft, Decision::Use(PropertyValue::Margin(value))) => {
-                style.margin.left = *value;
+                style.margin.left = resolve_margin(*value, viewport);
             }
             (PropertyId::PaddingTop, Decision::Use(PropertyValue::Padding(value))) => {
-                style.padding.top = *value;
+                style.padding.top = resolve_padding(*value, viewport);
             }
             (PropertyId::PaddingRight, Decision::Use(PropertyValue::Padding(value))) => {
-                style.padding.right = *value;
+                style.padding.right = resolve_padding(*value, viewport);
             }
             (PropertyId::PaddingBottom, Decision::Use(PropertyValue::Padding(value))) => {
-                style.padding.bottom = *value;
+                style.padding.bottom = resolve_padding(*value, viewport);
             }
             (PropertyId::PaddingLeft, Decision::Use(PropertyValue::Padding(value))) => {
-                style.padding.left = *value;
+                style.padding.left = resolve_padding(*value, viewport);
             }
             (PropertyId::BorderTopStyle, Decision::Use(PropertyValue::BorderStyle(value))) => {
                 style.border_style.top = *value;
@@ -894,6 +966,53 @@ mod tests {
         let refs: Vec<&Stylesheet> = parsed.iter().collect();
         let element = find_first_by_name(&document, name).expect("element");
         cascade(&document, element, &refs, None, None)
+    }
+
+    /// 视口 800×600：vw/vh/vmin/vmax 按对应边 1% 折算为绝对 px。
+    #[test]
+    fn viewport_units_resolve_against_viewport() {
+        let document = build_document("<div></div>");
+        let sheet = Stylesheet::parse(
+            "div { width: 50vw; min-height: 10vh; margin: 1vmin auto; \
+             padding: 1vmax; top: 2vw; row-gap: 3vh }",
+        );
+        let refs = vec![&sheet];
+        let div = find_first_by_name(&document, "div").expect("div");
+        let viewport = MediaViewport {
+            width: 800.0,
+            height: 600.0,
+        };
+        let style = cascade_in(&document, div, &refs, None, None, Some(viewport));
+        assert_eq!(style.width, SizeValue::Length(400.0), "50vw = 400px");
+        assert_eq!(style.min_height, SizeValue::Length(60.0), "10vh = 60px");
+        assert_eq!(
+            style.margin.top,
+            MarginValue::Length(6.0),
+            "1vmin = 6px（短边 600）"
+        );
+        assert_eq!(style.margin.left, MarginValue::Auto, "非视口成分不受影响");
+        assert_eq!(
+            style.padding.top,
+            PaddingValue::Length(8.0),
+            "1vmax = 8px（长边 800）"
+        );
+        assert_eq!(style.inset.top, InsetValue::Length(16.0), "2vw = 16px");
+        assert_eq!(style.row_gap, GapValue::Length(18.0), "3vh = 18px");
+    }
+
+    /// 无视口信息：视口单位原样保留在 computed style 里（消费方降级）。
+    #[test]
+    fn viewport_units_stay_unresolved_without_viewport() {
+        let style = style_of(
+            "<div></div>",
+            &["div { width: 50vw; margin-top: 2vh }"],
+            "div",
+        );
+        assert_eq!(style.width, SizeValue::Viewport(50.0, ViewportUnit::Vw));
+        assert_eq!(
+            style.margin.top,
+            MarginValue::Viewport(2.0, ViewportUnit::Vh)
+        );
     }
 
     #[test]

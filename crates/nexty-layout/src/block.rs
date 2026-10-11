@@ -282,7 +282,8 @@ fn used_edge(value: MarginValue, containing_width: f32) -> f32 {
     match value {
         MarginValue::Length(px) => px,
         MarginValue::Percent(fraction) => fraction * containing_width,
-        MarginValue::Auto => 0.0,
+        // auto 与未折算的视口单位均视作 0（后者由 cascade 折算，正常不出现）。
+        MarginValue::Auto | MarginValue::Viewport(..) => 0.0,
     }
 }
 

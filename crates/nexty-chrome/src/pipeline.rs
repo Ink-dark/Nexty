@@ -11,7 +11,10 @@
 
 use std::collections::HashMap;
 
-use nexty_css::{ComputedStyle, Rgba, Stylesheet, compute_document_styles, html_ua_stylesheet};
+use nexty_css::{
+    ComputedStyle, MediaViewport, Rgba, Stylesheet, compute_document_styles,
+    compute_document_styles_in, html_ua_stylesheet,
+};
 use nexty_dom::{Document, NodeId};
 use nexty_html::ParseOptions;
 use nexty_layout::Fragment;
@@ -24,6 +27,8 @@ pub struct Page {
     pub document: Document,
     /// 各元素的 computed style。
     pub styles: HashMap<NodeId, ComputedStyle>,
+    /// 作者样式表（视口变化后重级联用；UA 样式表固定不存）。
+    stylesheets: Vec<Stylesheet>,
     /// 已解码图片（`<img>` 节点 → RGBA 图像），构建 Scene 时进入图片池。
     pub images: HashMap<NodeId, Image>,
 }
@@ -32,6 +37,9 @@ pub struct Page {
 ///
 /// `stylesheets` 按级联优先级排列（CSS Cascade：源顺序靠后者胜出）——
 /// inline `<style>` 与外链样式表按文档出现顺序交错。
+///
+/// 级联在此先做一次（无视口，视口单位保持未折算）；布局前由调用方以
+/// 实际视口走 [`recascade`]（后台线程拿不到窗口尺寸）。
 #[must_use]
 pub fn build_page(
     document: Document,
@@ -43,8 +51,21 @@ pub fn build_page(
     Page {
         document,
         styles,
+        stylesheets,
         images,
     }
+}
+
+/// 按给定视口重新级联：视口单位（vw/vh/vmin/vmax）在 computed 阶段
+/// 折算为绝对 px。resize 后布局前必须调用，否则视口尺寸滞后。
+pub fn recascade(page: &mut Page, viewport: MediaViewport) {
+    let sheet_refs: Vec<&Stylesheet> = page.stylesheets.iter().collect();
+    page.styles = compute_document_styles_in(
+        &page.document,
+        &sheet_refs,
+        Some(html_ua_stylesheet()),
+        Some(viewport),
+    );
 }
 
 /// 解析并级联一份页面（单张作者样式表，无图片——内部页/空白页用）。
@@ -485,3 +506,41 @@ fn to_color(rgba: Rgba) -> Color {
 
 /// 视口尺寸别名（paint 的 `Size`）。
 pub type Viewport = Size;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nexty_css::SizeValue;
+    use nexty_dom::NodeKind;
+
+    /// recascade 按视口折算视口单位：50vw @800×600 → 400px、10vh → 60px。
+    #[test]
+    fn recascade_resolves_viewport_units() {
+        let document = nexty_html::parse_document("<div></div>", ParseOptions::default());
+        let sheet = Stylesheet::parse("div { width: 50vw; height: 10vh }");
+        let mut page = build_page(document, vec![sheet], HashMap::new());
+
+        // 构建期无视口：视口单位保持未折算
+        let div = *page
+            .styles
+            .keys()
+            .find(|&&id| {
+                matches!(
+                    page.document.node(id),
+                    Some(NodeKind::Element(data)) if data.name == "div"
+                )
+            })
+            .expect("div element");
+        assert!(matches!(page.styles[&div].width, SizeValue::Viewport(..)));
+
+        recascade(
+            &mut page,
+            MediaViewport {
+                width: 800.0,
+                height: 600.0,
+            },
+        );
+        assert_eq!(page.styles[&div].width, SizeValue::Length(400.0), "50vw");
+        assert_eq!(page.styles[&div].height, SizeValue::Length(60.0), "10vh");
+    }
+}

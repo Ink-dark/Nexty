@@ -185,11 +185,15 @@ fn map_display(d: DisplayValue) -> Display {
 }
 
 /// `width` / `height` / `flex-basis`：auto / 长度 / 百分比 → taffy `Dimension`。
+///
+/// 视口单位只在 cascade 提供视口时折算为 `Length`；未折算的残留值按
+/// `auto` 降级（chrome 管线总在布局前带视口重级联，正常不会出现）。
 fn map_dimension(v: SizeValue) -> Dimension {
     match v {
         SizeValue::Auto => sh::auto(),
         SizeValue::Length(f) => sh::length(f),
         SizeValue::Percent(p) => sh::percent(p),
+        SizeValue::Viewport(..) => sh::auto(),
     }
 }
 
@@ -199,6 +203,7 @@ fn map_lp_auto(v: SizeValue) -> LengthPercentageAuto {
         SizeValue::Auto => sh::auto(),
         SizeValue::Length(f) => sh::length(f),
         SizeValue::Percent(p) => sh::percent(p),
+        SizeValue::Viewport(..) => sh::auto(),
     }
 }
 
@@ -207,6 +212,7 @@ fn margin_side(v: MarginValue) -> LengthPercentageAuto {
         MarginValue::Length(f) => sh::length(f),
         MarginValue::Percent(p) => sh::percent(p),
         MarginValue::Auto => sh::auto(),
+        MarginValue::Viewport(..) => sh::auto(),
     }
 }
 
@@ -214,6 +220,8 @@ fn padding_side(v: PaddingValue) -> LengthPercentage {
     match v {
         PaddingValue::Length(f) => sh::length(f),
         PaddingValue::Percent(p) => sh::percent(p),
+        // 未折算的视口单位按 0 降级（padding 无 auto）。
+        PaddingValue::Viewport(..) => sh::length(0.0),
     }
 }
 
@@ -224,6 +232,7 @@ fn inset_side(v: InsetValue) -> LengthPercentageAuto {
         InsetValue::Length(f) => sh::length(f),
         InsetValue::Percent(p) => sh::percent(p),
         InsetValue::Auto => sh::auto(),
+        InsetValue::Viewport(..) => sh::auto(),
     }
 }
 
@@ -236,8 +245,8 @@ fn gap_side(v: GapValue) -> LengthPercentage {
     match v {
         GapValue::Length(f) => sh::length(f),
         GapValue::Percent(p) => sh::percent(p),
-        // `normal` 在 flex/grid 中等价于 0。
-        GapValue::Normal => sh::length(0.0),
+        // `normal` 在 flex/grid 中等价于 0；未折算的视口单位同。
+        GapValue::Normal | GapValue::Viewport(..) => sh::length(0.0),
     }
 }
 
