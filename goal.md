@@ -1,140 +1,113 @@
-# goal.md — 本轮任务：nexty-layout 引入 taffy 接管盒级几何（block/flex/grid/absolute）
+# goal.md — 本轮任务：行内呈现与文本能力补齐（text-align / font 简写 / 视口单位 / CJK 回退 / flex baseline）
 
-> **状态（2026-10-11）：已完成。** T0–T3 见 git 历史（`[layout]` 系列提交）；T4/T5 的
-> run 叶 measure 节点与 Layout 回填随 T3 提交落地；T6 专项测试（grid 双列 / 多行 flex
-> wrap / 绝对定位 inset / contents 提升 / 匿名块混排）与 grid/absolute feature 转正见
-> `[layout]` 提交；门禁与文档同步见 `[docs]` 提交。下一轮 goal 待用户指派。
-
-日期：2026-10-10。前置：上轮 chrome 交互补全（[docs/plans/2026-10-08-round-chrome-interaction.md](docs/plans/2026-10-08-round-chrome-interaction.md)）
-完成，`nexty-chrome` 0.1.14；八层骨架端到端连通，`nexty-layout` 0.1.4 自研块级流 + 单行 flex + 自研 inline 断行已落地。
-旧 chrome 交互 goal 归档于 `docs/plans/2026-10-08-round-chrome-interaction.md`。
+日期：2026-10-11。前置：taffy 轮完成（盒级几何 block/flex/grid/absolute 由 taffy 接管，
+`nexty-layout` 0.1.10，布局完备度约 70–75%），旧 goal 归档于
+[docs/plans/2026-10-10-round-taffy-layout.md](docs/plans/2026-10-10-round-taffy-layout.md)。
 
 ## 本轮为什么做这些
 
-上一轮对「日常可用浏览器」的差距评估中，**盒级布局完备度仅约 35%**，最大缺口是
-grid、多行 flex、绝对定位与复杂块级流——这些恰恰是现代真实页面渲染质量的核心，自研补齐
-成本极高。
+taffy 轮之后盒级几何已不是短板。对真实页面渲染质量的剩余差距里，**行内与文本侧**集中了
+密度最高的一批缺口（均已实测核实）：
 
-当初 ADR（[docs/decisions/2026-10-01-crate-selection.md](docs/decisions/2026-10-01-crate-selection.md)）把布局定为自研的理由是
-"**`taffy` 虽成熟但布局是 WPT 对齐的关键层，需完全可控**"。但该理由已过时：taffy 0.14
-现已实现 **CSS Block / Flexbox / CSS Grid** 三套算法，被 Servo、Blitz 等成熟浏览器引擎
-采用，且为 MIT 许可（已在 `deny.toml` 白名单）。这与 Nexty「不造轮子」的总方针一致——
-布局层本就是 ADR 列出的"自研例外"之一，现在有条件收回这个例外。
+- **`text-align` 未消费**：css 层已解析（value.rs `TextAlignValue`），但 inline 行盒与
+  taffy 映射都不消费——行内居中/右对齐在真实页面无处不在，是当前最刺眼的呈现偏差。
+- **`font` 简写未解析**：`font: 12px/1.5 serif` 这类一行简写在真实 CSS 里占比极高，
+  现在整条声明被丢弃后退 UA 默认。
+- **视口单位未实现**：`vw`/`vh` 完全没有（value 层无该词法），`50vw` 直接解析失败。
+- **CJK 缺字**：默认字体栈无 CJK 字形时整段豆腐块（text 层无按脚本的字体回退）。
+- **flex baseline 退化**：taffy run 叶 measure 返回 `Baselines::NONE`，
+  `align-items: baseline` 退化为顶对齐（block.rs 差异清单第 6 条）。
 
-**引入 taffy ≠ 全替换**，边界由能力决定：
-- taffy **做**：块级盒几何（普通流块级子盒排列、宽度解析、margin）、flex 容器（含多行
-  wrap / flex-shrink / 完整对齐值）、grid 容器、绝对/固定定位盒。
-- taffy **不做**：inline / 文本布局、table。故 `inline.rs`（行内断行）必须保留；table
-  维持现状（taffy roadmap 尚未覆盖，本轮不引入 taffy table）。
+为什么这轮优先于其他候选（见文末「方向评估」）：单点成本小、几乎全部可无头单测、
+且是「页面文本选择与复制」（AGENTS.md 已列另轮立项）的前置卫生——text-align 改变行盒
+几何、TextRun 携带原文也在这几层，先做避免选择轮返工。
 
-本轮目标：以**不破坏现有渲染**为前提，把块级流与 flex 的几何解算迁移到 taffy，并**顺带
-借 taffy 补齐 grid / 多行 flex / 绝对定位**；paint 层零改动——`layout_document` 的
-输入输出契约（`Document + ComputedStyle + image_sizes + viewport_width` → `Fragment` 树，
-定义见 `crates/nexty-layout/src/fragment.rs`）冻结。
-
-预期收益：盒级布局完备度从约 35% 提升至约 70–75%（grid / 多行 flex / 绝对定位补齐；
-剩余为 table + 完整 UAX#14 断行 + 部分 edge case）。
+预期收益：真实页面（含 CJK 内容）的行内呈现质量显著提升；盒级完备度数字不变，
+新增行内/文本侧能力清单。
 
 ## 任务清单与退出条件
 
-### T0 决策更新与门禁准备
-- 在 `docs/decisions/2026-10-01-crate-selection.md` 追加「修正记录」：将"盒级布局"选型由
-  "自研"改为"**taffy 接管盒级几何 + 自研 inline/table**"，记录理由（taffy 0.14 已支持
-  Block/Flex/Grid、MIT、被 Servo/Blitz 采用；inline 与 text 仍自研因 taffy 不做文本布局；
-  table 维持现状待 taffy roadmap）、能力边界、与"不造轮子"方针的关系、风险。
-- `taffy` 加入 `crates/nexty-layout/Cargo.toml`（MIT，MSRV 1.71 < 本仓 1.90，兼容）；
-  跑 `cargo deny check` 确认其传递依赖许可证全过（白名单已含 MIT/Apache/BSD/ISC/MPL/Zlib/
-  CC0/Unicode/CDLA/LGPL）；`cargo about` 重生成 `docs/dependencies.html`。
-- 隔离策略落实：taffy 的 `Style` / `TaffyTree` / `Layout` 等类型**只出现在 nexty-layout
-  内部**，**绝不进入 pub 导出**（AGENTS.md「依赖类型不得外泄」硬规则）。
-- 退出条件：deny check 零新增失败（或仅已有放行项）；dependencies.html 更新；ADR 修正
-  记录就位。
+### T1 nexty-css：`font` 简写解析与展开
+- 按 CSS Fonts §3.3 简写语法展开：`<font-style> || <font-variant-css2> || <font-weight>
+  || <font-width>? <font-size> [ / <line-height> ]? <font-family>#`（normal 关键字占位
+  吞掉；已有 font-style/weight/size/line-height/family 逐属性解析，只补简写展开与
+  `/` 行高形式）。
+- 系统关键字（`caption`/`icon`/`menu` 等）按偏差记录降级为整条声明无效（不走 initial
+  重置，简写语义 §3.3 要求重置全部子属性——解析失败整条丢弃，与现有错误恢复一致）。
+- `font: menu` 等与 UA 设置相关的系统字体明确不支持，记入偏差清单。
+- 退出条件：单测——`font: italic bold 12px/1.5 "Helvetica Neue", serif` 各子属性展开
+  正确；`font: 12px serif`（无行高）、`font: normal normal 400 1em sans-serif`（normal
+  占位）通过；非法值（缺 size/family、只有关键字）整条丢弃。
 
-### T1 样式映射层（`style_map.rs`，新模块）
-- 实现 `ComputedStyle -> taffy::Style` 单向映射，覆盖已支持属性：
-  - `display` 计算值（block/inline/flex/grid/none/contents → taffy `Display` + 必要的
-    blockify；inline 由 `inline.rs` 处理，不在 taffy 建节点）；
-  - `position`（static/relative/absolute/fixed）；
-  - `box-sizing`；四边 `margin` / `padding` / `border`（edges，border 宽度计入盒模型）；
-  - `width` / `height`（auto / px / % / min-content / max-content 映射；% 相对包含块）；
-  - `min/max-width` / `min/max-height`；
-  - flex-*（`flex-direction` / `grow` / `shrink` / `basis` / `wrap` / `align-items` /
-    `justify-content` 及 align-self/justify-self）；
-  - grid-*（`grid-template-columns` / `rows` / `gap` / `align-items` / `justify-items` /
-    `grid-auto-flow` 等，视 taffy 0.14 支持面取舍）；
-  - `inset`（top/right/bottom/left，绝对定位用）。
-- 明确降级项（记入模块偏差清单）：`var()`、CSS 逻辑属性、`aspect-ratio` 等暂按 initial
-  处理；影响布局的（如 % 高度依赖父高度）按 taffy 语义走。
-- 退出条件：单测——典型取值映射正确（px/% / auto、flex basis、grid template、border
-  edges、box-sizing）；降级项有断言与偏差记录。
+### T2 nexty-css + chrome：视口单位 `vw` / `vh`（含 `vmin` / `vmax`）
+- value 层新增视口单位词法与 `LengthValue::Viewport(f32, ViewportUnit)`；
+  cascade 的 computed value 阶段按**传入的视口尺寸**解析为 px——`cascade` 入参增加
+  视口尺寸（`viewport: (f32, f32)` 或现有上下文结构），chrome pipeline 以窗口内容区
+  实际尺寸传入；`1v* = 视口对应边的 1%`（CSS Values §6.2）。
+- style_map 无需改动（cascade 出来的已是 px）；`@media` 视口条件求值沿用现有视口入参。
+- 退出条件：单测——视口 800×600 时 `50vw`=400px、`10vh`=60px、`1vmin`=6px、`1vmax`=8px；
+  chrome 接线实机验收（resize 后重排取新视口）。
 
-### T2 盒树构建（`tree_build.rs`，新模块）
-- 遍历 arena DOM + computed style，按生成盒规则构造 taffy `TaffyTree<()>`：
-  - `display:none` 不建节点（跳过子树，Fragment 也不产）；
-  - `display:contents` 不产盒，子节点提升为父的参与盒；
-  - 块级替换元素 `<img>` 以 `image_sizes` 自然尺寸（或默认 300×150）作 definite size
-    建叶节点；
-  - **文本 / inline 内容暂不建 taffy 节点**，留待 T4 断行后包装成匿名块（taffy 不做
-    text，必须用 `measure` 机制提供 line box 的 intrinsic size）；
-  - 容器节点建立 children 关系（块级子盒 + 后续匿名块）。
-- 维护 `NodeId(DOM) ↔ taffy Node` 双向映射表，供 T5 回填 Fragment。
-- 退出条件：单测——已知 DOM 结构下，构造出的 taffy 树节点数 / 父子关系正确（含
-  none / contents / inline 提升 / `<img>` 替换元素）。
+### T3 nexty-layout：inline 行盒 `text-align` 消费
+- `inline.rs` 行盒放置支持 left / center / right：行内容整体相对 content box 平移
+  （center 偏移 `(content_width - line_width)/2`，right 偏移全额）；多 run 行、
+  含行内原子盒的行同样适用（平移整个行盒，不改 run 内部间距）。
+- `justify` 按偏差记录降级为 left（两端对齐需逐空格伸缩，另轮评估）；
+  taffy 映射不引入对齐字段（行内对齐永远是自研 inline 的事，style_map 偏差清单同步）。
+- 退出条件：单测——单 run / 多 run / 含图片的行在 center 与 right 下 x 坐标正确；
+  行宽超容器（可断行贪心已换行）时退化为 left；`text-align` 继承生效。
 
-### T3 taffy 接管块级与 flex 几何（改造 `block.rs`）
-- 用 T1 的 `taffy::Style` 与 T2 的 `TaffyTree` 替换 `block.rs` 中"块级流几何解算"与
-  "单行 flex 主轴分配"的计算逻辑；`tree.compute_layout(root, available)` 后读回各节点
-  `Layout`（x/y/size）填入 `Fragment.border_box`。
-- 保留：宽度解析所需的根 available size（视口宽度入参）；`Fragment` 的 `border` /
-  `padding` / `style` 仍由 computed style 填充（taffy 只给几何，不重复造盒模型）。
-- **行为差异处理**：taffy 与自研在 margin 折叠、百分比高度、min/max 收束等处可能存在差异，
-  差异处**优先固化 taffy**（其 WPT 对齐更优），文档化并记录；不得引入 panic。
-- 退出条件：单测——与现有自研 block 测试等效的几何断言仍通过（块级垂直堆叠、宽度解析、
-  单行 flex grow/basis）；差异项有文档化比对结论。
+### T4 nexty-text：按脚本字体回退（CJK 缺字修复）
+- 现状：FontResolver 按 CSS 族列表在 fontique 系统查询取字体，族内无该码点字形时产出
+  notdef（豆腐块）。补齐：主族覆盖不了码点时，按字符脚本（fontique `Query` 支持按
+  script 过滤）继续查询系统回退字体——Windows 上 CJK 应命中 Microsoft YaHei 等系统
+  字体；回退结果按码点区间分段 shaping（同 run 内混排中西文各用各自字体）。
+- 回退字体不入用户可见族列表缓存污染；每 run 仍一次 harfrust 整形。
+- 若 fontique API 不支持粒度（如无法按 script 查询），如实记录偏差与替代方案后停在
+  最小可行（允许降级为「探测常用 CJK 族名」方案，但先查 fontique 能力再定，不许猜）。
+- 退出条件：单测——纯中文文本整形结果无 notdef（Windows 实机系统字体）；中西文混排
+  run 分段正确、各自字形非 notdef；纯拉丁文本路径行为不变（现有测试全绿）。
 
-### T4 inline 内容前置排版（衔接 `inline.rs` 与 taffy）
-- 对每个 block/flex/grid 容器内的 inline 内容，先以容器 content width 跑 `inline.rs`
-  断行，得到若干 `LineFragment`（每行高度已知）；把每行包装为一个**匿名块 taffy 节点**，
-  用 taffy 的 **measure function** 提供其 intrinsic size（line box 尺寸由 nexty 断行
-  决定，非 taffy 计算），与真实块级子盒一起参与该容器的 taffy 块级流 / 弹性流。
-- 处理匿名块盒的 `Fragment` 标记（`anonymous = true`，`node` 指向父元素，绘制按透明处理）。
-- 退出条件：单测——inline 内容 + 块级子盒混排时，行盒垂直位置与块级子盒互不重叠、顺序
-  正确；与现有 inline 行为一致（字形 / 坐标不变）。
+### T5 nexty-layout：taffy run 叶上报 baseline
+- 匿名块 run 叶的 measure function 目前返回 `Baselines::NONE`；改为上报**首行 baseline**
+  （`inline::build_lines` 已算出行盒 baseline 相对行顶的距离，随 measure 上下文带出），
+  使 flex `align-items: baseline` 与 grid baseline 对齐生效。
+- 只报第一行（多行叶的 baseline 组语义 §8.5 另轮评估，记入偏差清单）。
+- 退出条件：单测——两个文本 run 叶在 `align-items: baseline` 的 flex 容器中首行基线
+  对齐（不同 font-size 下 y 差值等于 ascent 差）；无文本容器不 panic。
 
-### T5 几何回填与 Fragment 生成
-- 从 taffy `Layout` 读回每个节点几何，结合 computed style 生成 `Fragment` 树：`border_box`
-  相对包含块内容盒（与现有坐标约定一致）、`border` / `padding` edges、`style`、`children`
-  （块级 / 匿名块）、`lines`（来自 T4 的 `LineFragment`）。
-- 绝对定位盒：taffy 已相对其包含块定位，回填时坐标归一到 Fragment 约定。
-- 退出条件：单测——`Fragment` 结构与现有契约字段一致（node / anonymous / border_box /
-  border / padding / style / children / lines）；`display:none` / `contents` 产物断言。
-
-### T6 回归与专项测试
-- 复用现有静态页 fixture（Wikipedia 风格 / 博客类）做布局结构比对（`Fragment` 树 diff），
-  确保渲染**不退化**；新增布局专项单测：grid 双列模板、多行 flex wrap、绝对定位 inset、
-  `display:contents` 提升、匿名块混排。
-- inline 行为不变断言（沿用 `inline.rs` 现有测试）。
-- 退出条件：布局回归 fixture 无结构性退化（允许 T3 列明的 taffy 与自研已知差异，差异需
-  文档化且经人工核验）；全部单测绿。
-
-### T7 门禁与收尾
-- `cargo check --workspace` 零 warning；`cargo test --workspace` 全绿；clippy `-D warnings`
-  零告警；`cargo fmt --all -- --check` 通过。
-- AGENTS.md「当前状态」同步：`nexty-layout` 改为"**taffy 接管盒级几何（block/flex/grid/
-  absolute）+ 自研 inline 断行**"，记录偏差清单（inline / table 仍自研、`var()` / 逻辑
-  属性降级、UAX#14 完整断行未做）；更新布局完备度数字（约 35% → 约 70–75%）。
-- 分任务 commit，最终 push（本机无凭据时留给用户）。
+### T6 门禁与收尾
+- `cargo check --workspace` 零 warning；`cargo test --workspace` 全绿；clippy
+  `-D warnings` 零告警；`cargo fmt --all -- --check` 通过；改动 feature 组合
+  （css 无 `values`、layout 无 `inline` 等）零 warning 编译。
+- AGENTS.md 同步：nexty-css 属性清单加 `font` 简写与视口单位；nexty-text 加按脚本
+  回退；nexty-layout 偏差清单划掉 baseline 退化与 text-align 缺失、保留 justify/UAX#14；
+  feature 映射表无新增模块则不动。
+- 记忆修正：「paint 层无 background-color」条目过期——`pipeline.rs` 自首版即按
+  fragment 填充 `background_color`，真实缺口是根元素/画布背景传播（CSS §14）与渐变，
+  改写该条避免重复排查。
+- 分任务 commit，最终 push。
 
 ## 非目标（本轮不做）
-- table 布局（taffy roadmap 未覆盖，维持现状：按块级化或忽略；本轮不引入 taffy table）。
-- 完整 UAX#14 断行（仍是 `inline.rs` 偏差，不在范围）。
-- paint 层改动（圆角 / 渐变 / 阴影不引入）；`Fragment` 契约冻结，paint 零改动。
-- JS 引擎、交互基础（选择 / 表单 / 标签）、GPU 后端、网络缓存 / cookie（无关本轮）。
-- 把 inline 文本布局交给 taffy（taffy 不做文本布局，**永不在本轮范围**）。
-- 删除 `block.rs` 全部逻辑——保留宽度 §10.3.3 解析与 inline 衔接作为 taffy 前的预处理；
-  被 taffy 替代的仅是"几何解算"部分。
+- 页面文本选择与复制（跨 text/layout/chrome 三层，**下轮候选**，AGENTS.md 已立项）。
+- float 布局与 table（taffy 不覆盖，自研成本高，单独评估）。
+- `text-align: justify` 两端对齐、UAX#14 完整断行（维持 inline.rs 偏差清单）。
+- `text-decoration`、`letter-spacing`、`white-space` 非 normal 取值。
+- 根元素/画布背景传播（CSS §14）、渐变、圆角、阴影（paint 指令集另轮）。
+- vello_hybrid GPU 后端、`position: fixed` 视口锚定。
+- `font` 系统关键字字体、`font-variant` 完整展开、可变字体轴。
+- JS 引擎、表单、多标签页、网络缓存。
+
+## 方向评估（为什么是这轮）
+
+| 候选 | 价值 | 成本 | 结论 |
+| --- | --- | --- | --- |
+| **行内/文本补齐（本轮）** | 真实页面行内呈现质量，CJK 可读性 | 小–中，几乎全可无头单测 | ✅ 本轮 |
+| 页面文本选择与复制 | 「像浏览器」的关键交互里程碑 | 中–大，跨三层，依赖本轮的行几何稳定 | 下轮首选 |
+| float / table 布局 | 老页面与邮件类内容 | 大（taffy 不覆盖，自研违「不造轮子」需 ADR 论证无轮可用） | 暂缓 |
+| paint 圆角/渐变 + GPU 后端 | 视觉上限，但底层数量级低于行内缺口 | 中（GPU 有 winit surface 接缝工作） | 暂缓 |
 
 ## 验证流（AGENTS.md Verification Flow）
 每层：cargo check 零 warning → cargo test 全绿 → fmt/clippy → commit。
-taffy 行为差异需人工核验处（margin 折叠 / 百分比高度 / min-max 收束）在 T3/T6 注明并文档化，
-列为人工核验待办。
+T2 的 chrome 侧 resize 接线、T4 的 Windows 实机字形为无头不可测项，列入实机验收；
+其余全部单测覆盖。修 bug 类（CJK notdef）先写 failing test 再修。
