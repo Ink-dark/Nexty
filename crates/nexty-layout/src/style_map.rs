@@ -28,9 +28,11 @@
 //!   搜索，绝对定位盒相对其**树内父盒**定位——父盒自身定位（relative/absolute）时
 //!   与 CSS 一致；父盒 static 时 CSS 应上溯定位祖先，此处偏差（见 `block` 模块文档
 //!   差异 8）。视口锚定（fixed 相对初始包含块）同样未建模。
-//! - `text-align` 不映射：taffy 的 `TextAlign::Legacy*` 是 legacy 块级子盒对齐
-//!   （`<center>` 语义），映射 `center` 会让块级子盒居中，偏离现代 CSS 语义
-//!   （行内内容的对齐由 `inline` 模块处理，本轮未做）。
+//! - `text-align` 不映射到 taffy：taffy 的 `TextAlign::Legacy*` 是 legacy 块级
+//!   子盒对齐（`<center>` 语义），映射 `center` 会让块级子盒居中，偏离现代
+//!   CSS 语义。行内内容的对齐由自研管线施加（`block` 模块 `alignment_shift`，
+//!   在行盒并入容器/匿名块时平移）；`justify`/`justify-all`/`match-parent`
+//!   降级为左对齐。
 
 #[cfg(feature = "absolute")]
 use nexty_css::InsetValue;

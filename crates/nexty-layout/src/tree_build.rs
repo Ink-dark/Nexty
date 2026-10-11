@@ -187,9 +187,14 @@ impl InlineRunNode<'_> {
                 let content_width = match available.width {
                     AvailableSpace::Definite(width) => width,
                     // 不折行：行内项总宽（缓存行恰为单行）
-                    AvailableSpace::MaxContent => lines.last().map(line_width).unwrap_or(0.0),
+                    AvailableSpace::MaxContent => {
+                        lines.last().map(crate::inline::line_width).unwrap_or(0.0)
+                    }
                     // 最长不可拆项
-                    AvailableSpace::MinContent => lines.iter().map(line_width).fold(0.0, f32::max),
+                    AvailableSpace::MinContent => lines
+                        .iter()
+                        .map(crate::inline::line_width)
+                        .fold(0.0, f32::max),
                 };
                 TaffySize {
                     width: known.width.unwrap_or(content_width),
@@ -198,23 +203,6 @@ impl InlineRunNode<'_> {
             },
         )
     }
-}
-
-/// 一行行内内容的宽度（取文本 / 图片 / 原子盒右缘最大值）。
-fn line_width(line: &LineFragment) -> f32 {
-    let mut width = 0.0_f32;
-    for run in &line.runs {
-        if let Some(glyph) = run.glyphs.last() {
-            width = width.max(glyph.x + glyph.advance);
-        }
-    }
-    for image in &line.images {
-        width = width.max(image.x + image.width);
-    }
-    for atomic in &line.boxes {
-        width = width.max(atomic.border_box.x + atomic.border_box.width);
-    }
-    width
 }
 
 /// 匿名 run 叶节点的 taffy 样式：普通块级叶，无 margin/padding/border。

@@ -867,3 +867,104 @@ fn mixed_inline_and_block_content_does_not_overlap() {
         "三者垂直堆叠、互不重叠"
     );
 }
+
+// ---- text-align 行盒对齐（CSS Text 4 §5.1） ----
+
+/// 取片段首行首个字形 x 与末字形右缘（行宽参照）。
+fn line_extent(line: &LineFragment) -> (f32, f32) {
+    let first = line
+        .runs
+        .first()
+        .and_then(|run| run.glyphs.first())
+        .expect("line has glyphs")
+        .x;
+    let mut end = first;
+    for run in &line.runs {
+        if let Some(glyph) = run.glyphs.last() {
+            end = end.max(glyph.x + glyph.advance);
+        }
+    }
+    (first, end)
+}
+
+#[test]
+fn text_align_center_shifts_line() {
+    let (document, root) = layout(
+        "<div style=\"width: 400px; text-align: center\">hello world</div>",
+        "",
+        800.0,
+    );
+    let div = find(&document, &root, "div").expect("div fragment");
+    let line = div.lines.first().expect("one line");
+    let (first, end) = line_extent(line);
+    // 整行平移：first = (400 - 行宽) / 2，行宽 = end - first
+    assert!(
+        approx(first, (400.0 - (end - first)) / 2.0),
+        "居中：first={first}, end={end}"
+    );
+}
+
+#[test]
+fn text_align_right_shifts_line_to_edge() {
+    let (document, root) = layout(
+        "<div style=\"width: 400px; text-align: right\">hello world</div>",
+        "",
+        800.0,
+    );
+    let div = find(&document, &root, "div").expect("div fragment");
+    let line = div.lines.first().expect("one line");
+    let (first, end) = line_extent(line);
+    assert!(
+        approx(first, 400.0 - (end - first)),
+        "右对齐：行尾贴内容盒右缘"
+    );
+}
+
+#[test]
+fn text_align_overfull_line_stays_left() {
+    // 不可拆长词超出容器：自由空间为 0，center 不产生偏移（防负偏移）
+    let (document, root) = layout(
+        "<div style=\"width: 50px; text-align: center\">wwwwwwwwwwwwwwwwwwwwww</div>",
+        "",
+        800.0,
+    );
+    let div = find(&document, &root, "div").expect("div fragment");
+    let line = div.lines.first().expect("one line");
+    let (first, _) = line_extent(line);
+    assert!(approx(first, 0.0), "溢出行退化为左对齐");
+}
+
+#[test]
+fn text_align_inherits_into_block_children() {
+    let (document, root) = layout(
+        "<div style=\"width: 400px; text-align: center\"><p>ab</p></div>",
+        "",
+        800.0,
+    );
+    let p = find(&document, &root, "p").expect("p fragment");
+    let line = p.lines.first().expect("one line");
+    let (first, end) = line_extent(line);
+    assert!(
+        approx(first, (400.0 - (end - first)) / 2.0),
+        "继承属性：块级子元素的行也居中"
+    );
+}
+
+#[test]
+fn text_align_applies_to_anonymous_blocks() {
+    // 混排：行内流由匿名块承接，text-align 相对匿名块宽（=容器内容宽）平移
+    let (document, root) = layout(
+        "<div style=\"width: 400px; text-align: center\">intro tail<div></div></div>",
+        "",
+        800.0,
+    );
+    let div = find(&document, &root, "div").expect("div fragment");
+    let anonymous = div.children.first().expect("anonymous block");
+    assert!(anonymous.anonymous, "行内流为匿名块");
+    let line = anonymous.lines.first().expect("one line");
+    let (first, end) = line_extent(line);
+    assert!(
+        approx(first, (400.0 - (end - first)) / 2.0),
+        "匿名块内的行同样居中"
+    );
+}

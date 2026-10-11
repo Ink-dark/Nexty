@@ -556,3 +556,20 @@ pub(crate) fn build_lines(
     flush(&mut placed, &mut lines);
     lines
 }
+
+/// 一行行内内容的宽度（取文本 / 图片 / 原子盒右缘最大值）。
+pub(crate) fn line_width(line: &LineFragment) -> f32 {
+    let mut width = 0.0_f32;
+    for run in &line.runs {
+        if let Some(glyph) = run.glyphs.last() {
+            width = width.max(glyph.x + glyph.advance);
+        }
+    }
+    for image in &line.images {
+        width = width.max(image.x + image.width);
+    }
+    for atomic in &line.boxes {
+        width = width.max(atomic.border_box.x + atomic.border_box.width);
+    }
+    width
+}

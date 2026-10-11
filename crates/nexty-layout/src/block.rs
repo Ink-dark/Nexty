@@ -48,7 +48,7 @@
 //!    偏差，列为已知限制。`position: fixed` 同样映射为 taffy `Absolute`
 //!    （视口锚定未建模）。
 
-use nexty_css::{ComputedStyle, MarginValue};
+use nexty_css::{ComputedStyle, MarginValue, TextAlignValue};
 use nexty_dom::NodeId;
 use taffy::geometry::Size as TaffySize;
 use taffy::style::AvailableSpace;
@@ -202,9 +202,27 @@ fn assemble_element(
             let run_lines = run.lines_at(child_layout.size.width);
             if merge_lines {
                 for line in run_lines {
-                    lines.push(offset_line(line, position.0, position.1));
+                    // text-align 在行盒并入容器时施加：整行相对内容盒平移
+                    //（CSS Text 4 §5.1；run 叶内坐标相对自身，行宽即自由空间参照）
+                    let shift = alignment_shift(
+                        style.text_align,
+                        crate::inline::line_width(&line),
+                        child_layout.size.width,
+                    );
+                    lines.push(offset_line(line, position.0 + shift, position.1));
                 }
             } else {
+                let mut shifted_lines = run_lines;
+                // 匿名块承接的行盒（混排 / flex·grid item）同样按 text-align
+                // 平移——相对匿名块自身内容盒（宽 = run 叶宽）
+                for line in &mut shifted_lines {
+                    let shift = alignment_shift(
+                        style.text_align,
+                        crate::inline::line_width(line),
+                        child_layout.size.width,
+                    );
+                    offset_line_in_place(line, shift, 0.0);
+                }
                 children.push(Fragment {
                     node: dom_node,
                     anonymous: true,
@@ -218,7 +236,7 @@ fn assemble_element(
                     padding: Edges::default(),
                     style: style.clone(),
                     children: Vec::new(),
-                    lines: run_lines,
+                    lines: shifted_lines,
                 });
             }
         } else if let Some(dom) = boxes.taffy_to_dom.get(&child).copied() {
@@ -240,6 +258,12 @@ fn assemble_element(
 
 /// 把行盒从 run 叶内容盒坐标系平移到容器内容盒坐标系。
 fn offset_line(mut line: LineFragment, dx: f32, dy: f32) -> LineFragment {
+    offset_line_in_place(&mut line, dx, dy);
+    line
+}
+
+/// [`offset_line`] 的原地版本（批量平移前先算对齐偏移时用）。
+fn offset_line_in_place(line: &mut LineFragment, dx: f32, dy: f32) {
     line.baseline += dy;
     for run in &mut line.runs {
         for glyph in &mut run.glyphs {
@@ -254,7 +278,24 @@ fn offset_line(mut line: LineFragment, dx: f32, dy: f32) -> LineFragment {
         atomic.border_box.x += dx;
         atomic.border_box.y += dy;
     }
-    line
+}
+
+/// `text-align` 的行内水平偏移（CSS Text 4 §5.1）。
+///
+/// 偏移 = 自由空间 ×（center: 1/2、right/end: 1、其余: 0——`start` 为
+/// initial（LTR 即左对齐），`justify`/`justify-all`/`match-parent` 按偏差
+/// 降级为左对齐）；行宽超出可用宽（不可拆溢出行）时自由空间为 0。
+fn alignment_shift(align: TextAlignValue, line_width: f32, available: f32) -> f32 {
+    let free = (available - line_width).max(0.0);
+    match align {
+        TextAlignValue::Center => free / 2.0,
+        TextAlignValue::Right | TextAlignValue::End => free,
+        TextAlignValue::Left
+        | TextAlignValue::Start
+        | TextAlignValue::Justify
+        | TextAlignValue::JustifyAll
+        | TextAlignValue::MatchParent => 0.0,
+    }
 }
 
 /// 内容盒 inset：(border.left + padding.left, border.top + padding.top)。
