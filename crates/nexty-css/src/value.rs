@@ -6,12 +6,16 @@
 //! - 字号：[CSS Fonts Module Level 4 §2.5](https://drafts.csswg.org/css-fonts-4/#font-size-prop)
 //! - 字重：[CSS Fonts Module Level 4 §2.2](https://drafts.csswg.org/css-fonts-4/#font-weight-numeric)
 //! - 字体族：[CSS Fonts Module Level 4 §2.3](https://drafts.csswg.org/css-fonts-4/#font-family-prop)
+//! - font 简写：[CSS Fonts Module Level 4 §3.3](https://drafts.csswg.org/css-fonts-4/#font-prop)
 //! - display：[CSS Display Module Level 3](https://drafts.csswg.org/css-display-3/#the-display-properties)
 //! - text-align：[CSS Text Module Level 4](https://drafts.csswg.org/css-text-4/#text-align-property)
 //!
 //! 已知偏差（按需再补，见本轮 goal.md 非目标）：`rem` / `ex` / `ch` 等
 //! 相对单位、`currentcolor`、`color-mix()` 等函数色、`display` 的多关键字
 //! 语法与 ruby 内部盒、`var()` 均视为无效声明（浏览器会接受其中的合法值）。
+//! `font` 简写里无对应 longhand 的成分——`<font-variant-css2>`（`small-caps`）
+//! 与 `<font-width-css3>`（宽度关键字/百分比）——按语法接受后丢弃（无渲染
+//! 效果但声明不整体失效）；系统字体关键字（`caption` / `menu` 等）整条无效。
 //!
 //! **Feature**：本模块受 `values` feature 控制（由 lib.rs 装配）。其中的
 //! `parse_*` 逐属性解析函数供 `parser` / `cascade` 模块消费，故当上层 feature
@@ -1640,25 +1644,47 @@ fn parse_font_weight(input: &mut Parser<'_>) -> Result<FontWeightValue, ()> {
 }
 
 fn parse_font_family(input: &mut Parser<'_>) -> Result<Vec<FontFamilyValue>, ()> {
-    input
-        .parse_comma_separated(|input| {
-            parse_family_item(input).map_err(|_| ParseError::<()>::unexpected_token())
-        })
-        .map_err(|_| ())
+    let mut families = Vec::new();
+    loop {
+        families.push(parse_family_item(input)?);
+        // 逗号 → 还有下一项；`!`（!important 前缀）、其他终止符或 EOF →
+        // 族名列表结束，后续交给调用方（parse_important / 耗尽校验）。
+        // 注意逗号是独立的 Token::Comma，不是 Delim。
+        if input.try_parse(|i| i.expect_comma()).is_err() {
+            break;
+        }
+    }
+    Ok(families)
 }
 
 /// 解析一个字体族名：`<string>` 或一串 `<custom-ident>`（以空白分隔）。
+///
+/// 遇到终止符（逗号、`!`、EOF）即停止且不消费，留给调用方——它们经
+/// `try_parse` 的 `Err` 返回，位置已还原；其他无法归入族名语法的 token
+/// （数字、不匹配的括号等）照常消费并由 [`family_from_tokens`] 判为无效。
 fn parse_family_item(input: &mut Parser<'_>) -> Result<FontFamilyValue, ()> {
     let mut tokens = Vec::new();
-    while let Ok(token) = input.next_including_whitespace() {
-        tokens.push(token.clone());
+    loop {
+        let peeked = input.try_parse(|i| match i.next_including_whitespace() {
+            Ok(Token::Comma) | Ok(Token::Delim('!')) => Err(()),
+            Ok(token) => Ok(token.clone()),
+            Err(_) => Err(()),
+        });
+        match peeked {
+            Ok(token) => tokens.push(token),
+            Err(()) => break,
+        }
     }
+    family_from_tokens(&tokens)
+}
 
-    // 去掉首尾空白，中部空白折叠为单个空格。
+/// 把族名的 token 序列归一化为 [`FontFamilyValue`]：去首尾空白、中部空白
+/// 折叠为单个空格；无引号的单词族名映射 generic。
+fn family_from_tokens(tokens: &[Token<'_>]) -> Result<FontFamilyValue, ()> {
     let mut parts: Vec<String> = Vec::new();
     let mut current: Option<String> = None;
     let mut quoted = false;
-    for token in &tokens {
+    for token in tokens {
         match token {
             Token::WhiteSpace(_) => {
                 if let Some(word) = current.take() {
@@ -1694,6 +1720,158 @@ fn parse_family_item(input: &mut Parser<'_>) -> Result<FontFamilyValue, ()> {
         return Ok(FontFamilyValue::Generic(generic));
     }
     Ok(FontFamilyValue::Family(parts.join(" ")))
+}
+
+/// `font` 简写值解析并展开为 longhand（CSS Fonts 4 §3.3）。
+///
+/// 语法：`[ <'font-style'> || <font-variant-css2> || <'font-weight'> ||
+/// <font-width-css3> ]? <'font-size'> [ / <'line-height'> ]? <'font-family'>#`——
+/// `||` 成分任意顺序、每项至多一次；缺省成分按简写语义重置为 initial。
+/// 偏差：`font-variant-css2`（`small-caps`）与 `<font-width-css3>`（宽度
+/// 关键字/百分比）无对应 longhand，按语法接受后丢弃；系统字体关键字
+/// （`caption` 等）整条无效。
+pub(crate) fn parse_font_shorthand(
+    input: &mut Parser<'_>,
+) -> Result<Vec<(PropertyId, PropertyValue)>, ()> {
+    if is_system_family_name(input) {
+        return Err(());
+    }
+    let mut style: Option<FontStyleValue> = None;
+    let mut weight: Option<FontWeightValue> = None;
+    let mut small_caps_seen = false;
+    let mut width_seen = false;
+    // `normal` 可出现在 style / variant / weight / width 四个槽位，统一计数
+    // （各槽初值均为 normal，无需区分归属）。
+    let mut normals = 0usize;
+    loop {
+        if normals < 4 && try_parse_ident(input, "normal") {
+            normals += 1;
+            continue;
+        }
+        if style.is_none()
+            && let Ok(value) = input.try_parse(parse_font_style_shorthand)
+        {
+            style = Some(value);
+            continue;
+        }
+        if weight.is_none()
+            && let Ok(value) = input.try_parse(parse_font_weight)
+        {
+            weight = Some(value);
+            continue;
+        }
+        if !small_caps_seen && try_parse_ident(input, "small-caps") {
+            small_caps_seen = true;
+            continue;
+        }
+        if !width_seen && try_parse_font_width(input) {
+            width_seen = true;
+            continue;
+        }
+        break;
+    }
+
+    let size = parse_font_size(input)?;
+    let line_height = if input.try_parse(|i| i.expect_delim('/')).is_ok() {
+        Some(parse_line_height(input)?)
+    } else {
+        None
+    };
+    let families = parse_font_family(input)?;
+
+    Ok(vec![
+        (
+            PropertyId::FontStyle,
+            PropertyValue::FontStyle(style.unwrap_or(FontStyleValue::Normal)),
+        ),
+        (
+            PropertyId::FontWeight,
+            PropertyValue::FontWeight(weight.unwrap_or(FontWeightValue::Weight(400.0))),
+        ),
+        (PropertyId::FontSize, PropertyValue::FontSize(size)),
+        (
+            PropertyId::LineHeight,
+            PropertyValue::LineHeight(line_height.unwrap_or(LineHeightValue::Normal)),
+        ),
+        (PropertyId::FontFamily, PropertyValue::FontFamily(families)),
+    ])
+}
+
+/// 简写前缀里的 `<font-style>`：`italic | oblique [ <angle> | none ]?`。
+/// 与 longhand [`parse_font_style`] 的差别：裸 `oblique` 合法——简写中
+/// 其后还有 size 等成分，不能要求耗尽。
+fn parse_font_style_shorthand(input: &mut Parser<'_>) -> Result<FontStyleValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("italic") {
+        return Ok(FontStyleValue::Italic);
+    }
+    if name.eq_ignore_ascii_case("oblique") {
+        let angle = input.try_parse(parse_angle).ok();
+        if angle.is_none()
+            && input
+                .try_parse(|i| i.expect_ident_matching("none").map_err(|_| ()))
+                .is_ok()
+        {
+            return Ok(FontStyleValue::Oblique(None));
+        }
+        return Ok(FontStyleValue::Oblique(angle));
+    }
+    Err(())
+}
+
+/// `font` 简写的系统字体关键字（CSS Fonts 4 §3.3 `<system-family-name>`）：
+/// 依赖 UA 系统设置且要求重置全部子属性，本层不支持。
+fn is_system_family_name(input: &mut Parser<'_>) -> bool {
+    const SYSTEM: [&str; 6] = [
+        "caption",
+        "icon",
+        "menu",
+        "message-box",
+        "small-caption",
+        "status-bar",
+    ];
+    input
+        .try_parse(|i| match i.next() {
+            Ok(Token::Ident(name)) if SYSTEM.iter().any(|k| name.eq_ignore_ascii_case(k)) => Ok(()),
+            _ => Err(()),
+        })
+        .is_ok()
+}
+
+/// 尝试消费一个指定关键字（ASCII case-insensitive），命中则消费并返回真。
+fn try_parse_ident(input: &mut Parser<'_>, expected: &str) -> bool {
+    input
+        .try_parse(|i| match i.next() {
+            Ok(Token::Ident(name)) if name.eq_ignore_ascii_case(expected) => Ok(()),
+            _ => Err(()),
+        })
+        .is_ok()
+}
+
+/// `<font-width-css3>`：宽度关键字或非负百分比。本层无 font-stretch
+/// longhand，按语法接受后丢弃（返回是否命中）。
+fn try_parse_font_width(input: &mut Parser<'_>) -> bool {
+    const KEYWORDS: [&str; 8] = [
+        "ultra-condensed",
+        "extra-condensed",
+        "condensed",
+        "semi-condensed",
+        "semi-expanded",
+        "expanded",
+        "extra-expanded",
+        "ultra-expanded",
+    ];
+    input
+        .try_parse(|i| match i.next() {
+            Ok(Token::Ident(name)) if KEYWORDS.iter().any(|k| name.eq_ignore_ascii_case(k)) => {
+                Ok(())
+            }
+            Ok(Token::Percentage { unit_value, .. }) if *unit_value >= 0.0 => Ok(()),
+            _ => Err(()),
+        })
+        .is_ok()
 }
 
 /// 无引号的 generic 族关键字

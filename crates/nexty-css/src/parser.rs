@@ -24,8 +24,8 @@ use crate::selector::{NextySelector, parse_selector_list};
 use crate::value::{
     BorderColorValue, BorderStyle, BorderWidthValue, DeclaredValue, PropertyId, PropertyValue,
     parse_border_color_value, parse_border_style_value, parse_border_width_value,
-    parse_css_wide_keyword, parse_declared_value, parse_gap_value, parse_inset_value,
-    parse_margin_value, parse_padding_value,
+    parse_css_wide_keyword, parse_declared_value, parse_font_shorthand, parse_gap_value,
+    parse_inset_value, parse_margin_value, parse_padding_value,
 };
 use cssparser::{
     AtRuleParser, DeclarationParser, ParseError, Parser, QualifiedRuleParser, RuleBodyItemParser,
@@ -474,6 +474,37 @@ type ShorthandExpansion = (Vec<(PropertyId, DeclaredValue)>, bool);
 /// 返回 `None` 表示 `name` 不是本层支持的简写；`Some(Err)` 表示简写值无效
 /// （整条声明丢弃）。CSS-wide 关键字作用于全部 longhand。
 fn expand_shorthand(name: &str, input: &mut Parser<'_>) -> Option<Result<ShorthandExpansion, ()>> {
+    // font 简写：缺省成分重置为 initial（CSS Fonts 4 §3.3），longhand 组见
+    // font_longhands；small-caps / font-width 成分在值层接受后丢弃。
+    if name.eq_ignore_ascii_case("font") {
+        if let Ok(keyword) = input.try_parse(parse_css_wide_keyword) {
+            let important = input.try_parse(cssparser::parse_important).is_ok();
+            if input.expect_exhausted().is_err() {
+                return Some(Err(()));
+            }
+            return Some(Ok((
+                font_longhands()
+                    .into_iter()
+                    .map(|property| (property, DeclaredValue::CssWide(keyword)))
+                    .collect(),
+                important,
+            )));
+        }
+        let expanded = parse_font_shorthand(input)
+            .map(|values| {
+                values
+                    .into_iter()
+                    .map(|(property, value)| (property, DeclaredValue::Typed(value)))
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|_| ());
+        let important = input.try_parse(cssparser::parse_important).is_ok();
+        if input.expect_exhausted().is_err() {
+            return Some(Err(()));
+        }
+        return Some(expanded.map(|declarations| (declarations, important)));
+    }
+
     // gap 简写：row-gap || column-gap（两值：行优先，缺省列取行）。
     if name.eq_ignore_ascii_case("gap") {
         if let Ok(keyword) = input.try_parse(parse_css_wide_keyword) {
@@ -769,6 +800,18 @@ fn border_longhands() -> Vec<PropertyId> {
         border_color_longhands(),
     ]
     .concat()
+}
+
+/// `font` 简写的 longhand 组（CSS Fonts 4 §3.3：简写重置全部子属性，
+/// 故缺省成分也产声明、值取 initial）。
+fn font_longhands() -> Vec<PropertyId> {
+    vec![
+        PropertyId::FontStyle,
+        PropertyId::FontWeight,
+        PropertyId::FontSize,
+        PropertyId::LineHeight,
+        PropertyId::FontFamily,
+    ]
 }
 
 #[cfg(test)]
@@ -1225,5 +1268,167 @@ mod tests {
                 "{css} should drop the declaration"
             );
         }
+    }
+
+    // ---- font 简写（CSS Fonts 4 §3.3） ----
+
+    use crate::value::{FontFamilyValue, FontStyleValue, FontWeightValue};
+
+    #[test]
+    fn font_shorthand_expands_with_line_height() {
+        let sheet =
+            Stylesheet::parse(r#"p { font: italic bold 12px/1.5 "Helvetica Neue", serif }"#);
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::FontStyle).value,
+            DeclaredValue::Typed(PropertyValue::FontStyle(FontStyleValue::Italic))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::FontWeight).value,
+            DeclaredValue::Typed(PropertyValue::FontWeight(FontWeightValue::Weight(700.0)))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::FontSize).value,
+            DeclaredValue::Typed(PropertyValue::FontSize(FontSizeValue::Px(12.0)))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::LineHeight).value,
+            DeclaredValue::Typed(PropertyValue::LineHeight(LineHeightValue::Number(1.5)))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::FontFamily).value,
+            DeclaredValue::Typed(PropertyValue::FontFamily(vec![
+                FontFamilyValue::Family("Helvetica Neue".to_string()),
+                FontFamilyValue::Generic("serif"),
+            ]))
+        );
+    }
+
+    /// 缺省成分按简写语义重置为 initial（style=normal、weight=400、
+    /// line-height=normal）。
+    #[test]
+    fn font_shorthand_resets_missing_longhands_to_initial() {
+        let sheet = Stylesheet::parse("p { font: 12px serif }");
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::FontStyle).value,
+            DeclaredValue::Typed(PropertyValue::FontStyle(FontStyleValue::Normal))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::FontWeight).value,
+            DeclaredValue::Typed(PropertyValue::FontWeight(FontWeightValue::Weight(400.0)))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::FontSize).value,
+            DeclaredValue::Typed(PropertyValue::FontSize(FontSizeValue::Px(12.0)))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::LineHeight).value,
+            DeclaredValue::Typed(PropertyValue::LineHeight(LineHeightValue::Normal))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::FontFamily).value,
+            DeclaredValue::Typed(PropertyValue::FontFamily(vec![FontFamilyValue::Generic(
+                "serif"
+            )]))
+        );
+    }
+
+    /// `normal` 占位（style/variant/weight/width 槽位）与数值字重。
+    #[test]
+    fn font_shorthand_accepts_normal_placeholders_and_numeric_weight() {
+        let sheet = Stylesheet::parse("p { font: normal normal 400 1em sans-serif }");
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::FontStyle).value,
+            DeclaredValue::Typed(PropertyValue::FontStyle(FontStyleValue::Normal))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::FontWeight).value,
+            DeclaredValue::Typed(PropertyValue::FontWeight(FontWeightValue::Weight(400.0)))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::FontSize).value,
+            DeclaredValue::Typed(PropertyValue::FontSize(FontSizeValue::Em(1.0)))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::FontFamily).value,
+            DeclaredValue::Typed(PropertyValue::FontFamily(vec![FontFamilyValue::Generic(
+                "sans-serif"
+            )]))
+        );
+    }
+
+    /// `||` 成分任意顺序；small-caps / font-width 无 longhand，接受后丢弃。
+    #[test]
+    fn font_shorthand_components_in_any_order_with_discarded_width() {
+        let sheet =
+            Stylesheet::parse("p { font: small-caps condensed bold oblique 14px monospace }");
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::FontStyle).value,
+            DeclaredValue::Typed(PropertyValue::FontStyle(FontStyleValue::Oblique(None)))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::FontWeight).value,
+            DeclaredValue::Typed(PropertyValue::FontWeight(FontWeightValue::Weight(700.0)))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::FontSize).value,
+            DeclaredValue::Typed(PropertyValue::FontSize(FontSizeValue::Px(14.0)))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::FontFamily).value,
+            DeclaredValue::Typed(PropertyValue::FontFamily(vec![FontFamilyValue::Generic(
+                "monospace"
+            )]))
+        );
+    }
+
+    /// `!important` 作用于全部 longhand（族名解析在 `!` 前停止）。
+    #[test]
+    fn font_shorthand_important_applies_to_all_longhands() {
+        let sheet = Stylesheet::parse("p { font: 12px serif !important }");
+        let declarations = &sheet.rules()[0].declarations();
+        assert_eq!(declarations.len(), 5);
+        assert!(declarations.iter().all(|declaration| declaration.important));
+    }
+
+    /// CSS-wide 关键字作用于全部 longhand。
+    #[test]
+    fn font_shorthand_css_wide_keyword() {
+        let sheet = Stylesheet::parse("p { font: inherit }");
+        let declarations = &sheet.rules()[0].declarations();
+        assert_eq!(declarations.len(), 5);
+        assert!(declarations.iter().all(
+            |declaration| declaration.value == DeclaredValue::CssWide(CssWideKeyword::Inherit)
+        ));
+    }
+
+    /// 非法值整条丢弃：缺 size、缺 family、系统字体关键字、值后残留垃圾。
+    #[test]
+    fn font_shorthand_invalid_values_are_dropped() {
+        for css in [
+            "p { font: 12px }",         // 缺 family
+            "p { font: bold serif }",   // 缺 size
+            "p { font: caption }",      // 系统字体关键字
+            "p { font: 12px serif 2 }", // 族名中混入非 ident token
+            "p { font: 12px/ }",        // 行高缺失
+        ] {
+            assert!(
+                Stylesheet::parse(css).rules()[0].declarations().is_empty(),
+                "{css} should drop the declaration"
+            );
+        }
+    }
+
+    /// font-family longhand 本身带 `!important`（族名解析在 `!` 前停止）。
+    #[test]
+    fn font_family_longhand_with_important() {
+        let sheet = Stylesheet::parse(r#"p { font-family: "Helvetica Neue", serif !important }"#);
+        assert!(declaration_of(&sheet, 0, PropertyId::FontFamily).important);
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::FontFamily).value,
+            DeclaredValue::Typed(PropertyValue::FontFamily(vec![
+                FontFamilyValue::Family("Helvetica Neue".to_string()),
+                FontFamilyValue::Generic("serif"),
+            ]))
+        );
     }
 }
