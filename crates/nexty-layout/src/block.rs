@@ -37,9 +37,10 @@
 //!    使用高度时末子盒下边距不再与父折叠的规范细节），与旧自研结论一致。
 //! 5. **过约束宽度**（§10.3.3 ltr）：忽略 margin-right——taffy 通过左 margin
 //!    定位实现同结论，盒子停在 margin-left 处。
-//! 6. **基线传播**：run 叶不向 taffy 上报 baselines（`Baselines::NONE`），
-//!    flex `align-items: baseline` 退化为顶部对齐。旧自研同样未实现基线对齐，
-//!    列为已知限制（T4/后续补）。
+//! 6. **基线传播**：run 叶向 taffy 上报**首行** baseline（`tree_build` 的
+//!    measure 手动构造 `LayoutOutput`，不走恒返回 `Baselines::NONE` 的
+//!    `compute_leaf_layout`），flex/grid `align-items: baseline` 生效。
+//!    多行叶只报首行（baseline 组语义 §8.5 未建模，列为已知限制）。
 //! 7. **`display: contents` 的根**：根元素无自身盒，其 margin 不再参与定位
 //!    （旧自研会给根加 margin 偏移，规范上无盒元素无 margin 可言）。
 //! 8. **绝对定位的包含块**（T6）：taffy 不做「最近定位祖先」搜索，绝对定位盒

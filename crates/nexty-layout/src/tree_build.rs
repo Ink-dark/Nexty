@@ -170,38 +170,62 @@ impl InlineRunNode<'_> {
     /// 断行宽取已知宽或定宽可用空间；`MaxContent` 按不折行（单行）测量，
     /// `MinContent` 按 0 宽断行（每项一行，取最长项）近似内在尺寸。
     /// 行盒由自研断行决定，taffy 只消费尺寸结果。
+    ///
+    /// 不走 `compute_leaf_layout`（其恒定返回 `Baselines::NONE`）：手动构造
+    /// `LayoutOutput`，上报**首行 baseline**（相对边框盒顶，run 叶无边框/
+    /// 内边距即行顶），使 flex/grid 的 baseline 对齐生效。run 叶无 margin/
+    /// padding/border 与尺寸样式，尺寸即测量结果（min/max 收束不适用）。
     pub(crate) fn measure(&self, input: LayoutInput) -> LayoutOutput {
-        compute_leaf_layout(
-            input,
-            &run_leaf_style(),
-            |_, _| 0.0,
-            |known, available| {
-                let break_width = known
-                    .width
-                    .or_else(|| available.width.into_option())
-                    .unwrap_or(match available.width {
-                        AvailableSpace::MinContent => 0.0,
-                        _ => f32::INFINITY,
-                    });
-                let lines = self.lines_at(break_width);
-                let content_width = match available.width {
-                    AvailableSpace::Definite(width) => width,
-                    // 不折行：行内项总宽（缓存行恰为单行）
-                    AvailableSpace::MaxContent => {
-                        lines.last().map(crate::inline::line_width).unwrap_or(0.0)
-                    }
-                    // 最长不可拆项
-                    AvailableSpace::MinContent => lines
-                        .iter()
-                        .map(crate::inline::line_width)
-                        .fold(0.0, f32::max),
-                };
-                TaffySize {
-                    width: known.width.unwrap_or(content_width),
-                    height: lines.iter().map(|line| line.height).sum(),
-                }
+        if input.run_mode == RunMode::PerformHiddenLayout {
+            return LayoutOutput::HIDDEN;
+        }
+        let known = input.known_dimensions;
+        let available = input.available_space;
+        let break_width = known
+            .width
+            .or_else(|| available.width.into_option())
+            .unwrap_or(match available.width {
+                AvailableSpace::MinContent => 0.0,
+                _ => f32::INFINITY,
+            });
+        let lines = self.lines_at(break_width);
+        let content_width = match available.width {
+            AvailableSpace::Definite(width) => width,
+            // 不折行：行内项总宽（缓存行恰为单行）
+            AvailableSpace::MaxContent => {
+                lines.last().map(crate::inline::line_width).unwrap_or(0.0)
+            }
+            // 最长不可拆项
+            AvailableSpace::MinContent => lines
+                .iter()
+                .map(crate::inline::line_width)
+                .fold(0.0, f32::max),
+        };
+        let size = TaffySize {
+            width: known.width.unwrap_or(content_width),
+            height: known
+                .height
+                .unwrap_or_else(|| lines.iter().map(|line| line.height).sum()),
+        };
+        LayoutOutput {
+            size,
+            scrollable_overflow_rect: taffy::geometry::Rect {
+                left: 0.0,
+                top: 0.0,
+                right: size.width,
+                bottom: size.height,
             },
-        )
+            // 首行基线（多行叶只报首行，baseline 组语义为偏差记录）
+            baselines: taffy::tree::Baselines {
+                first: lines.first().map(|line| line.baseline),
+                last: None,
+            },
+            top_margin: taffy::tree::CollapsibleMarginSet::ZERO,
+            bottom_margin: taffy::tree::CollapsibleMarginSet::ZERO,
+            // 与 compute_leaf_layout 同语义：仅实测高度为 0 的 run 叶可被
+            // margin 穿透（taffy block 布局对可穿透项不推进 y）
+            margins_can_collapse_through: size.height == 0.0,
+        }
     }
 }
 

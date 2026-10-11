@@ -968,3 +968,47 @@ fn text_align_applies_to_anonymous_blocks() {
         "匿名块内的行同样居中"
     );
 }
+
+// ---- flex baseline 对齐（taffy run 叶上报首行 baseline） ----
+
+#[test]
+fn flex_baseline_aligns_first_line_baselines() {
+    // run 叶向 taffy 上报首行基线后，align-items: baseline 应让两个不同
+    // 字号 item 的首行基线落在同一水平线（退化行为是顶对齐，基线错位）
+    let (document, root) = layout(
+        "<div style=\"display: flex; align-items: baseline\">\
+         <span style=\"font-size: 24px\">big</span>\
+         <span style=\"font-size: 14px\">small</span></div>",
+        "",
+        800.0,
+    );
+    let flex = find(&document, &root, "div").expect("flex container");
+    assert_eq!(flex.children.len(), 2, "两个 span 各成一个 item");
+    let baseline_of = |item: &Fragment| {
+        let line = item.lines.first().expect("item has a line");
+        item.border_box.y + line.baseline
+    };
+    let big = baseline_of(&flex.children[0]);
+    let small = baseline_of(&flex.children[1]);
+    assert!(approx(big, small), "首行基线对齐：big={big}, small={small}");
+    // 且确实发生了基线对齐而非顶对齐：小字号 item 必须被下移
+    assert!(
+        flex.children[1].border_box.y > 0.5,
+        "小字号 item 相对容器顶下移（baseline 对齐生效）"
+    );
+}
+
+#[test]
+fn flex_baseline_without_text_still_lays_out() {
+    // 无文本 item（空 span + 有文本 span）：无 baseline 的一侧不 panic，
+    // 退化为各自静态位置
+    let (document, root) = layout(
+        "<div style=\"display: flex; align-items: baseline\">\
+         <span></span><span>text</span></div>",
+        "",
+        800.0,
+    );
+    let flex = find(&document, &root, "div").expect("flex container");
+    assert_eq!(flex.children.len(), 2);
+    assert!(flex.children[0].border_box.y >= 0.0);
+}
