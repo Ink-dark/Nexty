@@ -72,7 +72,8 @@ jobs:
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxrandr-dev libdbus-1-dev libdrm-dev libgbm-dev \
             libegl1-mesa-dev libgles2-mesa-dev libfontconfig1-dev \
-            vulkan-tools libvulkan-dev
+            vulkan-tools libvulkan-dev \
+            fonts-noto-cjk
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace

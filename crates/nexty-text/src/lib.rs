@@ -612,7 +612,13 @@ mod tests {
     #[test]
     fn cjk_text_shapes_without_notdef_glyphs() {
         // fontique 回退应把缺字码点交给系统 CJK 字体（Windows YaHei 等），
-        // 不得产出 .notdef（字形 id 0）豆腐块
+        // 不得产出 .notdef（字形 id 0）豆腐块。
+        // 环境门：系统没有任何 Hani 回退字体时（部分 CI runner 未装 CJK
+        // 字体），notdef 是唯一合法产出，跳过断言（见 system_has_cjk_fallback）。
+        if !system_has_cjk_fallback() {
+            eprintln!("skipping notdef assertion: no CJK fallback font on this system");
+            return;
+        }
         let shaper = shaper();
         let shaped = shaper
             .shape("中文测试", &style(&["sans-serif"], 16.0))
@@ -630,15 +636,35 @@ mod tests {
         );
     }
 
+    /// 系统是否有 CJK（Hani 脚本）回退字体。
+    ///
+    /// 与被测管线无关的独立探测：直接向 fontique 的系统回退查询要 Hani
+    /// 脚本的回退族（不走 TextShaper 的整形路径）。CI runner（无 CJK 字体
+    /// 的 Windows Server / 未装 fonts-noto-cjk 的 Ubuntu）探测为空时，
+    /// notdef 是缺字码点的唯一合法产出，notdef 断言按环境跳过；
+    /// 跳过不算通过验证，实机（有 CJK 字体）上该断言始终生效。
+    fn system_has_cjk_fallback() -> bool {
+        let mut context = parley::FontContext::new();
+        let parley::FontContext { collection, .. } = &mut context;
+        collection
+            .fallback_families(parley::fontique::FallbackKey::new(
+                parley::fontique::Script::from_str_unchecked("Hani"),
+                None,
+            ))
+            .next()
+            .is_some()
+    }
+
     #[test]
     fn mixed_script_text_keeps_valid_font_indices() {
+        // 与被测管线无关的属性（字形-字体归属一致性）无条件断言；
+        // notdef 断言仅在有 CJK 字体的系统上生效（环境门见上一个测试）
+        let gate = system_has_cjk_fallback();
         let shaper = shaper();
         let shaped = shaper
             .shape("Ab中cd", &style(&["sans-serif"], 16.0))
             .expect("mixed-script shaping");
         assert_eq!(shaped.glyphs.len(), 5, "每个字符一个字形");
-        let notdef = shaped.glyphs.iter().filter(|glyph| glyph.id == 0).count();
-        assert_eq!(notdef, 0, "混排文本不得有 notdef");
         assert!(
             shaped
                 .glyphs
@@ -646,5 +672,9 @@ mod tests {
                 .all(|glyph| (glyph.font as usize) < shaped.fonts.len()),
             "font 下标均在字体表内"
         );
+        if gate {
+            let notdef = shaped.glyphs.iter().filter(|glyph| glyph.id == 0).count();
+            assert_eq!(notdef, 0, "混排文本不得有 notdef");
+        }
     }
 }
