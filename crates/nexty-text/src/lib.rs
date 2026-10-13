@@ -613,15 +613,17 @@ mod tests {
     fn cjk_text_shapes_without_notdef_glyphs() {
         // fontique 回退应把缺字码点交给系统 CJK 字体（Windows YaHei 等），
         // 不得产出 .notdef（字形 id 0）豆腐块。
-        // 环境门：系统没有任何 Hani 回退字体时（部分 CI runner 未装 CJK
-        // 字体），notdef 是唯一合法产出，跳过断言（见 system_has_cjk_fallback）。
-        if !system_has_cjk_fallback() {
-            eprintln!("skipping notdef assertion: no CJK fallback font on this system");
+        // 环境门：系统字体对有任一测试字符无覆盖时（部分 CI runner 未装
+        // 完整 CJK 字体），notdef 是唯一合法产出，跳过断言——覆盖按
+        // cmap 逐字符独立核查（见 system_covers_cjk_probe），不走被测管线。
+        let probe = "中文测试";
+        if !system_covers_text(probe) {
+            eprintln!("skipping notdef assertion: system fonts do not cover {probe:?}");
             return;
         }
         let shaper = shaper();
         let shaped = shaper
-            .shape("中文测试", &style(&["sans-serif"], 16.0))
+            .shape(probe, &style(&["sans-serif"], 16.0))
             .expect("CJK shaping");
         assert!(!shaped.glyphs.is_empty());
         assert!(!shaped.fonts.is_empty(), "字体表非空");
@@ -636,33 +638,55 @@ mod tests {
         );
     }
 
-    /// 系统是否有 CJK（Hani 脚本）回退字体。
+    /// 系统字体（sans-serif 链 + Hani 脚本回退）是否覆盖 `text` 全部字符。
     ///
-    /// 与被测管线无关的独立探测：直接向 fontique 的系统回退查询要 Hani
-    /// 脚本的回退族（不走 TextShaper 的整形路径）。CI runner（无 CJK 字体
-    /// 的 Windows Server / 未装 fonts-noto-cjk 的 Ubuntu）探测为空时，
-    /// notdef 是缺字码点的唯一合法产出，notdef 断言按环境跳过；
-    /// 跳过不算通过验证，实机（有 CJK 字体）上该断言始终生效。
-    fn system_has_cjk_fallback() -> bool {
+    /// 与被测管线无关的独立核查：直接向 fontique 查询字体族与回退族，
+    /// 逐字符查 cmap（`QueryFont::charmap`）确认存在覆盖。任一字符无字体
+    /// 覆盖时返回 false——此时整形产出 notdef 是环境的唯一合法行为
+    /// （无 CJK 字体的 CI runner），notdef 断言按环境跳过；跳过不算通过
+    /// 验证，有覆盖的系统（开发机 / 装了字体的 CI）上断言始终生效。
+    fn system_covers_text(text: &str) -> bool {
         let mut context = parley::FontContext::new();
-        let parley::FontContext { collection, .. } = &mut context;
-        collection
-            .fallback_families(parley::fontique::FallbackKey::new(
-                parley::fontique::Script::from_str_unchecked("Hani"),
-                None,
-            ))
-            .next()
-            .is_some()
+        let parley::FontContext {
+            collection,
+            source_cache,
+        } = &mut context;
+        let mut query = collection.query(source_cache);
+        query.set_families([parley::fontique::QueryFamily::Generic(
+            parley::GenericFamily::SansSerif,
+        )]);
+        query.set_fallbacks(parley::fontique::FallbackKey::new(
+            parley::fontique::Script::from_str_unchecked("Hani"),
+            None,
+        ));
+        // 逐个字符收集「已覆盖」标记，任一字体命中即算覆盖
+        let mut covered = vec![false; text.chars().count()];
+        query.matches_with(|font| {
+            if let Some(charmap) = font.charmap() {
+                for (index, character) in text.chars().enumerate() {
+                    if !covered[index] && charmap.map(character).is_some() {
+                        covered[index] = true;
+                    }
+                }
+            }
+            if covered.iter().all(|flag| *flag) {
+                parley::fontique::QueryStatus::Stop
+            } else {
+                parley::fontique::QueryStatus::Continue
+            }
+        });
+        covered.iter().all(|flag| *flag)
     }
 
     #[test]
     fn mixed_script_text_keeps_valid_font_indices() {
         // 与被测管线无关的属性（字形-字体归属一致性）无条件断言；
-        // notdef 断言仅在有 CJK 字体的系统上生效（环境门见上一个测试）
-        let gate = system_has_cjk_fallback();
+        // notdef 断言仅在有覆盖的系统上生效（环境门见上一个测试）
+        let probe = "Ab中cd";
+        let gate = system_covers_text(probe);
         let shaper = shaper();
         let shaped = shaper
-            .shape("Ab中cd", &style(&["sans-serif"], 16.0))
+            .shape(probe, &style(&["sans-serif"], 16.0))
             .expect("mixed-script shaping");
         assert_eq!(shaped.glyphs.len(), 5, "每个字符一个字形");
         assert!(
