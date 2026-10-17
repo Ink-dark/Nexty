@@ -1,7 +1,7 @@
 [package]
 name = "nexty-layout"
 description = "Nexty 自研盒级布局"
-version = "0.1.14"
+version = "0.1.15"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -45,6 +45,13 @@ nexty-text = { path = "../nexty-text", version = "0.1.0" }
 # taffy 接管盒级几何（block/flex/grid/absolute）；inline 与 table 仍自研。
 # 选型与边界见 docs/decisions/2026-10-01-crate-selection.md 修正记录。
 taffy = "0.14"
+# 断行是布局层职责（text 层保持纯整形）：UAX#29 扩展字形簇边界
+# （cluster 不得跨字形簇切分；UAX#14 规则自研，见 src/inline.rs）。
+unicode-segmentation = "1.13.3"
 
 [dev-dependencies]
 nexty-html = { path = "../nexty-html", version = "0.1.0" }
+# 仅测试用 oracle：harfrust 独立整形出 glyph cluster（UAX#14 断行与 cluster
+# 覆盖断言）。生产整形仍在 nexty-text（parley/harfrust）。
+# 不选 rustybuzz：RUSTSEC-2026-0206 已标记其无人维护，官方替代即 harfrust。
+harfrust = "0.12.0"

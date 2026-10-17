@@ -5,7 +5,10 @@
 //! （行高与 strut）、[CSS Text §3](https://drafts.csswg.org/css-text-3/#white-space-processing)
 //! （空白折叠）与 [§7](https://drafts.csswg.org/css-text-3/#line-breaking)（断行）。
 //!
-//! 已知偏差：断行只在 ASCII 空白处（无 UAX#14 完整断点，CJK 不折行）；
+//! 已知偏差：行内贪心断行（`build_lines`）仍按 ASCII 空白切词；UAX#14
+//! 断点、glyph cluster 映射与 min-content 由文件末尾的 conformance API
+//! （`break_opportunities` / `cluster_map` / `min_content_width` /
+//! `split_spans`）提供，尚未接入 `build_lines`。
 //! `vertical-align` 仅 baseline（原子盒/图片底边对齐基线）。
 //!
 //! feature `block` 关闭时本模块无消费方（行内流的唯一下游是 taffy 管线），
@@ -431,6 +434,7 @@ pub(crate) fn build_lines(
                             y: glyph.y,
                             advance: glyph.advance,
                             font: glyph.font,
+                            cluster: glyph.cluster,
                         })
                         .collect();
                     match runs.last_mut() {
@@ -597,3 +601,1149 @@ pub(crate) fn line_width(line: &LineFragment) -> f32 {
     }
     width
 }
+
+// ---------------------------------------------------------------------------
+// UAX#14 断行机会 / cluster 映射 / min-content（tests/inline_conformance.rs）
+// ---------------------------------------------------------------------------
+
+/// 断行一致性 API。
+///
+/// 这里自研 UAX#14 规则引擎而不是继续使用 `unicode-linebreak`：后者 0.1.5
+/// 的 Unicode 数据停在 15.0，对 Unicode 18.0.0 官方语料会有 1,117 条差异
+/// （HH 类、AK/AP/AS/VF/VI、LB12a/LB15c/LB15d/LB19a/LB25/LB28a 等新规则）。
+/// 规则与类数据以 Unicode 18.0.0 的 UAX #14 与 UCD 数据文件为准，
+/// 数据来源见 `src/data/README.md`。
+#[cfg(feature = "inline")]
+mod conformance {
+    use std::collections::BTreeSet;
+    use std::sync::OnceLock;
+
+    use nexty_text::ShapedText;
+    use unicode_segmentation::UnicodeSegmentation;
+
+    /// 源文本中的一段字节区间。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Span {
+        /// 起始字节偏移（含）。
+        pub byte_start: usize,
+        /// 结束字节偏移（不含）。
+        pub byte_end: usize,
+    }
+
+    /// CSS `word-break`（CSS Text 3 §5.1）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum WordBreak {
+        /// 按 UAX#14 的常规断点。
+        #[default]
+        Normal,
+        /// 允许在单词内部断行（但不切开字形簇）。
+        BreakAll,
+        /// 禁止在单词内部断行。
+        KeepAll,
+    }
+
+    /// CSS `overflow-wrap`（CSS Text 3 §5.4）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum OverflowWrap {
+        /// 只在 UAX#14 允许的位置断行。
+        #[default]
+        Normal,
+        /// 溢出时可在任意字形簇之间断行；不参与 min-content。
+        BreakWord,
+        /// 溢出时可在任意字形簇之间断行；参与 min-content。
+        Anywhere,
+    }
+
+    /// 断行选项。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct BreakOptions {
+        /// CSS `word-break`。
+        pub word_break: WordBreak,
+        /// CSS `overflow-wrap`。
+        pub overflow_wrap: OverflowWrap,
+    }
+
+    // -----------------------------------------------------------------------
+    // 数据表（Unicode 18.0.0）
+    // -----------------------------------------------------------------------
+
+    const LIMIT: usize = 0x11_0000;
+
+    const LINE_BREAK_DATA: &str = include_str!("data/DerivedLineBreak-18.0.0.txt");
+    const EAST_ASIAN_DATA: &str = include_str!("data/EastAsianWidth-18.0.0.txt");
+    const PI_PF_DATA: &str = include_str!("data/PiPf-18.0.0.txt");
+    const COMBINING_DATA: &str = include_str!("data/Combining-18.0.0.txt");
+    const EXT_PICT_DATA: &str = include_str!("data/ExtPict-18.0.0.txt");
+    const UNASSIGNED_DATA: &str = include_str!("data/Unassigned-18.0.0.txt");
+
+    /// UAX#14 的 Line_Break 类（Unicode 18.0.0，含 AK/AP/AS/VF/VI/HH）。
+    #[allow(clippy::upper_case_acronyms)] // 类名沿用 UAX#14 的缩写（ZWJ/BK/...）
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum LineBreakClass {
+        BK,
+        CR,
+        LF,
+        CM,
+        NL,
+        SG,
+        WJ,
+        ZW,
+        GL,
+        SP,
+        ZWJ,
+        B2,
+        BA,
+        BB,
+        HY,
+        CB,
+        CL,
+        CP,
+        EX,
+        IN,
+        NS,
+        OP,
+        QU,
+        IS,
+        NU,
+        PO,
+        PR,
+        SY,
+        AI,
+        AL,
+        CJ,
+        EB,
+        EM,
+        H2,
+        H3,
+        HL,
+        ID,
+        JL,
+        JV,
+        JT,
+        RI,
+        SA,
+        XX,
+        AK,
+        AP,
+        AS,
+        VF,
+        VI,
+        HH,
+    }
+
+    impl LineBreakClass {
+        fn from_name(name: &str) -> Option<Self> {
+            Some(match name {
+                "BK" => Self::BK,
+                "CR" => Self::CR,
+                "LF" => Self::LF,
+                "CM" => Self::CM,
+                "NL" => Self::NL,
+                "SG" => Self::SG,
+                "WJ" => Self::WJ,
+                "ZW" => Self::ZW,
+                "GL" => Self::GL,
+                "SP" => Self::SP,
+                "ZWJ" => Self::ZWJ,
+                "B2" => Self::B2,
+                "BA" => Self::BA,
+                "BB" => Self::BB,
+                "HY" => Self::HY,
+                "CB" => Self::CB,
+                "CL" => Self::CL,
+                "CP" => Self::CP,
+                "EX" => Self::EX,
+                "IN" => Self::IN,
+                "NS" => Self::NS,
+                "OP" => Self::OP,
+                "QU" => Self::QU,
+                "IS" => Self::IS,
+                "NU" => Self::NU,
+                "PO" => Self::PO,
+                "PR" => Self::PR,
+                "SY" => Self::SY,
+                "AI" => Self::AI,
+                "AL" => Self::AL,
+                "CJ" => Self::CJ,
+                "EB" => Self::EB,
+                "EM" => Self::EM,
+                "H2" => Self::H2,
+                "H3" => Self::H3,
+                "HL" => Self::HL,
+                "ID" => Self::ID,
+                "JL" => Self::JL,
+                "JV" => Self::JV,
+                "JT" => Self::JT,
+                "RI" => Self::RI,
+                "SA" => Self::SA,
+                "XX" => Self::XX,
+                "AK" => Self::AK,
+                "AP" => Self::AP,
+                "AS" => Self::AS,
+                "VF" => Self::VF,
+                "VI" => Self::VI,
+                "HH" => Self::HH,
+                _ => return None,
+            })
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum QuoteKind {
+        None,
+        Pi,
+        Pf,
+    }
+
+    struct RangeTable {
+        ranges: Vec<(u32, u32, LineBreakClass)>,
+        default: LineBreakClass,
+    }
+
+    impl RangeTable {
+        fn get(&self, codepoint: u32) -> LineBreakClass {
+            let index = self
+                .ranges
+                .partition_point(|&(start, _, _)| start <= codepoint);
+            if index > 0 {
+                let (_, end, class) = self.ranges[index - 1];
+                if codepoint <= end {
+                    return class;
+                }
+            }
+            self.default
+        }
+    }
+
+    #[derive(Default)]
+    struct BoolRanges {
+        ranges: Vec<(u32, u32)>,
+    }
+
+    impl BoolRanges {
+        fn new(mut ranges: Vec<(u32, u32)>) -> Self {
+            ranges.sort_unstable();
+            let mut merged: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+            for (start, end) in ranges {
+                if let Some(last) = merged.last_mut()
+                    && start <= last.1.saturating_add(1)
+                {
+                    last.1 = last.1.max(end);
+                } else {
+                    merged.push((start, end));
+                }
+            }
+            Self { ranges: merged }
+        }
+
+        fn contains(&self, codepoint: u32) -> bool {
+            let index = self
+                .ranges
+                .partition_point(|&(start, _)| start <= codepoint);
+            index > 0 && codepoint <= self.ranges[index - 1].1
+        }
+    }
+
+    struct Tables {
+        line_break: RangeTable,
+        east_asian: BoolRanges,
+        pi: BoolRanges,
+        pf: BoolRanges,
+        combining: BoolRanges,
+        extended_pictographic: BoolRanges,
+        unassigned: BoolRanges,
+    }
+
+    static TABLES: OnceLock<Tables> = OnceLock::new();
+
+    fn tables() -> &'static Tables {
+        TABLES.get_or_init(parse_tables)
+    }
+
+    fn parse_tables() -> Tables {
+        assert!(
+            LINE_BREAK_DATA.contains("18.0.0")
+                && EAST_ASIAN_DATA.contains("18.0.0")
+                && COMBINING_DATA.contains("18.0.0")
+                && EXT_PICT_DATA.contains("18.0.0")
+                && UNASSIGNED_DATA.contains("18.0.0"),
+            "line-break data files must stay pinned to Unicode 18.0.0"
+        );
+        let (pi, pf) = parse_pi_pf();
+        Tables {
+            line_break: parse_line_break(),
+            east_asian: parse_east_asian(),
+            pi,
+            pf,
+            combining: parse_bool_property(COMBINING_DATA),
+            extended_pictographic: parse_bool_property(EXT_PICT_DATA),
+            unassigned: parse_bool_property(UNASSIGNED_DATA),
+        }
+    }
+
+    /// 解析只含单一布尔属性的 `range ; Name` 数据文件（所有行都入表）。
+    fn parse_bool_property(data: &str) -> BoolRanges {
+        let ranges = data
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(parse_property_line)
+            .map(|(range, _)| range)
+            .collect();
+        BoolRanges::new(ranges)
+    }
+
+    fn parse_line_break() -> RangeTable {
+        let mut dense = vec![LineBreakClass::XX; LIMIT];
+        // @missing 提供未列出码点的默认类（XX/ID/PR）。先铺默认值，
+        // 再用显式数据行覆盖。
+        for line in LINE_BREAK_DATA.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("# @missing:") else {
+                continue;
+            };
+            let Some((range, name)) = parse_property_line(rest) else {
+                continue;
+            };
+            if let Some(class) = missing_class(name) {
+                fill_line_break(&mut dense, range, class);
+            }
+        }
+        for line in LINE_BREAK_DATA.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((range, name)) = parse_property_line(line) else {
+                continue;
+            };
+            let class = LineBreakClass::from_name(name)
+                .unwrap_or_else(|| panic!("unknown Line_Break class {name:?}"));
+            fill_line_break(&mut dense, range, class);
+        }
+        RangeTable {
+            ranges: compress_line_break(&dense),
+            default: LineBreakClass::XX,
+        }
+    }
+
+    fn parse_east_asian() -> BoolRanges {
+        let mut dense = vec![false; LIMIT];
+        for line in EAST_ASIAN_DATA.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("# @missing:") else {
+                continue;
+            };
+            let Some((range, name)) = parse_property_line(rest) else {
+                continue;
+            };
+            fill_bool(&mut dense, range, is_east_asian(name));
+        }
+        for line in EAST_ASIAN_DATA.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((range, name)) = parse_property_line(line) else {
+                continue;
+            };
+            fill_bool(&mut dense, range, is_east_asian(name));
+        }
+        BoolRanges::new(compress_bool(&dense))
+    }
+
+    fn parse_pi_pf() -> (BoolRanges, BoolRanges) {
+        let mut pi = Vec::new();
+        let mut pf = Vec::new();
+        for line in PI_PF_DATA.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((range, name)) = parse_property_line(line) else {
+                continue;
+            };
+            match name {
+                "Pi" => pi.push(range),
+                "Pf" => pf.push(range),
+                _ => {}
+            }
+        }
+        (BoolRanges::new(pi), BoolRanges::new(pf))
+    }
+
+    fn parse_property_line(text: &str) -> Option<((u32, u32), &str)> {
+        let (range_part, rest) = text.split_once(';')?;
+        let name = rest.split('#').next()?.trim();
+        let range_part = range_part.trim();
+        let (start, end) = match range_part.split_once("..") {
+            Some((start, end)) => (
+                u32::from_str_radix(start.trim(), 16).ok()?,
+                u32::from_str_radix(end.trim(), 16).ok()?,
+            ),
+            None => {
+                let value = u32::from_str_radix(range_part, 16).ok()?;
+                (value, value)
+            }
+        };
+        Some(((start, end), name))
+    }
+
+    fn missing_class(name: &str) -> Option<LineBreakClass> {
+        Some(match name {
+            "Unknown" => LineBreakClass::XX,
+            "Prefix_Numeric" => LineBreakClass::PR,
+            "Ideographic" => LineBreakClass::ID,
+            "Alphabetic" => LineBreakClass::AL,
+            "Ambiguous" => LineBreakClass::AI,
+            "Combining_Mark" => LineBreakClass::CM,
+            "Contingent_Break" => LineBreakClass::CB,
+            "Complex_Context" => LineBreakClass::SA,
+            "Conditional_Japanese_Starter" => LineBreakClass::CJ,
+            "Exclamation" => LineBreakClass::EX,
+            "Hyphen" => LineBreakClass::HY,
+            "Infix_Separator" => LineBreakClass::IS,
+            "Numeric" => LineBreakClass::NU,
+            "Postfix_Numeric" => LineBreakClass::PO,
+            "Variation_Selector" => LineBreakClass::CM,
+            _ => return None,
+        })
+    }
+
+    fn is_east_asian(name: &str) -> bool {
+        matches!(name, "F" | "W" | "H")
+    }
+
+    fn fill_line_break(
+        dense: &mut [LineBreakClass],
+        (start, end): (u32, u32),
+        class: LineBreakClass,
+    ) {
+        let start = start as usize;
+        let end = (end as usize).min(dense.len() - 1);
+        if start <= end {
+            dense[start..=end].fill(class);
+        }
+    }
+
+    fn fill_bool(dense: &mut [bool], (start, end): (u32, u32), value: bool) {
+        let start = start as usize;
+        let end = (end as usize).min(dense.len() - 1);
+        if start <= end {
+            dense[start..=end].fill(value);
+        }
+    }
+
+    fn compress_line_break(dense: &[LineBreakClass]) -> Vec<(u32, u32, LineBreakClass)> {
+        let mut ranges = Vec::new();
+        let mut start = 0usize;
+        for index in 1..=dense.len() {
+            if index == dense.len() || dense[index] != dense[start] {
+                ranges.push((start as u32, (index - 1) as u32, dense[start]));
+                start = index;
+            }
+        }
+        ranges
+    }
+
+    fn compress_bool(dense: &[bool]) -> Vec<(u32, u32)> {
+        let mut ranges = Vec::new();
+        let mut start = 0usize;
+        for index in 1..=dense.len() {
+            if index == dense.len() || dense[index] != dense[start] {
+                if dense[start] {
+                    ranges.push((start as u32, (index - 1) as u32));
+                }
+                start = index;
+            }
+        }
+        ranges
+    }
+
+    // -----------------------------------------------------------------------
+    // 字符属性 / LB9-LB10 单元
+    // -----------------------------------------------------------------------
+
+    #[derive(Clone, Copy)]
+    struct CharProps {
+        class: LineBreakClass,
+        east_asian: bool,
+        quote: QuoteKind,
+        dotted_circle: bool,
+        /// LB9：该字符并入前一个 unit（CM/ZWJ，或 SA 类中的组合符）。
+        /// VF/VI 等有独立断行类的组合符**不**并入（它们参与 LB28a）。
+        lb9_joins_previous: bool,
+        /// LB30b 的“potential emoji”：未分配的 Extended_Pictographic。
+        potential_emoji: bool,
+    }
+
+    fn char_props(tables: &Tables, character: char) -> CharProps {
+        let codepoint = character as u32;
+        let raw = tables.line_break.get(codepoint);
+        let quote = if raw == LineBreakClass::QU {
+            if tables.pi.contains(codepoint) {
+                QuoteKind::Pi
+            } else if tables.pf.contains(codepoint) {
+                QuoteKind::Pf
+            } else {
+                QuoteKind::None
+            }
+        } else {
+            QuoteKind::None
+        };
+        // LB1 默认解析：AI/SA/SG/XX → AL，CJ → NS；CB 保持未解析（LB20）。
+        let class = match raw {
+            LineBreakClass::AI | LineBreakClass::SA | LineBreakClass::SG | LineBreakClass::XX => {
+                LineBreakClass::AL
+            }
+            LineBreakClass::CJ => LineBreakClass::NS,
+            other => other,
+        };
+        CharProps {
+            class,
+            east_asian: tables.east_asian.contains(codepoint),
+            quote,
+            dotted_circle: codepoint == 0x25CC,
+            // LB9 的“组合字符序列”：CM/ZWJ 按 Line_Break 类并入；SA 类里的
+            // 泰文/缅甸文组合符（如 U+0E31 SA_Mn）也要按 GC=Mark 并入。
+            // VF/VI 之类有独立断行类的组合符不并入，否则 LB28a 会失效。
+            lb9_joins_previous: raw == LineBreakClass::CM
+                || (raw == LineBreakClass::SA && tables.combining.contains(codepoint)),
+            // 已分配的 ExtPict（如 U+2757）不是 LB30b 的 emoji base；只有
+            // 未分配的 ExtPictUnassigned 才算“potential emoji”。
+            potential_emoji: tables.extended_pictographic.contains(codepoint)
+                && tables.unassigned.contains(codepoint),
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct Unit {
+        start: usize,
+        end: usize,
+        class: LineBreakClass,
+        east_asian: bool,
+        quote: QuoteKind,
+        dotted_circle: bool,
+        potential_emoji: bool,
+        /// LB8a：unit 的最后一个字符是 ZWJ。
+        no_break_after: bool,
+    }
+
+    fn build_units(text: &str) -> Vec<Unit> {
+        let tables = tables();
+        let mut units: Vec<Unit> = Vec::new();
+        for (offset, character) in text.char_indices() {
+            let props = char_props(tables, character);
+            let end = offset + character.len_utf8();
+            if props.lb9_joins_previous || props.class == LineBreakClass::ZWJ {
+                if let Some(unit) = units.last_mut()
+                    && !matches!(
+                        unit.class,
+                        LineBreakClass::BK
+                            | LineBreakClass::CR
+                            | LineBreakClass::LF
+                            | LineBreakClass::NL
+                            | LineBreakClass::SP
+                            | LineBreakClass::ZW
+                    )
+                {
+                    // LB9：X (CM|ZWJ)* 视为 X；只更新 unit 末尾与 LB8a 标记。
+                    unit.end = end;
+                    unit.no_break_after = props.class == LineBreakClass::ZWJ;
+                    continue;
+                }
+                // LB10：孤立的 CM/ZWJ 按 AL 处理。
+                units.push(Unit {
+                    start: offset,
+                    end,
+                    class: LineBreakClass::AL,
+                    east_asian: props.east_asian,
+                    quote: QuoteKind::None,
+                    dotted_circle: false,
+                    potential_emoji: false,
+                    no_break_after: props.class == LineBreakClass::ZWJ,
+                });
+                continue;
+            }
+            units.push(Unit {
+                start: offset,
+                end,
+                class: props.class,
+                east_asian: props.east_asian,
+                quote: props.quote,
+                dotted_circle: props.dotted_circle,
+                potential_emoji: props.potential_emoji,
+                no_break_after: false,
+            });
+        }
+        units
+    }
+
+    // -----------------------------------------------------------------------
+    // UAX#14 规则（Unicode 18.0.0，TR14 §6）
+    // -----------------------------------------------------------------------
+
+    fn last_non_sp(units: &[Unit], mut index: usize) -> Option<usize> {
+        loop {
+            if units[index].class != LineBreakClass::SP {
+                return Some(index);
+            }
+            if index == 0 {
+                return None;
+            }
+            index -= 1;
+        }
+    }
+
+    /// 从边界的左侧匹配 `NU (SY|IS)* (CL|CP)?`。
+    fn numeric_before(units: &[Unit], index: usize) -> bool {
+        let mut cursor = index as isize;
+        if cursor >= 0
+            && matches!(
+                units[cursor as usize].class,
+                LineBreakClass::CL | LineBreakClass::CP
+            )
+        {
+            cursor -= 1;
+        }
+        while cursor >= 0
+            && matches!(
+                units[cursor as usize].class,
+                LineBreakClass::SY | LineBreakClass::IS
+            )
+        {
+            cursor -= 1;
+        }
+        cursor >= 0 && units[cursor as usize].class == LineBreakClass::NU
+    }
+
+    fn uax14_break_between(units: &[Unit], index: usize) -> bool {
+        use LineBreakClass::*;
+
+        let previous = units[index];
+        let next = units[index + 1];
+
+        // LB4 / LB5 / LB6 / LB7 / LB8 / LB8a
+        if previous.class == BK {
+            return true;
+        }
+        if previous.class == CR && next.class == LF {
+            return false;
+        }
+        if matches!(previous.class, CR | LF | NL) {
+            return true;
+        }
+        if matches!(next.class, BK | CR | LF | NL) {
+            return false;
+        }
+        if matches!(next.class, SP | ZW) {
+            return false;
+        }
+        if let Some(last) = last_non_sp(units, index)
+            && units[last].class == ZW
+        {
+            return true;
+        }
+        if previous.no_break_after {
+            return false;
+        }
+
+        // LB11 / LB12 / LB12a
+        if next.class == WJ || previous.class == WJ {
+            return false;
+        }
+        if previous.class == GL {
+            return false;
+        }
+        if next.class == GL && !matches!(previous.class, SP | HY | HH) {
+            return false;
+        }
+
+        // LB14（OP SP* ×）与 LB15a/b 先判；LB15c 是允许断行的例外，必须在
+        // LB13 之前判，否则 LB13 的 × IS 会把它吃掉。
+        if let Some(last) = last_non_sp(units, index)
+            && units[last].class == OP
+        {
+            return false;
+        }
+        if let Some(last) = last_non_sp(units, index)
+            && units[last].quote == QuoteKind::Pi
+        {
+            let qualifies = last == 0
+                || matches!(
+                    units[last - 1].class,
+                    BK | CR | LF | NL | OP | QU | GL | SP | ZW
+                );
+            if qualifies {
+                return false;
+            }
+        }
+        if next.quote == QuoteKind::Pf {
+            let after = units.get(index + 2).map(|unit| unit.class);
+            let prohibited = match after {
+                None => true,
+                Some(class) => matches!(
+                    class,
+                    SP | GL | WJ | CL | QU | CP | EX | IS | SY | BK | CR | LF | NL | ZW
+                ),
+            };
+            if prohibited {
+                return false;
+            }
+        }
+        // LB15c：SP ÷ IS NU（覆盖 LB13/LB15d 的禁止）。
+        if previous.class == SP
+            && next.class == IS
+            && units.get(index + 2).is_some_and(|unit| unit.class == NU)
+        {
+            return true;
+        }
+
+        // LB13
+        if matches!(next.class, CL | CP | EX | SY) {
+            return false;
+        }
+        // LB15d
+        if next.class == IS {
+            return false;
+        }
+        // LB16
+        if next.class == NS
+            && let Some(last) = last_non_sp(units, index)
+            && matches!(units[last].class, CL | CP)
+        {
+            return false;
+        }
+        // LB17
+        if next.class == B2
+            && let Some(last) = last_non_sp(units, index)
+            && units[last].class == B2
+        {
+            return false;
+        }
+        // LB18
+        if previous.class == SP {
+            return true;
+        }
+
+        // LB19
+        if next.class == QU && next.quote != QuoteKind::Pi {
+            return false;
+        }
+        if previous.class == QU && previous.quote != QuoteKind::Pf {
+            return false;
+        }
+        // LB19a
+        if next.class == QU && !previous.east_asian {
+            return false;
+        }
+        if next.class == QU {
+            let after_non_east_asian = units.get(index + 2).is_none_or(|unit| !unit.east_asian);
+            if after_non_east_asian {
+                return false;
+            }
+        }
+        if previous.class == QU && !next.east_asian {
+            return false;
+        }
+        if previous.class == QU {
+            let before_non_east_asian = index == 0 || !units[index - 1].east_asian;
+            if before_non_east_asian {
+                return false;
+            }
+        }
+
+        // LB20
+        if next.class == CB || previous.class == CB {
+            return true;
+        }
+        // LB20a
+        if matches!(previous.class, HY | HH) && matches!(next.class, AL | HL) {
+            let word_initial = index == 0
+                || matches!(
+                    units[index - 1].class,
+                    BK | CR | LF | NL | SP | ZW | CB | GL
+                );
+            if word_initial {
+                return false;
+            }
+        }
+        // LB21
+        if matches!(next.class, BA | HH | HY | NS) || previous.class == BB {
+            return false;
+        }
+        // LB21a
+        if matches!(previous.class, HY | HH)
+            && next.class != HL
+            && index > 0
+            && units[index - 1].class == HL
+        {
+            return false;
+        }
+        // LB21b
+        if previous.class == SY && next.class == HL {
+            return false;
+        }
+        // LB22
+        if next.class == IN {
+            return false;
+        }
+        // LB23
+        if matches!(previous.class, AL | HL) && next.class == NU {
+            return false;
+        }
+        if previous.class == NU && matches!(next.class, AL | HL) {
+            return false;
+        }
+        // LB23a
+        if previous.class == PR && matches!(next.class, ID | EB | EM) {
+            return false;
+        }
+        if matches!(previous.class, ID | EB | EM) && next.class == PO {
+            return false;
+        }
+        // LB24
+        if matches!(previous.class, PR | PO) && matches!(next.class, AL | HL) {
+            return false;
+        }
+        if matches!(previous.class, AL | HL) && matches!(next.class, PR | PO) {
+            return false;
+        }
+        // LB25
+        if matches!(next.class, PO | PR) && numeric_before(units, index) {
+            return false;
+        }
+        if previous.class == PO || previous.class == PR {
+            if next.class == NU {
+                return false;
+            }
+            if next.class == OP {
+                let after_op = units.get(index + 2).map(|unit| unit.class);
+                if after_op == Some(NU) {
+                    return false;
+                }
+                if after_op == Some(IS) && units.get(index + 3).is_some_and(|unit| unit.class == NU)
+                {
+                    return false;
+                }
+            }
+        }
+        if matches!(previous.class, HY | IS) && next.class == NU {
+            return false;
+        }
+        if next.class == NU
+            && matches!(previous.class, NU | SY | IS)
+            && numeric_before(units, index)
+        {
+            return false;
+        }
+        // LB26
+        if previous.class == JL && matches!(next.class, JL | JV | H2 | H3) {
+            return false;
+        }
+        if matches!(previous.class, JV | H2) && matches!(next.class, JV | JT) {
+            return false;
+        }
+        if matches!(previous.class, JT | H3) && next.class == JT {
+            return false;
+        }
+        // LB27
+        if matches!(previous.class, JL | JV | JT | H2 | H3) && next.class == PO {
+            return false;
+        }
+        if previous.class == PR && matches!(next.class, JL | JV | JT | H2 | H3) {
+            return false;
+        }
+        // LB28
+        if matches!(previous.class, AL | HL) && matches!(next.class, AL | HL) {
+            return false;
+        }
+        // LB28a
+        let previous_brahmic = matches!(previous.class, AK | AS) || previous.dotted_circle;
+        let next_brahmic = matches!(next.class, AK | AS) || next.dotted_circle;
+        if previous.class == AP && (matches!(next.class, AK | AS) || next.dotted_circle) {
+            return false;
+        }
+        if previous_brahmic && matches!(next.class, VF | VI) {
+            return false;
+        }
+        if previous.class == VI
+            && (next.class == AK || next.dotted_circle)
+            && index > 0
+            && (matches!(units[index - 1].class, AK | AS) || units[index - 1].dotted_circle)
+        {
+            return false;
+        }
+        if previous_brahmic
+            && next_brahmic
+            && units.get(index + 2).is_some_and(|unit| unit.class == VF)
+        {
+            return false;
+        }
+        // LB29
+        if previous.class == IS && matches!(next.class, AL | HL) {
+            return false;
+        }
+        // LB30
+        if matches!(previous.class, AL | HL | NU) && next.class == OP && !next.east_asian {
+            return false;
+        }
+        if previous.class == CP && !previous.east_asian && matches!(next.class, AL | HL | NU) {
+            return false;
+        }
+        // LB30a
+        if previous.class == RI && next.class == RI {
+            let mut count = 0usize;
+            let mut cursor = index as isize;
+            while cursor >= 0 && units[cursor as usize].class == RI {
+                count += 1;
+                cursor -= 1;
+            }
+            if count % 2 == 1 {
+                return false;
+            }
+        }
+        // LB30b（“emoji base (or potential emoji)”）：ID_ExtPictUnassigned
+        // 这类潜在 emoji 即使 Line_Break=ID 也要与 EM 粘连。
+        if (previous.class == EB || previous.potential_emoji) && next.class == EM {
+            return false;
+        }
+        // LB31
+        true
+    }
+
+    fn uax14_breaks(text: &str, units: &[Unit]) -> Vec<usize> {
+        if units.is_empty() {
+            return vec![0];
+        }
+        let mut breaks = Vec::new();
+        for index in 0..units.len().saturating_sub(1) {
+            if uax14_break_between(units, index) {
+                breaks.push(units[index + 1].start);
+            }
+        }
+        breaks.push(text.len());
+        breaks
+    }
+
+    // -----------------------------------------------------------------------
+    // CSS 选项（word-break / overflow-wrap）
+    // -----------------------------------------------------------------------
+
+    fn unit_boundary(units: &[Unit], offset: usize) -> Option<(usize, usize)> {
+        let next = units.partition_point(|unit| unit.start < offset);
+        if next == 0 || next >= units.len() {
+            return None;
+        }
+        if units[next].start != offset || units[next - 1].end != offset {
+            return None;
+        }
+        Some((next - 1, next))
+    }
+
+    fn add_cluster_breaks(text: &str, units: &[Unit], breaks: &mut Vec<usize>, word_only: bool) {
+        use LineBreakClass::{AL, HL, ID, NU};
+        for (offset, _) in text.grapheme_indices(true) {
+            if offset == 0 {
+                continue;
+            }
+            let Some((previous, next)) = unit_boundary(units, offset) else {
+                continue;
+            };
+            if word_only {
+                let previous = units[previous].class;
+                let next = units[next].class;
+                let word = |class| matches!(class, AL | HL | NU | ID);
+                if !(word(previous) && word(next)) {
+                    continue;
+                }
+            }
+            breaks.push(offset);
+        }
+    }
+
+    fn remove_word_internal_breaks(units: &[Unit], breaks: &mut Vec<usize>) {
+        use LineBreakClass::{AL, HL, ID, NU};
+        breaks.retain(|&offset| {
+            let Some((previous, next)) = unit_boundary(units, offset) else {
+                return true;
+            };
+            let previous = units[previous].class;
+            let next = units[next].class;
+            let word = |class| matches!(class, AL | HL | NU | ID);
+            !(word(previous) && word(next))
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // 公共 API
+    // -----------------------------------------------------------------------
+
+    /// 按 UAX#14（默认解析）返回断行机会的字节偏移，升序、去重，含
+    /// `text.len()`（LB3 的 eot 断点）。
+    ///
+    /// CSS `word-break` / `overflow-wrap` 只在此结果上增删：`break-all` 在
+    /// 相邻 typographic letter unit 之间加断点；`anywhere`/`break-word` 在
+    /// 每个字形簇边界加紧急断点（后者是否参与 min-content 由调用方决定）；
+    /// `keep-all` 移除单词内部的隐式断点。
+    #[must_use]
+    pub fn break_opportunities(text: &str, options: &BreakOptions) -> Vec<usize> {
+        let units = build_units(text);
+        let mut breaks = uax14_breaks(text, &units);
+        match options.word_break {
+            WordBreak::Normal => {}
+            WordBreak::BreakAll => add_cluster_breaks(text, &units, &mut breaks, true),
+            WordBreak::KeepAll => remove_word_internal_breaks(&units, &mut breaks),
+        }
+        if options.overflow_wrap != OverflowWrap::Normal {
+            add_cluster_breaks(text, &units, &mut breaks, false);
+        }
+        breaks.push(text.len());
+        breaks.sort_unstable();
+        breaks.dedup();
+        breaks
+    }
+
+    /// 把一次整形结果的 glyph cluster 映射为源文本字节区间。
+    ///
+    /// 边界是「UAX#29 字形簇边界」与「harfrust 实际 glyph cluster 起点」的
+    /// 并集：从不出现在字形簇内部；若整形把多个字形簇合成一个 cluster
+    /// （连字），则合并（不切开）。因此 1 char ≠ 1 cluster。
+    #[must_use]
+    pub fn cluster_map(text: &str, shaped: &ShapedText) -> Vec<Span> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let mut grapheme_starts = BTreeSet::new();
+        let mut graphemes = Vec::new();
+        for (offset, grapheme) in text.grapheme_indices(true) {
+            grapheme_starts.insert(offset);
+            graphemes.push((offset, offset + grapheme.len()));
+        }
+        grapheme_starts.insert(text.len());
+
+        let mut starts = BTreeSet::new();
+        starts.insert(0);
+        starts.insert(text.len());
+        for glyph in &shaped.glyphs {
+            let cluster = glyph.cluster as usize;
+            if cluster <= text.len() && grapheme_starts.contains(&cluster) {
+                starts.insert(cluster);
+            }
+        }
+        if shaped.glyphs.is_empty() {
+            starts.extend(grapheme_starts.iter().copied());
+        }
+
+        let starts: Vec<usize> = starts.into_iter().collect();
+        let group_of = |offset: usize| -> usize {
+            let index = starts.partition_point(|&start| start <= offset);
+            if index == 0 { 0 } else { starts[index - 1] }
+        };
+
+        let mut spans = Vec::new();
+        let mut group_start = graphemes[0].0;
+        let mut group_cluster = group_of(group_start);
+        for &(grapheme_start, _) in &graphemes[1..] {
+            let cluster = group_of(grapheme_start);
+            if cluster != group_cluster {
+                spans.push(Span {
+                    byte_start: group_start,
+                    byte_end: grapheme_start,
+                });
+                group_start = grapheme_start;
+                group_cluster = cluster;
+            }
+        }
+        spans.push(Span {
+            byte_start: group_start,
+            byte_end: text.len(),
+        });
+        spans
+    }
+
+    /// 按 min-content 语义计算最窄宽度（CSS px）。
+    ///
+    /// `overflow-wrap: break-word` 的紧急断点不计入 min-content（CSS Text 3
+    /// §5.4）；`anywhere` 与 `word-break: break-all` 的断点计入（§5.1 末段）。
+    #[must_use]
+    pub fn min_content_width(text: &str, shaped: &ShapedText, options: &BreakOptions) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        let clusters = cluster_map(text, shaped);
+        let mut widths = vec![0.0_f32; clusters.len()];
+        for glyph in &shaped.glyphs {
+            let cluster = glyph.cluster as usize;
+            if let Some(index) = clusters
+                .iter()
+                .position(|span| span.byte_start <= cluster && cluster < span.byte_end)
+            {
+                widths[index] += glyph.advance;
+            }
+        }
+
+        let effective = if options.overflow_wrap == OverflowWrap::BreakWord {
+            BreakOptions {
+                overflow_wrap: OverflowWrap::Normal,
+                ..*options
+            }
+        } else {
+            *options
+        };
+        let breaks = break_opportunities(text, &effective);
+        let mut max_width = 0.0_f32;
+        let mut start = 0usize;
+        for &offset in &breaks {
+            if offset <= start {
+                continue;
+            }
+            let width: f32 = clusters
+                .iter()
+                .zip(&widths)
+                .filter(|(span, _)| span.byte_start >= start && span.byte_start < offset)
+                .map(|(_, width)| *width)
+                .sum();
+            max_width = max_width.max(width);
+            start = offset;
+        }
+        max_width
+    }
+
+    /// 在 cluster 边界上按断行机会切分文本；输出无缝覆盖输入。
+    ///
+    /// 不是 cluster 边界的断点会被忽略（cluster 不可拆）。逐段 `&text[start..end]`
+    /// 拼回必须与输入逐字节相同。
+    #[must_use]
+    pub fn split_spans(text: &str, clusters: &[Span], breaks: &[usize]) -> Vec<Span> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let boundaries: BTreeSet<usize> = clusters
+            .iter()
+            .flat_map(|span| [span.byte_start, span.byte_end])
+            .collect();
+        let mut points = BTreeSet::new();
+        points.insert(0);
+        points.insert(text.len());
+        for &offset in breaks {
+            if offset > 0 && offset < text.len() && boundaries.contains(&offset) {
+                points.insert(offset);
+            }
+        }
+        let points: Vec<usize> = points.into_iter().collect();
+        points
+            .windows(2)
+            .map(|window| Span {
+                byte_start: window[0],
+                byte_end: window[1],
+            })
+            .collect()
+    }
+}
+
+#[cfg(feature = "inline")]
+pub use conformance::{
+    BreakOptions, OverflowWrap, Span, WordBreak, break_opportunities, cluster_map,
+    min_content_width, split_spans,
+};
