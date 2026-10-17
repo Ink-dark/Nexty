@@ -20,11 +20,32 @@
 4. **字素边界**用 `unicode-segmentation` 1.13.3（MIT/Apache-2.0，已在依赖树中）。它是 CSS Text 3 §5.5 “typographic character unit” 的下界。
 5. **CSS 语义**：`word-break: break-all/keep-all` 与 `overflow-wrap: normal/break-word/anywhere` 在 UAX#14 结果上增删断点；`anywhere` 参与 min-content，`break-word` 不参与（CSS Text 3 §5.4）；`break-all` 的效果参与 intrinsic size（§5.1 末段），且绝不切开 cluster（§5.5）。
 
+## 接入 `build_lines`（2026-10-17 后续轮次）
+
+`break_opportunities` / `cluster_map` / `split_spans` 已接入 `inline::build_lines`：
+
+- 文本项按 computed style 切块，只整形一次；按 `cluster_map → break_opportunities →
+  split_spans` 切段后贪心放置。软断点只来自 UAX#14 + CSS 选项；`white-space:
+  nowrap|pre` 关闭软断点，`<br>` 与保留的 `\n` 是硬断行项。
+- CSS 选项由 `ComputedStyle` 映射：`word-break: normal|break-all|keep-all`、
+  `overflow-wrap: normal|break-word|anywhere`。`break-word` / `anywhere` 的
+  cluster 紧急断点只在整段放不下一行时启用（先放整词、再拆词）；`break-word`
+  不参与 min-content，`anywhere` 与 `break-all` 参与。
+- `white-space` 六种取值按 CSS Text 3 §3.1 实现：`normal`/`nowrap`/`pre-line`
+  折叠可折叠空白（行首/行尾折叠空格丢弃），`pre`/`pre-wrap`/`break-spaces`
+  逐字保留、`\n` 为硬断行；`pre` 不软换行，其余允许 UAX#14 软断点。
+- 实现取值（偏差）：`tab-size` 未实现，制表按一个空格保留/计宽；
+  `pre-wrap` 行尾保留空格按占宽处理（未做悬挂）；`break-spaces` 的行尾空格
+  按规范参与宽度。
+- 跨行内元素边界的断行上下文只回看左侧两个字符（`breaks_between_text`），
+  长距离数字/引号规则（LB15c/LB25 等）在跨盒子边界处可能退化；原子行内盒
+  按 U+FFFC（Line_Break=CB）处理，两侧可断。
+
 ## 边界（本轮不做）
 
 - 字典式断行（泰/缅/高棉/老挝）与 `hyphens` 自动断字；SA 按 LB1 默认解析为 AL。
 - CSS `line-break: strict|normal|loose` 的收紧/放宽与 `text-align: justify` 的断点分配。
-- 不把 `break_opportunities` 接入现有 `inline::build_lines` 贪心路径（需另轮处理空白折叠、原子盒与基线）；本轮先冻结一个可逐条比对的 conformance API。
+- bidi / RTL、`vertical-align` 非 baseline、页面文本选择与复制。
 
 ## 验证
 
@@ -32,3 +53,6 @@
 `LineBreakTest-18.0.0.txt`（19,346 条，SHA-256 见 `tests/data/README.md`），
 全量比对 `÷`/`×`，并另按 LB4-8 / LB9-10 / LB21-31 规则组过滤重跑；同一文件还覆盖
 cluster 覆盖不变量、`break-all`/`anywhere` 的 min-content 差异与 span 逐段拼回。
+`crates/nexty-layout/tests/text_breaking.rs` 走真实 `layout_document` 管线覆盖：
+`white-space` 六个取值、`<br>` 硬断（含 `nowrap`）、120 字中文折行与行首禁则、
+`break-all` / `keep-all` / `break-word` / `anywhere`、组合符字形簇不被切开。
