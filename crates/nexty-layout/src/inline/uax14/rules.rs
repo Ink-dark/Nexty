@@ -342,3 +342,34 @@ pub(crate) fn uax14_breaks(units: &[Unit]) -> Vec<usize> {
     }
     breaks
 }
+
+/// 两段相邻文本之间的边界是否允许断行（行内元素边界的近似）。
+///
+/// 取左段末尾两个字符与右段开头两个字符拼成上下文后跑 UAX#14；只判左右
+/// 交界处。上下文有限是已知近似：跨边界的数字/引号规则（LB15c/LB25 等）
+/// 需要更长的左文，这里不回溯整段行内流——边界两侧的样式与内容分属不同
+/// 盒子，跨盒子回溯会把断行成本拖成整段平方。
+///
+/// 返回值：`true` 允许软断行；`false` 禁止（含右段以组合符开头、边界落在
+/// LB9 单元内部的情况）。
+pub(crate) fn breaks_between_text(left: &str, right: &str) -> bool {
+    if left.is_empty() || right.is_empty() {
+        return true;
+    }
+    let tail: Vec<char> = left.chars().rev().take(2).collect();
+    let head: Vec<char> = right.chars().take(2).collect();
+    let mut context = String::new();
+    for character in tail.into_iter().rev() {
+        context.push(character);
+    }
+    let left_len = context.len();
+    for character in head {
+        context.push(character);
+    }
+    let units = super::classes::build_units(&context);
+    match units.iter().position(|unit| unit.end == left_len) {
+        Some(index) => uax14_break_between(&units, index),
+        // 边界落在 LB9 单元内部（右侧以组合符开头）：不可断。
+        None => false,
+    }
+}

@@ -13,4 +13,4 @@ mod data;
 mod rules;
 
 pub(crate) use classes::{LineBreakClass, Unit, build_units};
-pub(crate) use rules::uax14_breaks;
+pub(crate) use rules::{breaks_between_text, uax14_breaks};
