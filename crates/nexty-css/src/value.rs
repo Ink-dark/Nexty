@@ -88,6 +88,12 @@ pub enum PropertyId {
     TextAlign,
     /// `line-height`。
     LineHeight,
+    /// `white-space`。
+    WhiteSpace,
+    /// `overflow-wrap`。
+    OverflowWrap,
+    /// `word-break`。
+    WordBreak,
     /// `width`。
     Width,
     /// `height`。
@@ -196,6 +202,9 @@ impl PropertyId {
             PropertyId::FontFamily => "font-family",
             PropertyId::TextAlign => "text-align",
             PropertyId::LineHeight => "line-height",
+            PropertyId::WhiteSpace => "white-space",
+            PropertyId::OverflowWrap => "overflow-wrap",
+            PropertyId::WordBreak => "word-break",
             PropertyId::Width => "width",
             PropertyId::Height => "height",
             PropertyId::MinWidth => "min-width",
@@ -249,7 +258,7 @@ impl PropertyId {
     /// （CSS Syntax：声明名匹配大小写不敏感）。
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
-        const ALL: [PropertyId; 55] = [
+        const ALL: [PropertyId; 58] = [
             PropertyId::Display,
             PropertyId::Color,
             PropertyId::BackgroundColor,
@@ -259,6 +268,9 @@ impl PropertyId {
             PropertyId::FontFamily,
             PropertyId::TextAlign,
             PropertyId::LineHeight,
+            PropertyId::WhiteSpace,
+            PropertyId::OverflowWrap,
+            PropertyId::WordBreak,
             PropertyId::Width,
             PropertyId::Height,
             PropertyId::MinWidth,
@@ -358,6 +370,12 @@ pub enum PropertyValue {
     FontFamily(Vec<FontFamilyValue>),
     /// `line-height` 值。
     LineHeight(LineHeightValue),
+    /// `white-space` 关键字。
+    WhiteSpace(WhiteSpaceValue),
+    /// `overflow-wrap` 关键字。
+    OverflowWrap(OverflowWrapValue),
+    /// `word-break` 关键字。
+    WordBreak(WordBreakValue),
     /// `width` / `height` 值（min-width / max-width / min-height / max-height
     /// 复用同一语法）。
     Size(SizeValue),
@@ -459,6 +477,84 @@ pub enum TextAlignValue {
     MatchParent,
     /// `justify-all`。
     JustifyAll,
+}
+
+/// `white-space` 值
+/// （[CSS Text 3 §3.1](https://drafts.csswg.org/css-text-3/#white-space-property)）。
+///
+/// 本层按单属性实现（CSS Text 4 的 `white-space-collapse` + `text-wrap-mode`
+/// 拆分记为偏差）。语义：
+///
+/// | 值 | 空白 | 软换行 |
+/// | --- | --- | --- |
+/// | `normal`（initial） | 折叠 | 允许 |
+/// | `nowrap` | 折叠 | 禁止 |
+/// | `pre` | 保留（`\n` 强断） | 禁止 |
+/// | `pre-wrap` | 保留（`\n` 强断） | 允许 |
+/// | `pre-line` | 折叠空格、保留 `\n`（强断） | 允许 |
+/// | `break-spaces` | 保留（含行尾，`\n` 强断） | 允许（每个空格后） |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WhiteSpaceValue {
+    /// `normal`（initial）。
+    #[default]
+    Normal,
+    /// `nowrap`。
+    Nowrap,
+    /// `pre`。
+    Pre,
+    /// `pre-wrap`。
+    PreWrap,
+    /// `pre-line`。
+    PreLine,
+    /// `break-spaces`。
+    BreakSpaces,
+}
+
+impl WhiteSpaceValue {
+    /// 是否折叠可折叠空白（空格 / 制表 / 段内换行）。
+    #[must_use]
+    pub fn collapses(self) -> bool {
+        matches!(self, Self::Normal | Self::Nowrap | Self::PreLine)
+    }
+
+    /// 是否保留段内换行（`\n` 作为强断行）。
+    #[must_use]
+    pub fn preserves_newlines(self) -> bool {
+        !matches!(self, Self::Normal | Self::Nowrap)
+    }
+
+    /// 是否允许软换行（UAX#14 断点）。
+    #[must_use]
+    pub fn wraps(self) -> bool {
+        !matches!(self, Self::Nowrap | Self::Pre)
+    }
+}
+
+/// `overflow-wrap` 值
+/// （[CSS Text 3 §5.4](https://drafts.csswg.org/css-text-3/#overflow-wrap-property)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverflowWrapValue {
+    /// `normal`（initial）：只在 UAX#14 允许的位置断行。
+    #[default]
+    Normal,
+    /// `break-word`：溢出时可在任意字形簇之间断行；不参与 min-content。
+    BreakWord,
+    /// `anywhere`：溢出时可断，且断点参与 min-content。
+    Anywhere,
+}
+
+/// `word-break` 值
+/// （[CSS Text 3 §5.1](https://drafts.csswg.org/css-text-3/#word-break-property)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WordBreakValue {
+    /// `normal`（initial）。
+    #[default]
+    Normal,
+    /// `break-all`：在相邻 typographic letter unit 之间允许断行
+    /// （不切开字形簇）。
+    BreakAll,
+    /// `keep-all`：禁止 CJK 等词内部断行。
+    KeepAll,
 }
 
 /// `font-style` 值
@@ -954,6 +1050,9 @@ fn parse_property_value(property: PropertyId, input: &mut Parser<'_>) -> Result<
         PropertyId::FontFamily => parse_font_family(input).map(PropertyValue::FontFamily),
         PropertyId::BackgroundColor => parse_color(input).map(PropertyValue::Color),
         PropertyId::LineHeight => parse_line_height(input).map(PropertyValue::LineHeight),
+        PropertyId::WhiteSpace => parse_white_space(input).map(PropertyValue::WhiteSpace),
+        PropertyId::OverflowWrap => parse_overflow_wrap(input).map(PropertyValue::OverflowWrap),
+        PropertyId::WordBreak => parse_word_break(input).map(PropertyValue::WordBreak),
         PropertyId::Width
         | PropertyId::Height
         | PropertyId::MinWidth
@@ -1027,6 +1126,63 @@ fn parse_line_height(input: &mut Parser<'_>) -> Result<LineHeightValue, ()> {
             }
         }
         _ => Err(()),
+    }
+}
+
+/// `white-space`：CSS Text 3 §3.1 的六个关键字。
+///
+/// Level 4 拆分的 `white-space-collapse` / `text-wrap-mode` 未实现；两个关键字
+/// 连写（如 `pre nowrap`）按非法值整条丢弃。
+fn parse_white_space(input: &mut Parser<'_>) -> Result<WhiteSpaceValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("normal") {
+        Ok(WhiteSpaceValue::Normal)
+    } else if name.eq_ignore_ascii_case("nowrap") {
+        Ok(WhiteSpaceValue::Nowrap)
+    } else if name.eq_ignore_ascii_case("pre") {
+        Ok(WhiteSpaceValue::Pre)
+    } else if name.eq_ignore_ascii_case("pre-wrap") {
+        Ok(WhiteSpaceValue::PreWrap)
+    } else if name.eq_ignore_ascii_case("pre-line") {
+        Ok(WhiteSpaceValue::PreLine)
+    } else if name.eq_ignore_ascii_case("break-spaces") {
+        Ok(WhiteSpaceValue::BreakSpaces)
+    } else {
+        Err(())
+    }
+}
+
+/// `overflow-wrap`：normal | break-word | anywhere（CSS Text 3 §5.4）。
+fn parse_overflow_wrap(input: &mut Parser<'_>) -> Result<OverflowWrapValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("normal") {
+        Ok(OverflowWrapValue::Normal)
+    } else if name.eq_ignore_ascii_case("break-word") {
+        Ok(OverflowWrapValue::BreakWord)
+    } else if name.eq_ignore_ascii_case("anywhere") {
+        Ok(OverflowWrapValue::Anywhere)
+    } else {
+        Err(())
+    }
+}
+
+/// `word-break`：normal | break-all | keep-all（CSS Text 3 §5.1）。
+fn parse_word_break(input: &mut Parser<'_>) -> Result<WordBreakValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("normal") {
+        Ok(WordBreakValue::Normal)
+    } else if name.eq_ignore_ascii_case("break-all") {
+        Ok(WordBreakValue::BreakAll)
+    } else if name.eq_ignore_ascii_case("keep-all") {
+        Ok(WordBreakValue::KeepAll)
+    } else {
+        Err(())
     }
 }
 
@@ -2886,6 +3042,59 @@ mod tests {
         );
         parse_err(PropertyId::FlexBasis, "-5px");
         parse_err(PropertyId::FlexBasis, "content");
+    }
+
+    #[test]
+    fn white_space_overflow_wrap_word_break_forms() {
+        // white-space：六个关键字（CSS Text 3 §3.1），大小写不敏感
+        for (text, expected) in [
+            ("normal", WhiteSpaceValue::Normal),
+            ("nowrap", WhiteSpaceValue::Nowrap),
+            ("pre", WhiteSpaceValue::Pre),
+            ("pre-wrap", WhiteSpaceValue::PreWrap),
+            ("PRE-LINE", WhiteSpaceValue::PreLine),
+            ("break-spaces", WhiteSpaceValue::BreakSpaces),
+        ] {
+            assert_eq!(
+                parse_one(PropertyId::WhiteSpace, text),
+                PropertyValue::WhiteSpace(expected)
+            );
+        }
+        parse_err(PropertyId::WhiteSpace, "pre nowrap");
+        parse_err(PropertyId::WhiteSpace, "pre-wrap-x");
+        parse_err(PropertyId::WhiteSpace, "");
+
+        // overflow-wrap：normal | break-word | anywhere
+        assert_eq!(
+            parse_one(PropertyId::OverflowWrap, "normal"),
+            PropertyValue::OverflowWrap(OverflowWrapValue::Normal)
+        );
+        assert_eq!(
+            parse_one(PropertyId::OverflowWrap, "break-word"),
+            PropertyValue::OverflowWrap(OverflowWrapValue::BreakWord)
+        );
+        assert_eq!(
+            parse_one(PropertyId::OverflowWrap, "anywhere"),
+            PropertyValue::OverflowWrap(OverflowWrapValue::Anywhere)
+        );
+        parse_err(PropertyId::OverflowWrap, "break-all");
+        parse_err(PropertyId::OverflowWrap, "word-wrap");
+
+        // word-break：normal | break-all | keep-all
+        assert_eq!(
+            parse_one(PropertyId::WordBreak, "normal"),
+            PropertyValue::WordBreak(WordBreakValue::Normal)
+        );
+        assert_eq!(
+            parse_one(PropertyId::WordBreak, "break-all"),
+            PropertyValue::WordBreak(WordBreakValue::BreakAll)
+        );
+        assert_eq!(
+            parse_one(PropertyId::WordBreak, "keep-all"),
+            PropertyValue::WordBreak(WordBreakValue::KeepAll)
+        );
+        parse_err(PropertyId::WordBreak, "break-word");
+        parse_err(PropertyId::WordBreak, "keep");
     }
 
     #[test]

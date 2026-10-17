@@ -45,6 +45,6 @@ pub use value::{
     BoxSizingValue, CssWideKeyword, DeclaredValue, DisplayValue, FlexDirectionValue, FlexWrapValue,
     FontFamilyValue, FontSizeValue, FontStyleValue, FontWeightValue, GapValue, GridAutoFlowValue,
     GridTrack, GridTrackList, InsetValue, JustifyContentValue, LineHeightValue, MarginValue,
-    OverflowValue, PaddingValue, PositionValue, PropertyId, PropertyValue, Rgba, SizeValue,
-    TextAlignValue, ViewportUnit,
+    OverflowValue, OverflowWrapValue, PaddingValue, PositionValue, PropertyId, PropertyValue, Rgba,
+    SizeValue, TextAlignValue, ViewportUnit, WhiteSpaceValue, WordBreakValue,
 };

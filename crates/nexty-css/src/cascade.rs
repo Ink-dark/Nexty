@@ -21,8 +21,8 @@ use crate::value::{
     BoxSizingValue, CssWideKeyword, DeclaredValue, DisplayValue, FlexDirectionValue, FlexWrapValue,
     FontFamilyValue, FontSizeValue, FontStyleValue, FontWeightValue, GapValue, GridAutoFlowValue,
     GridTrackList, InsetValue, JustifyContentValue, LineHeightValue, MarginValue, OverflowValue,
-    PaddingValue, PositionValue, PropertyId, PropertyValue, Rgba, SizeValue, TextAlignValue,
-    ViewportUnit,
+    OverflowWrapValue, PaddingValue, PositionValue, PropertyId, PropertyValue, Rgba, SizeValue,
+    TextAlignValue, ViewportUnit, WhiteSpaceValue, WordBreakValue,
 };
 
 /// 本层 UA 的 medium 字号基准（CSS Fonts 4 §2.5：initial 值由 UA 决定，
@@ -51,6 +51,12 @@ pub struct ComputedStyle {
     /// `line-height`（数值/normal 保持原样；长度为绝对 px；
     /// 百分比与 em 已按本元素 font-size 折算）。
     pub line_height: LineHeightValue,
+    /// `white-space`（CSS Text 3 §3.1）。
+    pub white_space: WhiteSpaceValue,
+    /// `overflow-wrap`（CSS Text 3 §5.4）。
+    pub overflow_wrap: OverflowWrapValue,
+    /// `word-break`（CSS Text 3 §5.1）。
+    pub word_break: WordBreakValue,
     /// `width`（百分比由 layout 解析）。
     pub width: SizeValue,
     /// `height`（百分比由 layout 解析）。
@@ -153,6 +159,9 @@ impl ComputedStyle {
             font_family: vec![FontFamilyValue::Generic("serif")],
             text_align: TextAlignValue::Start,
             line_height: LineHeightValue::Normal,
+            white_space: WhiteSpaceValue::Normal,
+            overflow_wrap: OverflowWrapValue::Normal,
+            word_break: WordBreakValue::Normal,
             width: SizeValue::Auto,
             height: SizeValue::Auto,
             min_width: SizeValue::Auto,
@@ -198,6 +207,9 @@ impl PropertyId {
                 | Self::FontFamily
                 | Self::TextAlign
                 | Self::LineHeight
+                | Self::WhiteSpace
+                | Self::OverflowWrap
+                | Self::WordBreak
         )
     }
 }
@@ -207,7 +219,7 @@ impl PropertyId {
 /// 顺序承载计算依赖：`FontSize` 先于 `LineHeight`（百分比按自身字号折算）、
 /// `Color` 先于 border 颜色（currentcolor）、border style 先于 width
 /// （none/hidden 时宽度归零）。
-const PROPERTY_ORDER: [PropertyId; 55] = [
+const PROPERTY_ORDER: [PropertyId; 58] = [
     PropertyId::Display,
     PropertyId::Color,
     PropertyId::BackgroundColor,
@@ -217,6 +229,9 @@ const PROPERTY_ORDER: [PropertyId; 55] = [
     PropertyId::FontFamily,
     PropertyId::TextAlign,
     PropertyId::LineHeight,
+    PropertyId::WhiteSpace,
+    PropertyId::OverflowWrap,
+    PropertyId::WordBreak,
     PropertyId::Width,
     PropertyId::Height,
     PropertyId::MinWidth,
@@ -640,6 +655,15 @@ fn resolve_all(
                     other => other,
                 };
             }
+            (PropertyId::WhiteSpace, Decision::Use(PropertyValue::WhiteSpace(value))) => {
+                style.white_space = *value;
+            }
+            (PropertyId::OverflowWrap, Decision::Use(PropertyValue::OverflowWrap(value))) => {
+                style.overflow_wrap = *value;
+            }
+            (PropertyId::WordBreak, Decision::Use(PropertyValue::WordBreak(value))) => {
+                style.word_break = *value;
+            }
             (PropertyId::Width, Decision::Use(PropertyValue::Size(value))) => {
                 style.width = resolve_size(*value, viewport);
             }
@@ -794,6 +818,9 @@ fn resolve_all(
                     PropertyId::FontFamily => style.font_family = source.font_family.clone(),
                     PropertyId::TextAlign => style.text_align = source.text_align,
                     PropertyId::LineHeight => style.line_height = source.line_height,
+                    PropertyId::WhiteSpace => style.white_space = source.white_space,
+                    PropertyId::OverflowWrap => style.overflow_wrap = source.overflow_wrap,
+                    PropertyId::WordBreak => style.word_break = source.word_break,
                     PropertyId::Width => style.width = source.width,
                     PropertyId::Height => style.height = source.height,
                     PropertyId::MinWidth => style.min_width = source.min_width,
@@ -1552,5 +1579,62 @@ mod tests {
                 tracks: vec![GridTrack::Auto]
             }
         );
+    }
+
+    /// `white-space` / `overflow-wrap` / `word-break` 均继承，initial 为 `normal`。
+    #[test]
+    fn text_breaking_properties_inherit() {
+        let document = build_document(
+            "<div style=\"white-space: nowrap; overflow-wrap: break-word; word-break: break-all\">\
+             <p>x</p></div><span>y</span>",
+        );
+        let parsed = Stylesheet::parse("");
+        let div_style = cascade(
+            &document,
+            find_first_by_name(&document, "div").unwrap(),
+            &[&parsed],
+            None,
+            None,
+        );
+        assert_eq!(div_style.white_space, WhiteSpaceValue::Nowrap);
+        assert_eq!(div_style.overflow_wrap, OverflowWrapValue::BreakWord);
+        assert_eq!(div_style.word_break, WordBreakValue::BreakAll);
+
+        let p_style = cascade(
+            &document,
+            find_first_by_name(&document, "p").unwrap(),
+            &[&parsed],
+            None,
+            Some(&div_style),
+        );
+        assert_eq!(
+            p_style.white_space,
+            WhiteSpaceValue::Nowrap,
+            "子继承 nowrap"
+        );
+        assert_eq!(p_style.overflow_wrap, OverflowWrapValue::BreakWord);
+        assert_eq!(p_style.word_break, WordBreakValue::BreakAll);
+
+        // 无声明：initial 为 normal
+        let style = style_of("<span>y</span>", &[], "span");
+        assert_eq!(style.white_space, WhiteSpaceValue::Normal);
+        assert_eq!(style.overflow_wrap, OverflowWrapValue::Normal);
+        assert_eq!(style.word_break, WordBreakValue::Normal);
+    }
+
+    /// UA 表给 `<pre>` 系元素 `white-space: pre`，author 声明可覆盖。
+    #[test]
+    fn ua_stylesheet_sets_white_space_pre() {
+        let document = build_document("<pre>a\nb</pre><div>c</div>");
+        let styles = compute_document_styles(&document, &[], Some(html_ua_stylesheet()));
+        let pre = find_first_by_name(&document, "pre").expect("pre");
+        assert_eq!(styles[&pre].white_space, WhiteSpaceValue::Pre);
+        let div = find_first_by_name(&document, "div").expect("div");
+        assert_eq!(styles[&div].white_space, WhiteSpaceValue::Normal);
+
+        // author 普通声明压过 UA
+        let sheet = Stylesheet::parse("pre { white-space: pre-wrap }");
+        let styles = compute_document_styles(&document, &[&sheet], Some(html_ua_stylesheet()));
+        assert_eq!(styles[&pre].white_space, WhiteSpaceValue::PreWrap);
     }
 }
