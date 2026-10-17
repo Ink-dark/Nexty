@@ -1673,7 +1673,7 @@ dependencies = [
 
 [[package]]
 name = "nexty-css"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "cssparser",
  "nexty-dom",
@@ -1696,7 +1696,7 @@ dependencies = [
 
 [[package]]
 name = "nexty-layout"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "harfrust",
  "nexty-css",

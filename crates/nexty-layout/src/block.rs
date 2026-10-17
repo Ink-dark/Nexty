@@ -200,7 +200,7 @@ fn assemble_element(
                 child_layout.location.x - inset.0,
                 child_layout.location.y - inset.1,
             );
-            let run_lines = run.lines_at(child_layout.size.width);
+            let run_lines = run.lines_at(child_layout.size.width, false);
             if merge_lines {
                 for line in run_lines {
                     // text-align 在行盒并入容器时施加：整行相对内容盒平移

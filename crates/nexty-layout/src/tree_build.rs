@@ -117,20 +117,24 @@ pub(crate) struct InlineRunNode<'a> {
     items: RefCell<Vec<InlineItem>>,
     /// strut 来源：匿名块的父元素 computed style（CSS 2.1 §10.8.1）。
     strut_style: ComputedStyle,
-    /// (可用宽, 行盒) 缓存：measure 在 max-content 与定宽等多个约束下各调一次。
-    lines_cache: RefCell<Vec<(f32, Vec<LineFragment>)>>,
+    /// (可用宽, 是否 min-content 语义, 行盒) 缓存。measure 在 max-content、
+    /// 定宽与 min-content 等多个约束下各调一次；同一宽度下 break-word 的
+    /// 紧急断点在 min-content 与非 min-content 两种语义下结果不同。
+    lines_cache: RefCell<Vec<(f32, bool, Vec<LineFragment>)>>,
 }
 
 impl InlineRunNode<'_> {
     /// 以 `available_width` 为断行宽取行盒；未缓存则现算并缓存。
     ///
-    /// 原子盒项先按同一可用宽布局（其片段宽高参与断行与基线对齐）。
-    pub(crate) fn lines_at(&self, available_width: f32) -> Vec<LineFragment> {
-        if let Some((_, lines)) = self
+    /// `min_content` 为真时按 min-content 语义断行（`overflow-wrap:
+    /// break-word` 的紧急断点不参与，CSS Text 3 §5.4）。原子盒项先按同一
+    /// 可用宽布局（其片段宽高参与断行与基线对齐）。
+    pub(crate) fn lines_at(&self, available_width: f32, min_content: bool) -> Vec<LineFragment> {
+        if let Some((_, _, lines)) = self
             .lines_cache
             .borrow()
             .iter()
-            .find(|(width, _)| *width == available_width)
+            .find(|(width, mode, _)| *width == available_width && *mode == min_content)
         {
             return lines.clone();
         }
@@ -158,10 +162,11 @@ impl InlineRunNode<'_> {
             &self.items.borrow(),
             available_width,
             &self.strut_style,
+            min_content,
         );
         self.lines_cache
             .borrow_mut()
-            .push((available_width, lines.clone()));
+            .push((available_width, min_content, lines.clone()));
         lines
     }
 
@@ -181,20 +186,22 @@ impl InlineRunNode<'_> {
         }
         let known = input.known_dimensions;
         let available = input.available_space;
-        let break_width = known
-            .width
-            .or_else(|| available.width.into_option())
-            .unwrap_or(match available.width {
-                AvailableSpace::MinContent => 0.0,
-                _ => f32::INFINITY,
-            });
-        let lines = self.lines_at(break_width);
+        let (break_width, min_content) = match known.width {
+            Some(width) => (width, false),
+            None => match available.width {
+                AvailableSpace::Definite(width) => (width, false),
+                AvailableSpace::MinContent => (0.0, true),
+                AvailableSpace::MaxContent => (f32::INFINITY, false),
+            },
+        };
+        let lines = self.lines_at(break_width, min_content);
         let content_width = match available.width {
             AvailableSpace::Definite(width) => width,
-            // 不折行：行内项总宽（缓存行恰为单行）
-            AvailableSpace::MaxContent => {
-                lines.last().map(crate::inline::line_width).unwrap_or(0.0)
-            }
+            // 不折行：取各硬断行段的最宽行
+            AvailableSpace::MaxContent => lines
+                .iter()
+                .map(crate::inline::line_width)
+                .fold(0.0, f32::max),
             // 最长不可拆项
             AvailableSpace::MinContent => lines
                 .iter()
