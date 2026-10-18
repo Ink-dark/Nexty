@@ -44,5 +44,7 @@ i, em, cite, dfn, var { font-style: italic }
 
 pre, code, kbd, samp, tt { font-family: monospace }
 
+pre, textarea, listing, xmp { white-space: pre }
+
 center { text-align: center }
 ";

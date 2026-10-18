@@ -54,6 +54,12 @@ mod tree_build;
 
 pub use fragment::{Edges, Fragment, ImageRun, LineFragment, Rect, TextRun};
 
+#[cfg(feature = "inline")]
+pub use inline::{
+    BreakOptions, OverflowWrap, Span, WordBreak, break_opportunities, cluster_map,
+    min_content_width, split_spans,
+};
+
 /// 布局上下文：整棵树共享的输入引用。
 ///
 /// 由 `layout_document` 构造，`block` / `inline` / `tree_build` 共用；feature

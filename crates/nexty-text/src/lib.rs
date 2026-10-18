@@ -60,6 +60,9 @@ pub struct Glyph {
     /// 所属字体在 [`ShapedText::fonts`] 中的下标（按脚本回退后一段文本
     /// 可能用到多个字体）。
     pub font: u32,
+    /// 所属 cluster 在源文本中的起始字节偏移（UAX#14 断点与行内布局按它
+    /// 把一次整形结果切到各不可拆单元上）。
+    pub cluster: u32,
 }
 
 /// 一段文本的整形结果。
@@ -368,7 +371,18 @@ impl TextShaper for ParleyTextShaper {
                         fonts.push(resolved);
                         fonts.len() - 1
                     }) as u32;
-                for glyph in glyph_run.positioned_glyphs() {
+                // LB9/LB10：CM/ZWJ 序列并入基字符的 cluster；cluster 起点取
+                // parley 的 cluster text_range（源文本字节偏移）。当前 shaper
+                // 只推单一样式，GlyphRun 覆盖整个 run，故按顺序 zip 即可。
+                let cluster_starts: Vec<u32> = glyph_run
+                    .run()
+                    .visual_clusters()
+                    .flat_map(|cluster| {
+                        let start = cluster.text_range().start as u32;
+                        cluster.glyphs().map(move |_| start)
+                    })
+                    .collect();
+                for (index, glyph) in glyph_run.positioned_glyphs().enumerate() {
                     glyphs.push(Glyph {
                         id: glyph.id,
                         // positioned_glyphs 的 y 已含基线偏移，换回相对基线
@@ -376,6 +390,7 @@ impl TextShaper for ParleyTextShaper {
                         y: glyph.y - baseline,
                         advance: glyph.advance,
                         font: font_index,
+                        cluster: cluster_starts.get(index).copied().unwrap_or(0),
                     });
                 }
             }
@@ -462,6 +477,37 @@ mod tests {
         // 宽度与最后一个字形的右缘一致（容差内）
         let last = shaped.glyphs.last().expect("non-empty");
         assert!((shaped.width - (last.x + last.advance)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn glyphs_carry_source_byte_clusters() {
+        let text = "a\u{301}b";
+        let shaped = shaper()
+            .shape(text, &style(&["serif"], 16.0))
+            .expect("shaping with system fonts");
+
+        assert!(!shaped.glyphs.is_empty());
+        for glyph in &shaped.glyphs {
+            let cluster = glyph.cluster as usize;
+            assert!(cluster <= text.len());
+            assert!(text.is_char_boundary(cluster));
+        }
+        assert_eq!(shaped.glyphs[0].cluster, 0);
+        assert!(
+            shaped
+                .glyphs
+                .windows(2)
+                .all(|pair| pair[0].cluster <= pair[1].cluster),
+            "LTR cluster values must be monotone: {:?}",
+            shaped
+                .glyphs
+                .iter()
+                .map(|glyph| glyph.cluster)
+                .collect::<Vec<_>>()
+        );
+        // 组合附加符并入基字符 cluster：b 的起始字节是 3，不是 1。
+        assert!(shaped.glyphs.iter().any(|glyph| glyph.cluster == 3));
+        assert!(shaped.glyphs.iter().all(|glyph| glyph.cluster != 1));
     }
 
     #[test]

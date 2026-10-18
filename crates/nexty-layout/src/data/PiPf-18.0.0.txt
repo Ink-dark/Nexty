@@ -1,0 +1,22 @@
+# DerivedGeneralCategory-18.0.0.txt: Pi / Pf ranges only
+00AB ; Pi
+2018 ; Pi
+201B..201C ; Pi
+201F ; Pi
+2039 ; Pi
+2E02 ; Pi
+2E04 ; Pi
+2E09 ; Pi
+2E0C ; Pi
+2E1C ; Pi
+2E20 ; Pi
+00BB ; Pf
+2019 ; Pf
+201D ; Pf
+203A ; Pf
+2E03 ; Pf
+2E05 ; Pf
+2E0A ; Pf
+2E0D ; Pf
+2E1D ; Pf
+2E21 ; Pf
