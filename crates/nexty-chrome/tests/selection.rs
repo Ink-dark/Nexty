@@ -188,3 +188,24 @@ fn highlight_matches_nested_block_lines_with_origin() {
         .count();
     assert_eq!(emitted, rects.len(), "高亮矩形应逐行发射");
 }
+
+#[test]
+fn highlight_covers_heading_before_tall_spacer() {
+    let page = pipeline::load_page(
+        "<h2>5. link</h2><p><a href=\"links.html\">this is a link target</a></p>\
+         <h2>6. scroll</h2><div style=\"height: 700px\">spacer text</div><p>EOF marker</p>",
+        "body { margin: 8px } h2 { font-size: 18px; margin: 16px 0 4px }",
+    );
+    let shaper = ParleyTextShaper::new();
+    let root = pipeline::layout_page(&page, &shaper, 1280.0).expect("root");
+    let map = TextMap::new(&root);
+    let (from, to) = map.all().unwrap();
+    let rects = map.rects(from, to);
+    let scene = pipeline::build_scene_at_with_highlights(&page, &root, 0.0, 48.0, &rects);
+    let emitted = scene
+        .commands
+        .iter()
+        .filter(|command| matches!(command, Command::FillRect { color, .. } if color.a == 64))
+        .count();
+    assert_eq!(emitted, rects.len(), "含高 spacer 的页面也应逐行发射高亮");
+}
