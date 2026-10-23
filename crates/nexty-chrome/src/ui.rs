@@ -143,8 +143,10 @@ pub enum Shortcut {
     Reload,
     /// 聚焦地址栏并全选。
     FocusAddressBar,
-    /// 全选（本轮只对地址栏生效，页面文本选择未实现）。
+    /// 全选：地址栏聚焦时选地址栏，否则全选页面文本。
     SelectAll,
+    /// 复制页面选区到系统剪贴板（地址栏聚焦时不处理）。
+    Copy,
     /// 失焦并还原当前页 URL（丢弃未提交的编辑）。
     Escape,
 }
@@ -159,6 +161,7 @@ pub fn shortcut(key: Key, modifiers: Modifiers) -> Option<Shortcut> {
         Key::Right if modifiers.alt => Some(Shortcut::Forward),
         Key::Character('l' | 'L') if modifiers.ctrl => Some(Shortcut::FocusAddressBar),
         Key::Character('a' | 'A') if modifiers.ctrl => Some(Shortcut::SelectAll),
+        Key::Character('c' | 'C') if modifiers.ctrl => Some(Shortcut::Copy),
         Key::Character('r' | 'R') if modifiers.ctrl => Some(Shortcut::Reload),
         Key::F5 => Some(Shortcut::Reload),
         Key::Escape => Some(Shortcut::Escape),
@@ -1041,6 +1044,8 @@ mod tests {
             shortcut(Key::Character('a'), ctrl),
             Some(Shortcut::SelectAll)
         );
+        assert_eq!(shortcut(Key::Character('c'), ctrl), Some(Shortcut::Copy));
+        assert_eq!(shortcut(Key::Character('C'), ctrl), Some(Shortcut::Copy));
         assert_eq!(shortcut(Key::Character('r'), ctrl), Some(Shortcut::Reload));
         assert_eq!(shortcut(Key::F5, none), Some(Shortcut::Reload));
         assert_eq!(shortcut(Key::Escape, none), Some(Shortcut::Escape));

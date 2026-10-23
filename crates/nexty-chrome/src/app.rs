@@ -849,6 +849,19 @@ impl BrowserApp {
                     self.selection.select(from, to);
                 }
             }
+            ui::Shortcut::Copy => {
+                // 地址栏聚焦时不处理（地址栏复制不在本轮范围）。
+                if !self.bar.is_focused()
+                    && let Some(map) = &self.text_map
+                {
+                    let text = self.selection.text(map);
+                    if !text.is_empty()
+                        && let Err(error) = selection::write_clipboard(&text)
+                    {
+                        eprintln!("clipboard write failed: {error}");
+                    }
+                }
+            }
             ui::Shortcut::Escape => {
                 // 与 Chrome 一致：Esc 丢弃未提交的编辑并失焦
                 self.bar.blur();

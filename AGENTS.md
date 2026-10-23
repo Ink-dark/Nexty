@@ -114,7 +114,7 @@ Nexty/                                  # 主仓库 (Ink-dark/Nexty)，workspace
 - Rust stable，**仓库内代码严禁 unsafe**：本仓库自研代码一律不得出现 unsafe 块 / unsafe fn / unsafe impl，无例外、无 FFI 豁免。每个 crate 在 `lib.rs` 顶部用 `#![forbid(unsafe_code)]` 固化该约束。第三方 crate 内部的 unsafe 不由我们改写（`forbid` 也不作用于依赖），但选型时必须查其 unsafe 用量与边界
 - **依赖类型不得外泄**：每个 crate 的公共 API 只暴露自身抽象类型。依赖 crate（html5ever / cssparser / selectors / parley / vello_cpu / vello_hybrid / reqwest …）的类型不得出现在任何 `pub` 导出中——含 pub fn 签名、pub struct/enum 的 pub 字段、pub trait 的方法签名、`pub use` re-export。跨界传递依赖类型时，包一层自己的类型再暴露
 - **不造轮子优先**：已有成熟 crate 能覆盖的能力，直接依赖，不自己实现。参考优先级：**WHATWG 规范 > WPT 测试套件 > 成熟 crate > 自行实现**。**例外**：DOM / Cascade / 盒级布局三层已决策自研，理由与边界见选型 ADR，不得据此把自研扩大到其他层
-- **许可证政策**：白名单 MIT / Apache-2.0 / BSD / ISC / MPL-2.0 / LGPL / Zlib / CC0-1.0 / Unicode-3.0 / CDLA-Permissive-2.0，禁 GPL / AGPL。后 4 个是已选 crate 栈（wgpu / icu4x / reqwest）无法回避的宽松、非 copyleft 传递依赖，逐条理由见 `deny.toml`。`cargo-deny` 做硬门禁（含传递依赖），`cargo-about` 生成的第三方依赖清单入库。引入或升级依赖前必须确认传递依赖未引入白名单外的许可证
+- **许可证政策**：白名单 MIT / Apache-2.0 / BSD / ISC / MPL-2.0 / LGPL / Zlib / CC0-1.0 / Unicode-3.0 / CDLA-Permissive-2.0 / BSL-1.0，禁 GPL / AGPL。后 5 个是已选 crate 栈（wgpu / icu4x / reqwest / arboard）无法回避的宽松、非 copyleft 传递依赖，逐条理由见 `deny.toml`。`cargo-deny` 做硬门禁（含传递依赖），`cargo-about` 生成的第三方依赖清单入库。引入或升级依赖前必须确认传递依赖未引入白名单外的许可证
 - **隔离**：每层一个 facade crate，外部 crate 只允许出现在该层 crate 内；对外能力先定 trait（`NetworkFetcher` / `TextShaper` / `Rasterizer` 等），具体后端作为可替换实现
 - **渲染隔离**：渲染在独立线程执行，panic 由 `catch_unwind` 兜住并上报，不得让渲染失败拖垮主进程。因此 workspace 与各 crate 一律不得设置 `panic = "abort"`（会禁用 unwind，使兜底失效）。渲染后端对未支持特性是 panic 而非返回错误，此风险按已知限制对待
 - **JSRT 可插拔**：JS 运行时作为可插拔层，选型暂缓。DOM 与 JS runner 必须同处（可变树、可共享引用，为绑定预留），JS 运行时类型不得渗入 DOM 公共 API

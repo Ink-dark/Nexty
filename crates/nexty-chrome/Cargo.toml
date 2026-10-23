@@ -25,8 +25,8 @@ history = []
 ui = []
 # 滚动几何与拖拽状态机（纯逻辑，可测试）。
 scrollbar = []
-# 页面文本选区状态机（纯逻辑，可测试）。
-selection = ["pipeline"]
+# 页面文本选区状态机（纯逻辑）+ 复制到系统剪贴板。
+selection = ["pipeline", "dep:arboard"]
 # 浏览器外壳本体：winit 事件循环 + wgpu 呈现（`run()` 入口）。
 # 依赖 winit / wgpu / pollster 与下层各 crate，故隐含它们。
 window = ["pipeline", "resources", "render", "history", "ui", "scrollbar", "selection",
@@ -44,6 +44,9 @@ winit = { version = "0.30.13", optional = true }
 wgpu = { version = "29", optional = true }
 # wgpu 的异步初始化在 winit 事件循环外的同步入口完成
 pollster = { version = "0.4", optional = true }
+# 系统剪贴板（选区复制）。只要文本：关闭 default 的 image-data，避免引入
+# 图片剪贴板后端；选型与边界见 docs/decisions/2026-10-23-clipboard.md。
+arboard = { version = "3.7", default-features = false, optional = true }
 
 [dev-dependencies]
 # 仅测试用：构造 PNG 字节喂给资源编排测试（与 nexty-paint 同一依赖）

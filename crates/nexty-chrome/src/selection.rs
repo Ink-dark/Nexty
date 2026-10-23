@@ -18,6 +18,19 @@ pub fn is_click(press: (f32, f32), release: (f32, f32)) -> bool {
     (release.0 - press.0).abs() <= CLICK_SLOP && (release.1 - press.1).abs() <= CLICK_SLOP
 }
 
+/// 把文本写入系统剪贴板。
+///
+/// 失败只返回错误信息（调用方记录，不 panic）：剪贴板不可用时复制静默降级，
+/// 不影响页面渲染与选择交互。仅支持纯文本（图片/HTML 格式不在本轮范围）。
+///
+/// # Errors
+///
+/// 剪贴板后端初始化或写入失败时返回用户可读错误。
+pub fn write_clipboard(text: &str) -> Result<(), String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|error| error.to_string())?;
+    clipboard.set_text(text).map_err(|error| error.to_string())
+}
+
 /// 页面文本选区。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
