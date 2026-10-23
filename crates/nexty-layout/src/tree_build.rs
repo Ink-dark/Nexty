@@ -399,9 +399,9 @@ fn collect_children_boxes<'a>(
     for child in ctx.document.children(node) {
         match ctx.document.node(child) {
             Some(NodeKind::Text(text)) => {
-                // 直接文本：样式取父元素
+                // 直接文本：样式取父元素，节点身份取文本节点自身
                 run.get_or_insert_with(|| InlineRun::new(ctx))
-                    .push_text(text, node, style);
+                    .push_text(text, child, node, style);
             }
             Some(NodeKind::Element(_)) => {
                 let Some(child_style) = ctx.styles.get(&child) else {

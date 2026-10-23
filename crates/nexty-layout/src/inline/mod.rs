@@ -47,13 +47,14 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use nexty_css::{ComputedStyle, DisplayValue, LineHeightValue, OverflowWrapValue, WordBreakValue};
 use nexty_dom::{Document, ElementData, Namespace, NodeId, NodeKind};
 use nexty_text::{FontMetrics, Glyph, ResolvedFont, ShapedText, TextShaper, TextStyle};
 
 use crate::Context;
-use crate::fragment::{Fragment, ImageRun, LineFragment, TextRun};
+use crate::fragment::{Fragment, ImageRun, LineFragment, LineStart, SourceChar, TextRun};
 
 mod break_ops;
 mod cluster_map;
@@ -99,8 +100,12 @@ pub(crate) enum InlineItem {
 pub(crate) struct TextChunk {
     /// 样式来源元素。
     pub node: NodeId,
+    /// 产生这段文本的文本节点（选区端点的定位依据）。
+    pub text_node: NodeId,
     /// 文本（不含硬断行字符；折叠模式下连续空白已折成一个空格）。
-    pub text: String,
+    pub text: Arc<str>,
+    /// `text` 中每个字符回指 `text_node` 源文本的字节区间。
+    pub source_map: Arc<[SourceChar]>,
     /// 该文本的样式（直接包含它的元素的 computed style）。
     pub style: ComputedStyle,
 }
@@ -168,19 +173,29 @@ struct Collector<'a> {
     items: Vec<InlineItem>,
     /// 上一个发出的字符是否为折叠空格（跨文本节点去重）。
     last_collapsible_space: bool,
+    /// 上一个折叠空格所属的文本节点（用于把源区间扩展到整段空白）。
+    last_space_node: Option<NodeId>,
     text_buffer: String,
+    text_source: Vec<SourceChar>,
+    /// 当前缓冲的文本节点。
     text_node: Option<NodeId>,
+    /// 当前缓冲的样式来源元素。
+    text_style_node: Option<NodeId>,
     text_style: Option<ComputedStyle>,
 }
 
 impl Collector<'_> {
-    /// 若当前缓冲区属于别的样式，先刷出（一个文本块只带一种样式）。
-    fn ensure_style(&mut self, node: NodeId, style: &ComputedStyle) {
-        if self.text_node == Some(node) && self.text_style.as_ref() == Some(style) {
+    /// 若当前缓冲区属于别的文本节点/样式，先刷出（一个文本块只带一种样式）。
+    fn ensure_style(&mut self, text_node: NodeId, style_node: NodeId, style: &ComputedStyle) {
+        if self.text_node == Some(text_node)
+            && self.text_style_node == Some(style_node)
+            && self.text_style.as_ref() == Some(style)
+        {
             return;
         }
         self.flush_text();
-        self.text_node = Some(node);
+        self.text_node = Some(text_node);
+        self.text_style_node = Some(style_node);
         self.text_style = Some(style.clone());
     }
 
@@ -190,16 +205,48 @@ impl Collector<'_> {
             return;
         }
         self.items.push(InlineItem::Text(TextChunk {
-            node: self.text_node.take().expect("text has a style source"),
-            text: std::mem::take(&mut self.text_buffer),
+            node: self
+                .text_style_node
+                .take()
+                .expect("text has a style source"),
+            text_node: self.text_node.take().expect("text has a source node"),
+            text: Arc::from(std::mem::take(&mut self.text_buffer)),
+            source_map: Arc::from(std::mem::take(&mut self.text_source)),
             style: self.text_style.take().expect("text has a style"),
         }));
+        self.last_space_node = None;
+    }
+
+    /// 把一个字符及其源区间写入缓冲区。
+    fn push_char(
+        &mut self,
+        character: char,
+        text_node: NodeId,
+        style_node: NodeId,
+        style: &ComputedStyle,
+        source: Range<usize>,
+    ) {
+        self.ensure_style(text_node, style_node, style);
+        let chunk = self.text_buffer.len() as u32;
+        self.text_buffer.push(character);
+        self.text_source.push(SourceChar {
+            chunk,
+            source: source.start as u32,
+            source_end: source.end as u32,
+        });
     }
 
     /// 收集一段文本（按当前 `white-space` 处理空白）。
-    fn push_text(&mut self, text: &str, node: NodeId, style: &ComputedStyle) {
+    fn push_text(
+        &mut self,
+        text: &str,
+        text_node: NodeId,
+        style_node: NodeId,
+        style: &ComputedStyle,
+    ) {
         let white_space = style.white_space;
-        for character in text.chars() {
+        for (start, character) in text.char_indices() {
+            let source = start..start + character.len_utf8();
             if white_space.collapses() {
                 if is_collapsible(character) {
                     if white_space.preserves_newlines() && matches!(character, '\n' | '\r') {
@@ -209,29 +256,35 @@ impl Collector<'_> {
                     }
                     // 折叠：连续空白合成一个空格；跨文本节点去重
                     if self.last_collapsible_space {
+                        // 同一文本节点内把源区间扩展到整段空白
+                        if self.last_space_node == Some(text_node)
+                            && let Some(last) = self.text_source.last_mut()
+                        {
+                            last.source_end = source.end as u32;
+                        }
                         continue;
                     }
-                    self.ensure_style(node, style);
-                    self.text_buffer.push(' ');
+                    self.push_char(' ', text_node, style_node, style, source);
                     self.last_collapsible_space = true;
+                    self.last_space_node = Some(text_node);
                 } else {
-                    self.ensure_style(node, style);
-                    self.text_buffer.push(character);
+                    self.push_char(character, text_node, style_node, style, source);
                     self.last_collapsible_space = false;
+                    self.last_space_node = None;
                 }
             } else {
                 match character {
                     '\n' | '\r' => self.push_break(),
                     // 偏差：tab-size 不实现，制表按一个空格保留
                     '\t' => {
-                        self.ensure_style(node, style);
-                        self.text_buffer.push(' ');
+                        self.push_char(' ', text_node, style_node, style, source);
                         self.last_collapsible_space = false;
+                        self.last_space_node = None;
                     }
                     _ => {
-                        self.ensure_style(node, style);
-                        self.text_buffer.push(character);
+                        self.push_char(character, text_node, style_node, style, source);
                         self.last_collapsible_space = false;
+                        self.last_space_node = None;
                     }
                 }
             }
@@ -243,6 +296,7 @@ impl Collector<'_> {
         self.flush_text();
         self.items.push(InlineItem::Break);
         self.last_collapsible_space = false;
+        self.last_space_node = None;
     }
 
     /// 收集一个行内原子图片。
@@ -256,6 +310,7 @@ impl Collector<'_> {
             style: style.clone(),
         }));
         self.last_collapsible_space = false;
+        self.last_space_node = None;
     }
 
     /// 收集一个原子盒（inline-block 等）：登记节点与样式，布局延迟到
@@ -281,6 +336,7 @@ impl Collector<'_> {
             style: style.clone(),
         })));
         self.last_collapsible_space = false;
+        self.last_space_node = None;
     }
 }
 
@@ -301,16 +357,28 @@ impl<'a> InlineRun<'a> {
                 ctx,
                 items: Vec::new(),
                 last_collapsible_space: false,
+                last_space_node: None,
                 text_buffer: String::new(),
+                text_source: Vec::new(),
                 text_node: None,
+                text_style_node: None,
                 text_style: None,
             },
         }
     }
 
     /// 收集一个直接文本子节点（不递归）。
-    pub(crate) fn push_text(&mut self, text: &str, node: NodeId, style: &ComputedStyle) {
-        self.collector.push_text(text, node, style);
+    ///
+    /// `text_node` 是文本节点自身（选区端点定位），`style_node` 是提供样式的
+    /// 父元素。
+    pub(crate) fn push_text(
+        &mut self,
+        text: &str,
+        text_node: NodeId,
+        style_node: NodeId,
+        style: &ComputedStyle,
+    ) {
+        self.collector.push_text(text, text_node, style_node, style);
     }
 
     /// 收集一个行内级子元素的子树。
@@ -360,7 +428,7 @@ fn collect_children(collector: &mut Collector<'_>, node: NodeId, style: &Compute
     let document = collector.ctx.document;
     for child in document.children(node) {
         match document.node(child) {
-            Some(NodeKind::Text(text)) => collector.push_text(text, node, style),
+            Some(NodeKind::Text(text)) => collector.push_text(text, child, node, style),
             Some(NodeKind::Element(data)) => {
                 let Some(child_style) = collector.ctx.styles.get(&child) else {
                     continue;
@@ -601,6 +669,8 @@ pub(crate) fn build_lines(
         lines: Vec::new(),
         placed: Vec::new(),
         cursor: 0.0,
+        current_start: LineStart::Soft { space: false },
+        next_start: LineStart::Soft { space: false },
     };
 
     let mut previous: Option<usize> = None;
@@ -608,6 +678,7 @@ pub(crate) fn build_lines(
         match &items[index] {
             InlineItem::Break => {
                 // 硬断行：结束当前行（空行也保留），下一项从行首开始。
+                builder.next_start = LineStart::Hard;
                 builder.flush();
                 previous = None;
             }
@@ -691,6 +762,10 @@ struct LineBuilder<'a> {
     lines: Vec<LineFragment>,
     placed: Vec<PlacedItem>,
     cursor: f32,
+    /// 当前行的起点来源（写入正在构建的行）。
+    current_start: LineStart,
+    /// 下一次 `flush` 之后新行的起点来源。
+    next_start: LineStart,
 }
 
 impl LineBuilder<'_> {
@@ -771,6 +846,7 @@ impl LineBuilder<'_> {
         };
         if !self.placed.is_empty() && self.cursor + width > self.max_width {
             if break_before {
+                self.mark_soft_break(Some(item_index), span.byte_start);
                 self.flush();
                 let Some((new_start, new_end, new_width)) =
                     self.prepare_span(item_index, span, true)
@@ -827,6 +903,7 @@ impl LineBuilder<'_> {
                 continue;
             };
             if !self.placed.is_empty() && self.cursor + width > self.max_width {
+                self.mark_soft_break(Some(item_index), part.byte_start);
                 self.flush();
                 // 新行是空的：本段即使超宽也直接放置（单个 cluster 不可再拆）
                 let Some((start, end, _)) = self.prepare_span(item_index, &part, true) else {
@@ -842,6 +919,7 @@ impl LineBuilder<'_> {
     /// 放置一个原子项（图片 / 原子盒）：不可拆，放不下先换行。
     fn place_atomic(&mut self, item_index: usize, width: f32, break_before: bool) {
         if !self.placed.is_empty() && self.cursor + width > self.max_width && break_before {
+            self.mark_soft_break(None, 0);
             self.flush();
         }
         self.placed.push(PlacedItem {
@@ -851,6 +929,38 @@ impl LineBuilder<'_> {
             x: self.cursor,
         });
         self.cursor += width;
+    }
+
+    /// 记录软换行，并判断断点处是否消费了一个可折叠空格。
+    ///
+    /// 软换行不插换行符；若断点处丢掉了行尾折叠空格，复制文本时补回一个空格。
+    fn mark_soft_break(&mut self, item_index: Option<usize>, next_start: usize) {
+        let space = self.break_consumed_space(item_index, next_start);
+        self.next_start = LineStart::Soft { space };
+    }
+
+    fn break_consumed_space(&self, item_index: Option<usize>, next_start: usize) -> bool {
+        if let Some(index) = item_index
+            && let InlineItem::Text(chunk) = &self.items[index]
+            && chunk.style.white_space.collapses()
+            && chunk
+                .text
+                .get(next_start..)
+                .is_some_and(|tail| tail.starts_with(' '))
+        {
+            return true;
+        }
+        if let Some(placed) = self.placed.last()
+            && let InlineItem::Text(chunk) = &self.items[placed.item_index]
+            && let Some((_, end)) = placed.span
+        {
+            return chunk.style.white_space.collapses()
+                && chunk
+                    .text
+                    .get(..end)
+                    .is_some_and(|head| head.ends_with(' '));
+        }
+        false
     }
 
     /// 结束当前行（空行也保留：硬断行与 `<pre>` 的 `\n`）。
@@ -938,7 +1048,11 @@ impl LineBuilder<'_> {
                         })
                         .collect();
                     match runs.last_mut() {
-                        Some(run) if mergeable && run.node == chunk.node => {
+                        Some(run)
+                            if mergeable
+                                && run.node == chunk.node
+                                && run.text_node == chunk.text_node =>
+                        {
                             for glyph in glyphs {
                                 run.glyphs
                                     .push(remap_glyph(glyph, &shaped.fonts, &mut run.fonts));
@@ -946,8 +1060,11 @@ impl LineBuilder<'_> {
                         }
                         _ => runs.push(TextRun {
                             node: chunk.node,
+                            text_node: chunk.text_node,
                             style: text_style(&chunk.style),
                             color: chunk.style.color,
+                            text: Arc::clone(&chunk.text),
+                            source_map: Arc::clone(&chunk.source_map),
                             fonts: shaped.fonts.clone(),
                             glyphs,
                         }),
@@ -978,6 +1095,10 @@ impl LineBuilder<'_> {
         self.lines.push(LineFragment {
             baseline,
             height: baseline + below,
+            start: std::mem::replace(
+                &mut self.current_start,
+                std::mem::replace(&mut self.next_start, LineStart::Soft { space: false }),
+            ),
             runs,
             images,
             boxes,
