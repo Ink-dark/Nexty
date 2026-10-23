@@ -17,7 +17,7 @@ use nexty_css::{
 };
 use nexty_dom::{Document, NodeId};
 use nexty_html::ParseOptions;
-use nexty_layout::Fragment;
+use nexty_layout::{Fragment, Rect as LayoutRect};
 use nexty_paint::{Color, Command, Image, Rect as PaintRect, Scene, Size, TextGlyph};
 use nexty_text::TextShaper;
 
@@ -94,6 +94,14 @@ pub fn layout_page(page: &Page, shaper: &dyn TextShaper, viewport_width: f32) ->
     )
 }
 
+/// 选区高亮色（半透明蓝，src-over 叠在页面背景之上）。
+const SELECTION_COLOR: Color = Color {
+    r: 0,
+    g: 100,
+    b: 255,
+    a: 64,
+};
+
 /// 把片段树转译为显示列表，原点在视口左上角。
 #[must_use]
 pub fn build_scene(page: &Page, root: &Fragment) -> Scene {
@@ -106,9 +114,27 @@ pub fn build_scene(page: &Page, root: &Fragment) -> Scene {
 /// `Scene.images` 池，`DrawImage` 按下标引用（同一节点多图共享一份像素）。
 #[must_use]
 pub fn build_scene_at(page: &Page, root: &Fragment, origin_x: f32, origin_y: f32) -> Scene {
+    build_scene_at_with_highlights(page, root, origin_x, origin_y, &[])
+}
+
+/// 同 [`build_scene_at`]，并在每个行盒的文字之前插入选区高亮矩形。
+///
+/// `highlights` 是 `TextMap::rects` 的输出（相对根片段边框盒）。高亮按行
+/// 发射：只在该行自身字形与矩形相交时绘制，故位于页面背景/边框之上、
+/// 文字与图片之下；嵌套行内原子盒的矩形不会在父行重复绘制。
+#[must_use]
+pub fn build_scene_at_with_highlights(
+    page: &Page,
+    root: &Fragment,
+    origin_x: f32,
+    origin_y: f32,
+    highlights: &[LayoutRect],
+) -> Scene {
     let mut scene = Scene::default();
     let mut pool: HashMap<NodeId, usize> = HashMap::new();
-    emit(page, root, origin_x, origin_y, &mut scene, &mut pool);
+    emit(
+        page, root, origin_x, origin_y, &mut scene, &mut pool, highlights,
+    );
     scene
 }
 
@@ -119,6 +145,7 @@ fn emit(
     origin_y: f32,
     scene: &mut Scene,
     pool: &mut HashMap<NodeId, usize>,
+    highlights: &[LayoutRect],
 ) {
     let x = origin_x + fragment.border_box.x;
     let y = origin_y + fragment.border_box.y;
@@ -211,6 +238,30 @@ fn emit(
     for line in &fragment.lines {
         let line_y = content_y + line_offset;
         let baseline = line_y + line.baseline;
+        // 选区高亮：垫在本行文字之下；只画与本行自身字形相交的矩形，
+        // 避免嵌套行内原子盒的矩形在父行重复叠加。
+        for highlight in highlights {
+            let highlight_x = origin_x + highlight.x;
+            let highlight_y = origin_y + highlight.y;
+            if (highlight_y - line_y).abs() > 0.5 {
+                continue;
+            }
+            let overlaps = line.runs.iter().flat_map(|run| &run.glyphs).any(|glyph| {
+                let glyph_x = content_x + glyph.x;
+                highlight_x < glyph_x + glyph.advance && highlight_x + highlight.width > glyph_x
+            });
+            if overlaps {
+                scene.commands.push(Command::FillRect {
+                    rect: PaintRect {
+                        x: highlight_x,
+                        y: highlight_y,
+                        width: highlight.width,
+                        height: highlight.height,
+                    },
+                    color: SELECTION_COLOR,
+                });
+            }
+        }
         for run in &line.runs {
             if run.glyphs.is_empty() {
                 continue;
@@ -250,13 +301,13 @@ fn emit(
         // 行内原子盒（inline-block 等）：完整子片段树，x/y 已相对行顶定位，
         // 按子片段递归（原点 = 本行顶）
         for atomic in &line.boxes {
-            emit(page, atomic, content_x, line_y, scene, pool);
+            emit(page, atomic, content_x, line_y, scene, pool, highlights);
         }
         line_offset += line.height;
     }
 
     for child in &fragment.children {
-        emit(page, child, content_x, content_y, scene, pool);
+        emit(page, child, content_x, content_y, scene, pool, highlights);
     }
 }
 

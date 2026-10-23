@@ -6,6 +6,7 @@
 use nexty_chrome::pipeline;
 use nexty_chrome::selection::{Selection, is_click};
 use nexty_layout::{TextMap, TextPosition};
+use nexty_paint::Command;
 use nexty_text::ParleyTextShaper;
 
 fn text_map(html: &str, width: f32) -> TextMap {
@@ -110,4 +111,59 @@ fn click_and_drag_are_distinguished_for_link_navigation() {
     assert!(is_click((10.0, 10.0), (10.0, 10.0)));
     assert!(!is_click((10.0, 10.0), (30.0, 10.0)));
     assert!(!is_click((10.0, 10.0), (10.0, 30.0)));
+}
+
+#[test]
+fn highlight_is_emitted_between_background_and_text() {
+    let page = pipeline::load_page(
+        "<p>abc</p>",
+        "body { background-color: #ffffff; margin: 0 }",
+    );
+    let shaper = ParleyTextShaper::new();
+    let root = pipeline::layout_page(&page, &shaper, 400.0).expect("root");
+    let map = TextMap::new(&root);
+    let (from, to) = map.all().unwrap();
+    let rects = map.rects(from, to);
+    assert!(!rects.is_empty());
+
+    let scene = pipeline::build_scene_at_with_highlights(&page, &root, 0.0, 20.0, &rects);
+    let highlight = scene
+        .commands
+        .iter()
+        .position(|command| matches!(command, Command::FillRect { color, .. } if color.a == 64))
+        .expect("highlight rect");
+    let background = scene
+        .commands
+        .iter()
+        .position(|command| {
+            matches!(command, Command::FillRect { color, .. }
+                if color.a == 255 && color.r == 255 && color.g == 255 && color.b == 255)
+        })
+        .expect("opaque white background");
+    let text = scene
+        .commands
+        .iter()
+        .position(|command| matches!(command, Command::DrawText { .. }))
+        .expect("text");
+
+    assert!(background < highlight, "高亮必须在页面背景之上");
+    assert!(highlight < text, "高亮必须在文字之下");
+    match &scene.commands[highlight] {
+        Command::FillRect { rect, .. } => {
+            assert!((rect.x - rects[0].x).abs() < 0.01);
+            assert!((rect.y - (rects[0].y + 20.0)).abs() < 0.01);
+            assert!((rect.width - rects[0].width).abs() < 0.01);
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn empty_highlights_leave_scene_unchanged() {
+    let page = pipeline::load_page("<p>abc</p>", "body { margin: 0 }");
+    let shaper = ParleyTextShaper::new();
+    let root = pipeline::layout_page(&page, &shaper, 400.0).expect("root");
+    let plain = pipeline::build_scene(&page, &root);
+    let empty = pipeline::build_scene_at_with_highlights(&page, &root, 0.0, 0.0, &[]);
+    assert_eq!(plain.commands.len(), empty.commands.len());
 }

@@ -546,10 +546,18 @@ impl BrowserApp {
         let track = geometry.track();
 
         // 页面按滚动偏移重建显示列表（内容从工具带下方开始）
+        let highlights = match &self.text_map {
+            Some(map) if !self.selection.is_empty() => self.selection.rects(map),
+            _ => Vec::new(),
+        };
         let mut scene = match (&self.page, &self.root) {
-            (Some(page), Some(root)) => {
-                pipeline::build_scene_at(page, root, 0.0, BAR_HEIGHT - self.scroll_y)
-            }
+            (Some(page), Some(root)) => pipeline::build_scene_at_with_highlights(
+                page,
+                root,
+                0.0,
+                BAR_HEIGHT - self.scroll_y,
+                &highlights,
+            ),
             _ => Scene::default(),
         };
         // 画布底色：pipeline 的画布保持透明，直接 blit 会把透明像素交给
