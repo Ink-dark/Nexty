@@ -40,9 +40,10 @@
 //! （见 `uax14::rules::breaks_between_text`）。
 //!
 //! feature `block` 关闭时本模块无消费方（行内流的唯一下游是 taffy 管线），
-//! 按模块整体抑制 dead_code。
+//! 按模块整体抑制 dead_code；`replaced` 单独开启时 `lib.rs` 不 re-export 本模块
+//! 的公共项，故一并抑制 unused_imports。
 
-#![cfg_attr(not(feature = "block"), allow(dead_code))]
+#![cfg_attr(not(feature = "block"), allow(dead_code, unused_imports))]
 
 use std::collections::HashMap;
 use std::ops::Range;
