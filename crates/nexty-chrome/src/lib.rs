@@ -12,6 +12,7 @@
 //! - [`render`]：渲染隔离线程（panic 兜底，线程存活可继续服务）；
 //! - [`ui`]：自绘工具带状态机（纯逻辑，可测试）；
 //! - [`scrollbar`]：滚动几何与拖拽状态机（纯逻辑，可测试）；
+//! - [`selection`]：页面文本选区状态机（纯逻辑，可测试）；
 //! - [`history`]：会话历史栈（纯逻辑，可测试）；
 //! - `app`（私有）：winit 事件循环 + wgpu 呈现胶水——**无法在无头环境
 //!   自动化测试**，实机运行验证（`cargo run -p nexty-chrome --bin nexty`）。
@@ -34,6 +35,8 @@ pub mod render;
 pub mod resources;
 #[cfg(feature = "scrollbar")]
 pub mod scrollbar;
+#[cfg(feature = "selection")]
+pub mod selection;
 #[cfg(feature = "ui")]
 pub mod ui;
 
