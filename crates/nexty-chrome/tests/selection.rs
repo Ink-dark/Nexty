@@ -167,3 +167,24 @@ fn empty_highlights_leave_scene_unchanged() {
     let empty = pipeline::build_scene_at_with_highlights(&page, &root, 0.0, 0.0, &[]);
     assert_eq!(plain.commands.len(), empty.commands.len());
 }
+
+#[test]
+fn highlight_matches_nested_block_lines_with_origin() {
+    let page = pipeline::load_page(
+        "<h2>1. title</h2><div style=\"width:320px; border:1px solid #999; padding:4px\">中文段落测试文本一二三四五六七八九十</div>",
+        "body { margin: 8px }",
+    );
+    let shaper = ParleyTextShaper::new();
+    let root = pipeline::layout_page(&page, &shaper, 800.0).expect("root");
+    let map = TextMap::new(&root);
+    let (from, to) = map.all().unwrap();
+    let rects = map.rects(from, to);
+    assert!(!rects.is_empty());
+    let scene = pipeline::build_scene_at_with_highlights(&page, &root, 0.0, 48.0, &rects);
+    let emitted = scene
+        .commands
+        .iter()
+        .filter(|command| matches!(command, Command::FillRect { color, .. } if color.a == 64))
+        .count();
+    assert_eq!(emitted, rects.len(), "高亮矩形应逐行发射");
+}

@@ -132,8 +132,24 @@ pub fn build_scene_at_with_highlights(
 ) -> Scene {
     let mut scene = Scene::default();
     let mut pool: HashMap<NodeId, usize> = HashMap::new();
+    // 高亮矩形相对根片段；先平移到场景坐标，递归 emit 里不再叠加 origin
+    //（emit 的 origin 是父链累积位置，不是场景原点）。
+    let highlights: Vec<LayoutRect> = highlights
+        .iter()
+        .map(|rect| LayoutRect {
+            x: rect.x + origin_x,
+            y: rect.y + origin_y,
+            ..*rect
+        })
+        .collect();
     emit(
-        page, root, origin_x, origin_y, &mut scene, &mut pool, highlights,
+        page,
+        root,
+        origin_x,
+        origin_y,
+        &mut scene,
+        &mut pool,
+        &highlights,
     );
     scene
 }
@@ -241,8 +257,8 @@ fn emit(
         // 选区高亮：垫在本行文字之下；只画与本行自身字形相交的矩形，
         // 避免嵌套行内原子盒的矩形在父行重复叠加。
         for highlight in highlights {
-            let highlight_x = origin_x + highlight.x;
-            let highlight_y = origin_y + highlight.y;
+            let highlight_x = highlight.x;
+            let highlight_y = highlight.y;
             if (highlight_y - line_y).abs() > 0.5 {
                 continue;
             }
