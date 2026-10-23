@@ -143,6 +143,12 @@ pub struct TextRun {
     pub text: Arc<str>,
     /// `text` 中每个字符回指源文本节点的字节区间（按 `chunk` 升序）。
     pub source_map: Arc<[SourceChar]>,
+    /// 本 run 在 `text` 中实际渲染的字节区间起点（行首裁掉的折叠空白之前）。
+    pub text_start: u32,
+    /// 实际渲染的字节区间终点（exclusive；行尾裁掉的折叠空白之后）。
+    pub text_end: u32,
+    /// 该 run 的 `white-space` 是否折叠空白（复制文本时裁掉选区边缘空格）。
+    pub collapses_whitespace: bool,
     /// 字形：x 相对片段内容盒左缘，y 相对**行基线**；`glyph.font` 指向
     /// [`TextRun::fonts`]。
     pub glyphs: Vec<Glyph>,

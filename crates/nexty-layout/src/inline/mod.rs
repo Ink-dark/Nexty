@@ -1018,17 +1018,17 @@ impl LineBuilder<'_> {
                         .as_ref()
                         .expect("text item shaped");
                     let mut glyphs = placed_item.glyphs.clone().expect("text has glyphs");
+                    let (span_start, span_end) = placed_item.span.expect("text has span");
+                    let mut visible_end = span_end;
                     // 行尾：折叠模式丢弃尾部空格（CSS Text §4.1 Phase II）
-                    if position == last_index
-                        && chunk.style.white_space.collapses()
-                        && let Some((start, end)) = placed_item.span
-                    {
-                        let stop = trailing_space_start(&chunk.text, start, end);
-                        if stop < end {
+                    if position == last_index && chunk.style.white_space.collapses() {
+                        let stop = trailing_space_start(&chunk.text, span_start, span_end);
+                        if stop < span_end {
                             let cut = shaped
                                 .glyphs
                                 .partition_point(|glyph| (glyph.cluster as usize) < stop);
                             glyphs.end = cut.max(glyphs.start);
+                            visible_end = stop;
                         }
                     }
                     if glyphs.is_empty() {
@@ -1057,6 +1057,7 @@ impl LineBuilder<'_> {
                                 run.glyphs
                                     .push(remap_glyph(glyph, &shaped.fonts, &mut run.fonts));
                             }
+                            run.text_end = visible_end as u32;
                         }
                         _ => runs.push(TextRun {
                             node: chunk.node,
@@ -1065,6 +1066,9 @@ impl LineBuilder<'_> {
                             color: chunk.style.color,
                             text: Arc::clone(&chunk.text),
                             source_map: Arc::clone(&chunk.source_map),
+                            text_start: span_start as u32,
+                            text_end: visible_end as u32,
+                            collapses_whitespace: chunk.style.white_space.collapses(),
                             fonts: shaped.fonts.clone(),
                             glyphs,
                         }),

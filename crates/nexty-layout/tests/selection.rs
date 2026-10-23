@@ -1,12 +1,12 @@
-//! T1：文本项 → 源文本节点映射与行首断行种类的集成测试。
+//! T1/T2：文本源映射、行首断行种类与选区几何的集成测试。
 //!
 //! 选区端点按「文本节点 + 源字节偏移」定位，复制文本按行的起点来源拼接；
-//! 这些测试全部走真实 `layout_document` 管线。
+//! 命中与矩形走真实 `layout_document` 管线。
 
 use nexty_css::{Stylesheet, compute_document_styles, html_ua_stylesheet};
 use nexty_dom::{Document, NodeId, NodeKind};
 use nexty_html::ParseOptions;
-use nexty_layout::{Fragment, LineStart, layout_document};
+use nexty_layout::{Fragment, LineStart, TextMap, TextPosition, layout_document};
 use nexty_text::ParleyTextShaper;
 use std::collections::HashMap;
 
@@ -175,4 +175,259 @@ fn sibling_text_nodes_keep_distinct_identity() {
     assert_eq!(&*runs[1].text, "b");
     assert_eq!(runs[0].text_node, text_nodes[0]);
     assert_eq!(runs[1].text_node, text_nodes[1]);
+}
+
+// ---------------------------------------------------------------------------
+// T2：选区几何与复制文本（TextMap）
+// ---------------------------------------------------------------------------
+
+/// 元素内容盒在根片段坐标系中的原点（与 `hit_test_ex` 同一坐标约定）。
+fn content_origin(document: &Document, root: &Fragment, name: &str) -> Option<(f32, f32)> {
+    fn walk(
+        document: &Document,
+        fragment: &Fragment,
+        name: &str,
+        ox: f32,
+        oy: f32,
+    ) -> Option<(f32, f32)> {
+        let border_x = ox + fragment.border_box.x;
+        let border_y = oy + fragment.border_box.y;
+        let content_x = border_x + fragment.border.left + fragment.padding.left;
+        let content_y = border_y + fragment.border.top + fragment.padding.top;
+        if matches!(
+            document.node(fragment.node),
+            Some(NodeKind::Element(data)) if data.name == name
+        ) {
+            return Some((content_x, content_y));
+        }
+        let mut line_offset = 0.0;
+        for line in &fragment.lines {
+            for atomic in &line.boxes {
+                if let Some(found) =
+                    walk(document, atomic, name, content_x, content_y + line_offset)
+                {
+                    return Some(found);
+                }
+            }
+            line_offset += line.height;
+        }
+        for child in &fragment.children {
+            if let Some(found) = walk(document, child, name, content_x, content_y) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(document, root, name, 0.0, 0.0)
+}
+
+/// 某行第 `glyph_index` 个字形的点（`right_half` 取右半区）。
+fn point_on_glyph(
+    document: &Document,
+    root: &Fragment,
+    name: &str,
+    line_index: usize,
+    glyph_index: usize,
+    right_half: bool,
+) -> (f32, f32) {
+    let (content_x, content_y) = content_origin(document, root, name).expect("element origin");
+    let fragment = find(document, root, name).expect("element fragment");
+    let top: f32 = content_y
+        + fragment.lines[..line_index]
+            .iter()
+            .map(|line| line.height)
+            .sum::<f32>();
+    let glyphs: Vec<_> = fragment.lines[line_index]
+        .runs
+        .iter()
+        .flat_map(|run| run.glyphs.iter())
+        .collect();
+    let glyph = glyphs[glyph_index];
+    let x = content_x
+        + glyph.x
+        + if right_half {
+            glyph.advance * 0.75
+        } else {
+            glyph.advance * 0.25
+        };
+    (x, top + fragment.lines[line_index].height / 2.0)
+}
+
+fn text_position(node: NodeId, offset: usize) -> TextPosition {
+    TextPosition { node, offset }
+}
+
+#[test]
+fn hit_snaps_to_glyph_halves_and_line_ends() {
+    let (document, root) = layout("<p>ab</p>", "", 400.0);
+    let map = TextMap::new(&root);
+    let node = direct_text_node(&document, find(&document, &root, "p").unwrap().node);
+
+    let (x, y) = point_on_glyph(&document, &root, "p", 0, 0, false);
+    assert_eq!(map.hit(x, y), Some(text_position(node, 0)));
+    let (x, y) = point_on_glyph(&document, &root, "p", 0, 0, true);
+    assert_eq!(map.hit(x, y), Some(text_position(node, 1)));
+    let (x, y) = point_on_glyph(&document, &root, "p", 0, 1, true);
+    assert_eq!(map.hit(x, y), Some(text_position(node, 2)));
+}
+
+#[test]
+fn hit_never_splits_grapheme_clusters() {
+    let (document, root) = layout("<p>e\u{0301}x</p>", "", 400.0);
+    let map = TextMap::new(&root);
+    let node = direct_text_node(&document, find(&document, &root, "p").unwrap().node);
+
+    let (x, y) = point_on_glyph(&document, &root, "p", 0, 0, false);
+    assert_eq!(map.hit(x, y), Some(text_position(node, 0)));
+    let (x, y) = point_on_glyph(&document, &root, "p", 0, 0, true);
+    assert_eq!(
+        map.hit(x, y),
+        Some(text_position(node, 3)),
+        "组合序列内部不得产生位置"
+    );
+}
+
+#[test]
+fn rects_cover_selected_glyphs() {
+    let (document, root) = layout("<p>abc</p>", "", 400.0);
+    let map = TextMap::new(&root);
+    let p = find(&document, &root, "p").unwrap();
+    let node = direct_text_node(&document, p.node);
+    let (content_x, _) = content_origin(&document, &root, "p").unwrap();
+
+    let rects = map.rects(text_position(node, 0), text_position(node, 2));
+    assert_eq!(rects.len(), 1);
+    let first = p.lines[0].runs[0].glyphs[0];
+    let second = p.lines[0].runs[0].glyphs[1];
+    assert!((rects[0].x - (content_x + first.x)).abs() < 0.5);
+    let expected_right = content_x + second.x + second.advance;
+    assert!((rects[0].x + rects[0].width - expected_right).abs() < 0.5);
+
+    // 反向端点得到相同矩形；空选区不产出矩形。
+    assert_eq!(
+        rects,
+        map.rects(text_position(node, 2), text_position(node, 0))
+    );
+    assert!(
+        map.rects(text_position(node, 1), text_position(node, 1))
+            .is_empty()
+    );
+}
+
+#[test]
+fn rects_are_per_visual_line() {
+    let (_document, root) = layout("<p>abc def</p>", "", 40.0);
+    let map = TextMap::new(&root);
+    let (from, to) = map.all().unwrap();
+    let rects = map.rects(from, to);
+    assert!(rects.len() >= 2, "跨行选区必须逐行产出矩形");
+    for pair in rects.windows(2) {
+        assert!(pair[1].y >= pair[0].y + pair[0].height - 0.5);
+    }
+}
+
+#[test]
+fn resolve_clamps_and_rejects_unknown_nodes() {
+    let (document, root) = layout("<p>abc</p>", "", 400.0);
+    let map = TextMap::new(&root);
+    let p = find(&document, &root, "p").unwrap();
+    let node = direct_text_node(&document, p.node);
+
+    assert!(
+        map.resolve(text_position(p.node, 0)).is_none(),
+        "元素节点不是文本端点"
+    );
+    let clamped = map.resolve(text_position(node, 999)).unwrap();
+    assert_eq!(clamped.node, node);
+    assert_eq!(clamped.offset, 3);
+    assert_eq!(
+        map.resolve(text_position(node, 1)),
+        Some(text_position(node, 1))
+    );
+}
+
+#[test]
+fn word_range_selects_latin_word_and_single_cjk_char() {
+    let (document, root) = layout("<p>hello world</p>", "", 400.0);
+    let map = TextMap::new(&root);
+    let (x, y) = point_on_glyph(&document, &root, "p", 0, 7, false);
+    let (from, to) = map.word_range(map.hit(x, y).unwrap()).unwrap();
+    assert_eq!(map.text(from, to), "world");
+
+    // 空白上双击不选词。
+    let (x, y) = point_on_glyph(&document, &root, "p", 0, 5, false);
+    assert!(map.word_range(map.hit(x, y).unwrap()).is_none());
+
+    let (document, root) = layout("<p>汉字</p>", "", 400.0);
+    let map = TextMap::new(&root);
+    let (x, y) = point_on_glyph(&document, &root, "p", 0, 0, false);
+    let (from, to) = map.word_range(map.hit(x, y).unwrap()).unwrap();
+    assert_eq!(map.text(from, to), "汉");
+}
+
+#[test]
+fn text_joins_soft_wrap_with_space() {
+    let (_document, root) = layout("<p>abc def</p>", "", 40.0);
+    let map = TextMap::new(&root);
+    let (from, to) = map.all().unwrap();
+    assert_eq!(map.text(from, to), "abc def");
+}
+
+#[test]
+fn text_inserts_newlines_for_hard_breaks_and_blocks() {
+    let (_document, root) = layout("<p>a<br>b</p>", "", 400.0);
+    let map = TextMap::new(&root);
+    let (from, to) = map.all().unwrap();
+    assert_eq!(map.text(from, to), "a\nb");
+
+    let (_document, root) = layout("<p>a<br><br>b</p>", "", 400.0);
+    let map = TextMap::new(&root);
+    let (from, to) = map.all().unwrap();
+    assert_eq!(map.text(from, to), "a\n\nb");
+
+    let (_document, root) = layout("<p>a</p><p>b</p>", "", 400.0);
+    let map = TextMap::new(&root);
+    let (from, to) = map.all().unwrap();
+    assert_eq!(map.text(from, to), "a\nb");
+
+    let (_document, root) = layout("<pre>a\nb</pre>", "", 400.0);
+    let map = TextMap::new(&root);
+    let (from, to) = map.all().unwrap();
+    assert_eq!(map.text(from, to), "a\nb");
+}
+
+#[test]
+fn text_keeps_inline_content_and_preserved_whitespace() {
+    let (_document, root) = layout("<p>a <b>b</b></p>", "", 400.0);
+    let map = TextMap::new(&root);
+    let (from, to) = map.all().unwrap();
+    assert_eq!(map.text(from, to), "a b");
+
+    // 行内原子盒内的文本按行内拼接，不插换行。
+    let (_document, root) = layout(
+        "<p>a<span style=\"display:inline-block\">b</span></p>",
+        "",
+        400.0,
+    );
+    let map = TextMap::new(&root);
+    let (from, to) = map.all().unwrap();
+    assert_eq!(map.text(from, to), "ab");
+
+    // pre 保留首尾空格；折叠模式裁掉选区边缘空格。
+    let (_document, root) = layout("<pre> a </pre>", "", 400.0);
+    let map = TextMap::new(&root);
+    let (from, to) = map.all().unwrap();
+    assert_eq!(map.text(from, to), " a ");
+
+    let (_document, root) = layout("<p>  abc  </p>", "", 400.0);
+    let map = TextMap::new(&root);
+    let (from, to) = map.all().unwrap();
+    assert_eq!(map.text(from, to), "abc");
+}
+
+#[test]
+fn all_is_none_without_text() {
+    let (_document, root) = layout("<p></p>", "", 400.0);
+    let map = TextMap::new(&root);
+    assert!(map.all().is_none());
 }

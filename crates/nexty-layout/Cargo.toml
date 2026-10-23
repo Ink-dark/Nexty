@@ -11,7 +11,7 @@ rust-version.workspace = true
 # 默认开启全部已实现能力；下游 nexty-chrome 依赖默认即可获得完整布局栈。
 # 未实现的能力（table）不在 default 中，feature 槽位已预留，待对应任务落地时
 # 补全实现并加入 default。
-default = ["block", "inline", "flex", "replaced", "taffy-map", "grid", "absolute"]
+default = ["block", "inline", "flex", "replaced", "taffy-map", "grid", "absolute", "selection"]
 # 块级流：几何解算由 taffy 接管（CSS 2.1 §9.2 / §10.3 / §10.5–10.7）。taffy
 # 管线是块级流的唯一实现，故隐含 inline（行内断行喂给匿名块 measure 节点）与
 # taffy-map（盒树构建 + 样式映射）。
@@ -37,6 +37,8 @@ absolute = []
 # ComputedStyle → taffy::Style 映射层（style_map）与盒树构建（tree_build）。
 # 块级流的 taffy 管线复用 inline 模块断行，故依赖 inline。
 taffy-map = ["inline"]
+# 文本选区几何：命中、选区矩形与复制文本重建（消费 Fragment 树，隐含 block）。
+selection = ["block"]
 
 [dependencies]
 nexty-dom = { path = "../nexty-dom", version = "0.1.0" }

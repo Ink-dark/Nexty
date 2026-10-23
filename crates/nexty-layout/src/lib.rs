@@ -29,7 +29,8 @@
 //! `flex`（flex 容器 blockify 与 taffy Display::Flex 映射，含 wrap/shrink/对齐）、
 //! `replaced`（`<img>` 替换盒）、`taffy-map`（`ComputedStyle → taffy::Style` 映射层
 //! 与盒树构建）、`grid`（grid-* 样式映射与 Display::Grid）、`absolute`（position
-//! 与 inset 映射）。`table` 为预留槽位，当前未实现故不在 default。`taffy`
+//! 与 inset 映射）、`selection`（文本命中、选区矩形与复制文本重建）。`table`
+//! 为预留槽位，当前未实现故不在 default。`taffy`
 //! 依赖常驻（feature 只切能力开关，不切依赖）。
 
 #![forbid(unsafe_code)]
@@ -47,12 +48,17 @@ mod block;
 mod fragment;
 #[cfg(any(feature = "inline", feature = "replaced"))]
 mod inline;
+#[cfg(feature = "selection")]
+mod selection;
 #[cfg(feature = "taffy-map")]
 mod style_map;
 #[cfg(feature = "taffy-map")]
 mod tree_build;
 
 pub use fragment::{Edges, Fragment, ImageRun, LineFragment, LineStart, Rect, SourceChar, TextRun};
+
+#[cfg(feature = "selection")]
+pub use selection::{TextMap, TextPosition};
 
 #[cfg(feature = "inline")]
 pub use inline::{
