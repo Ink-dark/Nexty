@@ -186,6 +186,13 @@ fn map_display(d: DisplayValue) -> Display {
     }
 }
 
+/// 数值卫生纵深防御：css 层的解析/计算出口已钳值，此处兜底——映射进 taffy
+/// 的长度/百分比若异常为非有限值，按 `auto` / 0 降级，污染隔离在单元素，
+/// 不向兄弟与整页扩散。
+fn finite(value: f32) -> Option<f32> {
+    value.is_finite().then_some(value)
+}
+
 /// `width` / `height` / `flex-basis`：auto / 长度 / 百分比 → taffy `Dimension`。
 ///
 /// 视口单位只在 cascade 提供视口时折算为 `Length`；未折算的残留值按
@@ -193,8 +200,8 @@ fn map_display(d: DisplayValue) -> Display {
 fn map_dimension(v: SizeValue) -> Dimension {
     match v {
         SizeValue::Auto => sh::auto(),
-        SizeValue::Length(f) => sh::length(f),
-        SizeValue::Percent(p) => sh::percent(p),
+        SizeValue::Length(f) => finite(f).map_or_else(sh::auto, sh::length),
+        SizeValue::Percent(p) => finite(p).map_or_else(sh::auto, sh::percent),
         SizeValue::Viewport(..) => sh::auto(),
     }
 }
@@ -203,16 +210,16 @@ fn map_dimension(v: SizeValue) -> Dimension {
 fn map_lp_auto(v: SizeValue) -> LengthPercentageAuto {
     match v {
         SizeValue::Auto => sh::auto(),
-        SizeValue::Length(f) => sh::length(f),
-        SizeValue::Percent(p) => sh::percent(p),
+        SizeValue::Length(f) => finite(f).map_or_else(sh::auto, sh::length),
+        SizeValue::Percent(p) => finite(p).map_or_else(sh::auto, sh::percent),
         SizeValue::Viewport(..) => sh::auto(),
     }
 }
 
 fn margin_side(v: MarginValue) -> LengthPercentageAuto {
     match v {
-        MarginValue::Length(f) => sh::length(f),
-        MarginValue::Percent(p) => sh::percent(p),
+        MarginValue::Length(f) => finite(f).map_or_else(sh::auto, sh::length),
+        MarginValue::Percent(p) => finite(p).map_or_else(sh::auto, sh::percent),
         MarginValue::Auto => sh::auto(),
         MarginValue::Viewport(..) => sh::auto(),
     }
@@ -220,8 +227,8 @@ fn margin_side(v: MarginValue) -> LengthPercentageAuto {
 
 fn padding_side(v: PaddingValue) -> LengthPercentage {
     match v {
-        PaddingValue::Length(f) => sh::length(f),
-        PaddingValue::Percent(p) => sh::percent(p),
+        PaddingValue::Length(f) => sh::length(finite(f).unwrap_or(0.0)),
+        PaddingValue::Percent(p) => sh::percent(finite(p).unwrap_or(0.0)),
         // 未折算的视口单位按 0 降级（padding 无 auto）。
         PaddingValue::Viewport(..) => sh::length(0.0),
     }
@@ -231,8 +238,8 @@ fn padding_side(v: PaddingValue) -> LengthPercentage {
 #[cfg(feature = "absolute")]
 fn inset_side(v: InsetValue) -> LengthPercentageAuto {
     match v {
-        InsetValue::Length(f) => sh::length(f),
-        InsetValue::Percent(p) => sh::percent(p),
+        InsetValue::Length(f) => finite(f).map_or_else(sh::auto, sh::length),
+        InsetValue::Percent(p) => finite(p).map_or_else(sh::auto, sh::percent),
         InsetValue::Auto => sh::auto(),
         InsetValue::Viewport(..) => sh::auto(),
     }
@@ -240,13 +247,13 @@ fn inset_side(v: InsetValue) -> LengthPercentageAuto {
 
 /// border 宽度（computed 阶段 style 为 none/hidden 已归零）按长度处理。
 fn border_side(v: f32) -> LengthPercentage {
-    sh::length(v)
+    sh::length(finite(v).unwrap_or(0.0))
 }
 
 fn gap_side(v: GapValue) -> LengthPercentage {
     match v {
-        GapValue::Length(f) => sh::length(f),
-        GapValue::Percent(p) => sh::percent(p),
+        GapValue::Length(f) => sh::length(finite(f).unwrap_or(0.0)),
+        GapValue::Percent(p) => sh::percent(finite(p).unwrap_or(0.0)),
         // `normal` 在 flex/grid 中等价于 0；未折算的视口单位同。
         GapValue::Normal | GapValue::Viewport(..) => sh::length(0.0),
     }

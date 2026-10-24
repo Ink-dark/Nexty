@@ -49,7 +49,9 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use nexty_css::{ComputedStyle, DisplayValue, LineHeightValue, OverflowWrapValue, WordBreakValue};
+use nexty_css::{
+    ComputedStyle, DisplayValue, LineHeightValue, MAX_CSS_LENGTH, OverflowWrapValue, WordBreakValue,
+};
 use nexty_dom::{Document, ElementData, Namespace, NodeId, NodeKind};
 use nexty_text::{FontMetrics, Glyph, ResolvedFont, ShapedText, TextShaper, TextStyle};
 
@@ -129,7 +131,12 @@ pub(crate) fn image_box_size(
     (width, height)
 }
 
-/// 尺寸属性 → px（HTML 尺寸属性是无符号整数；宽松解析前导数字）。
+/// 尺寸属性 → px（WHATWG HTML §2.4.4.2 非负整数规则：跳过前导空白、可选
+/// `+` 号、ASCII 数字串、尾部垃圾忽略；小数点不属于非负整数，`40.5` → 40）。
+///
+/// 结果必须有限、`> 0` 且 ≤ [`MAX_CSS_LENGTH`]（与 css 值层同一上限），否则
+/// 返回 `None` 回落自然尺寸——`<img width="999…9">` 式巨数属性注入的 `inf`
+/// 在此被挡在布局之外。
 fn attribute_px(data: &ElementData, name: &str) -> Option<f32> {
     let raw = data
         .attributes
@@ -137,11 +144,25 @@ fn attribute_px(data: &ElementData, name: &str) -> Option<f32> {
         .find(|attr| attr.name == name)?
         .value
         .trim();
-    let digits: String = raw
-        .chars()
-        .take_while(|character| character.is_ascii_digit() || *character == '.')
-        .collect();
-    digits.parse::<f32>().ok().filter(|value| *value > 0.0)
+    let raw = raw.strip_prefix('+').unwrap_or(raw);
+    let digits_end = raw
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(raw.len());
+    if digits_end == 0 {
+        return None;
+    }
+    let mut integer: u64 = 0;
+    for byte in &raw.as_bytes()[..digits_end] {
+        integer = integer
+            .saturating_mul(10)
+            .saturating_add(u64::from(byte - b'0'));
+    }
+    let value = integer as f32;
+    if value.is_finite() && value > 0.0 && value <= MAX_CSS_LENGTH {
+        Some(value)
+    } else {
+        None
+    }
 }
 
 /// `node` 是否为 HTML 命名空间的 `<img>`。
@@ -626,6 +647,14 @@ pub(crate) fn build_lines(
     if items.is_empty() {
         return Vec::new();
     }
+
+    // 数值卫生兜底：包含块宽度异常为非有限值时按 0 降级，行内坐标不从
+    // 非有限起点扩散（污染隔离在单元素）。
+    let max_width = if max_width.is_finite() {
+        max_width
+    } else {
+        0.0
+    };
 
     // 每块文本只整形一次（cluster 映射与断点都基于同一结果）
     let shaped_items: Vec<Option<ShapedText>> = items

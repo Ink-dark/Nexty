@@ -35,7 +35,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use nexty_css::{ComputedStyle, DisplayValue};
-use nexty_dom::{NodeId, NodeKind};
+use nexty_dom::{MAX_TREE_DEPTH, NodeId, NodeKind};
 use taffy::compute::compute_leaf_layout;
 use taffy::geometry::Size as TaffySize;
 use taffy::style::{AvailableSpace, Display, Style};
@@ -353,6 +353,12 @@ fn root_style(ctx: &Context<'_>, root: NodeId) -> ComputedStyle {
 /// 返回 `None` 表示 taffy 建节点失败（内部 SlotMap 容量错误）：不登记映射，该
 /// 子树降级为「无盒」。刻意不用 panic——渲染隔离要求布局层不炸进程。
 fn build_box<'a>(ctx: &'a Context<'a>, boxes: &mut BoxTree<'a>, node: NodeId) -> Option<TaffyNode> {
+    // 纵深防御：主防线在 HTML 解析入口的深度截断（MAX_TREE_DEPTH），此处
+    // debug 断言遍历不越过预算——栈溢出是 abort 而非 panic，兜不住。
+    debug_assert!(
+        (ctx.document.depth(node) as usize) <= MAX_TREE_DEPTH,
+        "DOM depth exceeds MAX_TREE_DEPTH"
+    );
     let style = root_style(ctx, node);
     let kind = container_kind(&style);
 
@@ -396,6 +402,10 @@ fn collect_children_boxes<'a>(
     run: &mut Option<InlineRun<'a>>,
     participants: &mut Vec<TaffyNode>,
 ) {
+    debug_assert!(
+        (ctx.document.depth(node) as usize) <= MAX_TREE_DEPTH,
+        "DOM depth exceeds MAX_TREE_DEPTH"
+    );
     for child in ctx.document.children(node) {
         match ctx.document.node(child) {
             Some(NodeKind::Text(text)) => {
