@@ -444,7 +444,10 @@ fn collect_children_boxes<'a>(
         "DOM depth exceeds MAX_TREE_DEPTH"
     );
     // flex 走法下每段行内流都是独立匿名 item（自身是块容器，首行适用缩进）
+    #[cfg(feature = "flex")]
     let indent_every_run = kind == WalkKind::FlexItems;
+    #[cfg(not(feature = "flex"))]
+    let indent_every_run = false;
     for child in ctx.document.children(node) {
         match ctx.document.node(child) {
             Some(NodeKind::Text(text)) => {
