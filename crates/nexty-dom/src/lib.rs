@@ -27,7 +27,7 @@ pub use node::{
     ProcessingInstructionData, QuirksMode,
 };
 #[cfg(feature = "tree")]
-pub use tree::{Children, Document};
+pub use tree::{Children, Document, MAX_TREE_DEPTH};
 
 #[cfg(all(test, feature = "tree"))]
 mod tests {
@@ -453,5 +453,151 @@ mod tests {
         let mut doc = Document::new();
         doc.set_quirks_mode(QuirksMode::Quirks);
         assert_eq!(doc.quirks_mode(), QuirksMode::Quirks);
+    }
+
+    // ---- 树深度维护（不可信输入防线的地基） ----
+
+    #[test]
+    fn depth_is_zero_for_root_and_grows_per_level() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        assert_eq!(doc.depth(root), 0);
+
+        let html = element(&mut doc, "html");
+        let body = element(&mut doc, "body");
+        let div = element(&mut doc, "div");
+        doc.append_child(html, root).unwrap();
+        doc.append_child(body, html).unwrap();
+        doc.append_child(div, body).unwrap();
+
+        assert_eq!(doc.depth(html), 1);
+        assert_eq!(doc.depth(body), 2);
+        assert_eq!(doc.depth(div), 3);
+    }
+
+    #[test]
+    fn insert_before_assigns_reference_depth() {
+        let mut doc = Document::new();
+        let parent = element(&mut doc, "div");
+        doc.append_child(parent, doc.root()).unwrap();
+        let a = element(&mut doc, "span");
+        let b = element(&mut doc, "span");
+        doc.append_child(a, parent).unwrap();
+        doc.insert_before(b, parent, Some(a)).unwrap();
+
+        assert_eq!(doc.depth(parent), 1);
+        assert_eq!(doc.depth(b), 2);
+    }
+
+    #[test]
+    fn replace_child_assigns_replacement_depth() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let a = element(&mut doc, "div");
+        let b = element(&mut doc, "div");
+        doc.append_child(a, root).unwrap();
+        doc.replace_child(a, b, root).unwrap();
+
+        assert_eq!(doc.depth(b), 1);
+        assert_eq!(doc.depth(a), 1, "detach 不清深度，游离节点值无意义");
+    }
+
+    #[test]
+    fn relinking_recomputes_depth_from_new_parent() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let deep = element(&mut doc, "div"); // root > deep：1
+        doc.append_child(deep, root).unwrap();
+        let shallow = element(&mut doc, "div"); // deep > shallow：2
+        doc.append_child(shallow, deep).unwrap();
+        let nest = element(&mut doc, "div"); // shallow > nest：3
+        doc.append_child(nest, shallow).unwrap();
+        let inner = element(&mut doc, "div"); // deep > inner：2
+        doc.append_child(inner, deep).unwrap();
+        let grand = element(&mut doc, "div");
+        doc.append_child(grand, inner).unwrap();
+        assert_eq!(doc.depth(inner), 2);
+
+        // 挂到更深的父节点：深度抬升，子树跟着平移
+        doc.append_child(inner, nest).unwrap();
+        assert_eq!(doc.depth(inner), 4);
+        assert_eq!(doc.depth(grand), 5);
+
+        // 挂回原父节点：深度回落
+        doc.append_child(inner, deep).unwrap();
+        assert_eq!(doc.depth(inner), 2);
+        assert_eq!(doc.depth(grand), 3);
+    }
+
+    #[test]
+    fn moved_subtree_depths_track_new_position() {
+        let mut doc = Document::new();
+        let source = element(&mut doc, "ul");
+        let item = element(&mut doc, "li");
+        let label = element(&mut doc, "em");
+        doc.append_child(item, source).unwrap();
+        doc.append_child(label, item).unwrap();
+
+        let target = element(&mut doc, "div");
+        let shell = element(&mut doc, "section");
+        doc.append_child(shell, target).unwrap();
+        doc.append_child(shell, doc.root()).unwrap();
+        assert_eq!(doc.depth(shell), 1);
+
+        // 整棵子树挂到 shell 下：全部按新位置重算
+        doc.append_child(item, shell).unwrap();
+        assert_eq!(doc.depth(item), 2);
+        assert_eq!(doc.depth(label), 3);
+    }
+
+    #[test]
+    fn fragment_insert_assigns_children_depths() {
+        let mut doc = Document::new();
+        let parent = element(&mut doc, "div");
+        doc.append_child(parent, doc.root()).unwrap();
+        let fragment = doc.create_node(NodeKind::DocumentFragment);
+        let a = element(&mut doc, "span");
+        doc.append_child(a, fragment).unwrap();
+
+        doc.append_child(fragment, parent).unwrap();
+        assert_eq!(doc.depth(a), 2);
+    }
+
+    #[test]
+    fn template_contents_depth_restarts_from_zero() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let deep = element(&mut doc, "div");
+        let mut current = deep;
+        doc.append_child(deep, root).unwrap();
+        for _ in 0..10 {
+            let next = element(&mut doc, "div");
+            doc.append_child(next, current).unwrap();
+            current = next;
+        }
+        assert_eq!(doc.depth(current), 11);
+
+        let template = element(&mut doc, "template");
+        doc.append_child(template, current).unwrap();
+        let contents = doc.create_node(NodeKind::DocumentFragment);
+        let inner = element(&mut doc, "span");
+        doc.append_child(inner, contents).unwrap();
+        doc.set_template_contents(template, contents);
+
+        assert_eq!(doc.depth(contents), 0, "模板内容片段独立起算");
+        assert_eq!(doc.depth(inner), 1);
+    }
+
+    #[test]
+    fn deep_chain_well_under_max_depth_stays_consistent() {
+        let mut doc = Document::new();
+        let mut current = doc.root();
+        for i in 0..(MAX_TREE_DEPTH + 64) {
+            let node = element(&mut doc, "div");
+            doc.append_child(node, current).unwrap();
+            current = node;
+            assert_eq!(doc.depth(current), (i + 1) as u32);
+        }
+        assert_eq!(doc.depth(current), (MAX_TREE_DEPTH + 64) as u32);
     }
 }
