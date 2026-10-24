@@ -22,7 +22,8 @@ use crate::value::{
     FontFamilyValue, FontSizeValue, FontStyleValue, FontWeightValue, GapValue, GridAutoFlowValue,
     GridTrackList, InsetValue, JustifyContentValue, LineHeightValue, MAX_CSS_LENGTH, MarginValue,
     OverflowValue, OverflowWrapValue, PaddingValue, PositionValue, PropertyId, PropertyValue, Rgba,
-    SizeValue, TextAlignValue, ViewportUnit, WhiteSpaceValue, WordBreakValue,
+    SizeValue, SpacingValue, TabSizeValue, TextAlignValue, TextIndentValue, ViewportUnit,
+    WhiteSpaceValue, WordBreakValue,
 };
 
 /// 本层 UA 的 medium 字号基准（CSS Fonts 4 §2.5：initial 值由 UA 决定，
@@ -57,6 +58,14 @@ pub struct ComputedStyle {
     pub overflow_wrap: OverflowWrapValue,
     /// `word-break`（CSS Text 3 §5.1）。
     pub word_break: WordBreakValue,
+    /// `letter-spacing` 的附加字距（CSS px；`normal` 与 0 同义，CSS Text 3 §8.1）。
+    pub letter_spacing: f32,
+    /// `word-spacing`（CSS Text 3 §8.2；`normal` 语义保留给 layout，em 已折算）。
+    pub word_spacing: SpacingValue,
+    /// `text-indent`（CSS Text 3 §4；em 已折算，百分比由 layout 按包含块解析）。
+    pub text_indent: TextIndentValue,
+    /// `tab-size`（CSS Text 3 §5；整数形态由 layout 按空格 advance 解析）。
+    pub tab_size: TabSizeValue,
     /// `width`（百分比由 layout 解析）。
     pub width: SizeValue,
     /// `height`（百分比由 layout 解析）。
@@ -162,6 +171,10 @@ impl ComputedStyle {
             white_space: WhiteSpaceValue::Normal,
             overflow_wrap: OverflowWrapValue::Normal,
             word_break: WordBreakValue::Normal,
+            letter_spacing: 0.0,
+            word_spacing: SpacingValue::Normal,
+            text_indent: TextIndentValue::Length(0.0),
+            tab_size: TabSizeValue::Integer(8),
             width: SizeValue::Auto,
             height: SizeValue::Auto,
             min_width: SizeValue::Auto,
@@ -210,6 +223,10 @@ impl PropertyId {
                 | Self::WhiteSpace
                 | Self::OverflowWrap
                 | Self::WordBreak
+                | Self::LetterSpacing
+                | Self::WordSpacing
+                | Self::TextIndent
+                | Self::TabSize
         )
     }
 }
@@ -219,7 +236,7 @@ impl PropertyId {
 /// 顺序承载计算依赖：`FontSize` 先于 `LineHeight`（百分比按自身字号折算）、
 /// `Color` 先于 border 颜色（currentcolor）、border style 先于 width
 /// （none/hidden 时宽度归零）。
-const PROPERTY_ORDER: [PropertyId; 58] = [
+const PROPERTY_ORDER: [PropertyId; 62] = [
     PropertyId::Display,
     PropertyId::Color,
     PropertyId::BackgroundColor,
@@ -232,6 +249,10 @@ const PROPERTY_ORDER: [PropertyId; 58] = [
     PropertyId::WhiteSpace,
     PropertyId::OverflowWrap,
     PropertyId::WordBreak,
+    PropertyId::LetterSpacing,
+    PropertyId::WordSpacing,
+    PropertyId::TextIndent,
+    PropertyId::TabSize,
     PropertyId::Width,
     PropertyId::Height,
     PropertyId::MinWidth,
@@ -678,6 +699,41 @@ fn resolve_all(
             (PropertyId::WordBreak, Decision::Use(PropertyValue::WordBreak(value))) => {
                 style.word_break = *value;
             }
+            (PropertyId::LetterSpacing, Decision::Use(PropertyValue::LetterSpacing(value))) => {
+                // CSS Text 3 §8.1：normal 的 used value 与 0 同义
+                style.letter_spacing = match *value {
+                    SpacingValue::Normal => 0.0,
+                    SpacingValue::Length(px) => px,
+                    SpacingValue::Em(em) => clamp_computed(style.font_size * em),
+                };
+            }
+            (PropertyId::WordSpacing, Decision::Use(PropertyValue::WordSpacing(value))) => {
+                // normal 的语义保留给 layout 判读（CSS Text 3 §8.2）
+                style.word_spacing = match *value {
+                    SpacingValue::Normal => SpacingValue::Normal,
+                    SpacingValue::Length(px) => SpacingValue::Length(px),
+                    SpacingValue::Em(em) => {
+                        SpacingValue::Length(clamp_computed(style.font_size * em))
+                    }
+                };
+            }
+            (PropertyId::TextIndent, Decision::Use(PropertyValue::TextIndent(value))) => {
+                style.text_indent = match *value {
+                    TextIndentValue::Em(em) => {
+                        TextIndentValue::Length(clamp_computed(style.font_size * em))
+                    }
+                    other => other,
+                };
+            }
+            (PropertyId::TabSize, Decision::Use(PropertyValue::TabSize(value))) => {
+                style.tab_size = match *value {
+                    // 整数形态依赖空格 advance（字体度量），保留给 layout
+                    TabSizeValue::Em(em) => {
+                        TabSizeValue::Length(clamp_computed(style.font_size * em))
+                    }
+                    other => other,
+                };
+            }
             (PropertyId::Width, Decision::Use(PropertyValue::Size(value))) => {
                 style.width = resolve_size(*value, viewport);
             }
@@ -835,6 +891,10 @@ fn resolve_all(
                     PropertyId::WhiteSpace => style.white_space = source.white_space,
                     PropertyId::OverflowWrap => style.overflow_wrap = source.overflow_wrap,
                     PropertyId::WordBreak => style.word_break = source.word_break,
+                    PropertyId::LetterSpacing => style.letter_spacing = source.letter_spacing,
+                    PropertyId::WordSpacing => style.word_spacing = source.word_spacing,
+                    PropertyId::TextIndent => style.text_indent = source.text_indent,
+                    PropertyId::TabSize => style.tab_size = source.tab_size,
                     PropertyId::Width => style.width = source.width,
                     PropertyId::Height => style.height = source.height,
                     PropertyId::MinWidth => style.min_width = source.min_width,
@@ -1670,5 +1730,63 @@ mod tests {
         let sheet = Stylesheet::parse("pre { white-space: pre-wrap }");
         let styles = compute_document_styles(&document, &[&sheet], Some(html_ua_stylesheet()));
         assert_eq!(styles[&pre].white_space, WhiteSpaceValue::PreWrap);
+    }
+
+    /// CSS Text 3 四属性：initial、em 按自身字号折算、percentage 保留原值、
+    /// 继承（四属性均 inherited）。
+    #[test]
+    fn css_text_spacing_properties_compute_and_inherit() {
+        // initial 值：letter-spacing 0（normal 折算）、word-spacing normal、
+        // text-indent 0、tab-size 整数 8（CSS Text 3 §5 initial）
+        let style = style_of("<span>x</span>", &[], "span");
+        assert_eq!(style.letter_spacing, 0.0);
+        assert_eq!(style.word_spacing, SpacingValue::Normal);
+        assert_eq!(style.text_indent, TextIndentValue::Length(0.0));
+        assert_eq!(style.tab_size, TabSizeValue::Integer(8));
+
+        // em 按本元素 font-size 折算（先于自身求值的 FontSize，PROPERTY_ORDER）
+        let style = style_of(
+            "<div style=\"font-size: 20px; letter-spacing: 0.5em; word-spacing: 2em;\
+             text-indent: 1.5em; tab-size: 2em\">x</div>",
+            &[],
+            "div",
+        );
+        assert_eq!(style.letter_spacing, 10.0);
+        assert_eq!(style.word_spacing, SpacingValue::Length(40.0));
+        assert_eq!(style.text_indent, TextIndentValue::Length(30.0));
+        assert_eq!(style.tab_size, TabSizeValue::Length(40.0));
+
+        // percentage 保留原值（text-indent 由 layout 按包含块宽度解析）
+        let style = style_of("<div style=\"text-indent: 10%\">x</div>", &[], "div");
+        assert_eq!(style.text_indent, TextIndentValue::Percent(0.1));
+
+        // 负 letter-spacing 合法
+        let style = style_of("<div style=\"letter-spacing: -2px\">x</div>", &[], "div");
+        assert_eq!(style.letter_spacing, -2.0);
+
+        // 四属性均继承：子元素无声明时取父值
+        let document = build_document(
+            "<div style=\"letter-spacing: 4px; word-spacing: 8px; text-indent: 40px; tab-size: 4\">\
+             <p>x</p></div>",
+        );
+        let parsed = Stylesheet::parse("");
+        let div_style = cascade(
+            &document,
+            find_first_by_name(&document, "div").unwrap(),
+            &[&parsed],
+            None,
+            None,
+        );
+        let p_style = cascade(
+            &document,
+            find_first_by_name(&document, "p").unwrap(),
+            &[&parsed],
+            None,
+            Some(&div_style),
+        );
+        assert_eq!(p_style.letter_spacing, 4.0);
+        assert_eq!(p_style.word_spacing, SpacingValue::Length(8.0));
+        assert_eq!(p_style.text_indent, TextIndentValue::Length(40.0));
+        assert_eq!(p_style.tab_size, TabSizeValue::Integer(4));
     }
 }
