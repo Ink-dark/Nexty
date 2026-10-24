@@ -20,6 +20,17 @@ use nexty_paint::{Image, decode};
 /// 会撑爆调度器；分块处理后每块内并发、块间串行。
 const MAX_CONCURRENT_FETCHES: usize = 8;
 
+/// 响应体字节预算（不可信输入防线：巨响应/解压炸弹的分配失败是 abort，
+/// 渲染隔离的 panic 兜底兜不住）。预算放编排层，`NetworkFetcher` trait 与
+/// network crate 不动；超预算按既有降级语义处理（等同抓取失败，跳过资源）。
+///
+/// 文档与样式表是文本，10 MB 已远超真实页面（Chromium 同量级）；图片按
+/// 压缩字节 50 MB 上限——解压后的像素尺寸另由 nexty-paint 的解码预检
+/// （边长/面积上限）控制，两层预算互补。
+pub const MAX_DOCUMENT_BODY_BYTES: usize = 10 * 1024 * 1024;
+pub const MAX_STYLESHEET_BODY_BYTES: usize = 10 * 1024 * 1024;
+pub const MAX_IMAGE_BODY_BYTES: usize = 50 * 1024 * 1024;
+
 /// 抓取完成的子资源。
 pub struct Subresources {
     /// 作者样式表，按级联优先级排列（inline 与外链按文档出现顺序交错）。
@@ -85,9 +96,9 @@ pub fn fetch_subresources(
         }
     }
 
-    // ---- 阶段二：并发抓取（分块限流）----
-    let css_bytes = fetch_many(fetcher, &css_tasks);
-    let image_bytes = fetch_many(fetcher, &image_tasks);
+    // ---- 阶段二：并发抓取（分块限流，按类别带响应体预算）----
+    let css_bytes = fetch_many(fetcher, &css_tasks, MAX_STYLESHEET_BODY_BYTES);
+    let image_bytes = fetch_many(fetcher, &image_tasks, MAX_IMAGE_BODY_BYTES);
 
     // ---- 阶段三：按清单顺序重组 ----
     // inline 与抓到的外链按文档出现顺序交错产出（顺序即级联优先级）；
@@ -130,8 +141,12 @@ pub fn fetch_subresources(
     }
 }
 
-/// 并发抓取一组 URL，返回与 `urls` 等长的结果槽（失败为 `None`）。
-fn fetch_many(fetcher: &dyn NetworkFetcher, urls: &[String]) -> Vec<Option<Vec<u8>>> {
+/// 并发抓取一组 URL，返回与 `urls` 等长的结果槽（失败或超预算为 `None`）。
+fn fetch_many(
+    fetcher: &dyn NetworkFetcher,
+    urls: &[String],
+    max_body_bytes: usize,
+) -> Vec<Option<Vec<u8>>> {
     let mut results: Vec<Option<Vec<u8>>> = Vec::with_capacity(urls.len());
     for chunk in urls.chunks(MAX_CONCURRENT_FETCHES) {
         let chunk_results: Vec<Option<Vec<u8>>> = std::thread::scope(|scope| {
@@ -143,7 +158,7 @@ fn fetch_many(fetcher: &dyn NetworkFetcher, urls: &[String]) -> Vec<Option<Vec<u
                         method: Method::Get,
                         headers: Vec::new(),
                     };
-                    scope.spawn(move || fetch_ok(fetcher, &request))
+                    scope.spawn(move || fetch_ok(fetcher, &request, max_body_bytes))
                 })
                 .collect();
             handles
@@ -156,10 +171,20 @@ fn fetch_many(fetcher: &dyn NetworkFetcher, urls: &[String]) -> Vec<Option<Vec<u
     results
 }
 
-/// 抓取并把非 2xx / 错误归为 `None`（降级语义）。
-fn fetch_ok(fetcher: &dyn NetworkFetcher, request: &Request) -> Option<Vec<u8>> {
+/// 抓取并把非 2xx / 错误 / 超预算归为 `None`（降级语义）。
+fn fetch_ok(
+    fetcher: &dyn NetworkFetcher,
+    request: &Request,
+    max_body_bytes: usize,
+) -> Option<Vec<u8>> {
     match fetcher.fetch(request) {
-        Ok(response) if (200..300).contains(&response.status) => Some(response.body),
+        Ok(response) if (200..300).contains(&response.status) => {
+            if response.body.len() > max_body_bytes {
+                None
+            } else {
+                Some(response.body)
+            }
+        }
         Ok(_) => None,
         Err(NetworkError::InvalidUrl | NetworkError::Transport | NetworkError::Timeout) => None,
     }
@@ -344,5 +369,34 @@ mod tests {
                 .contains(&"https://page.test/css/a.css".to_owned()),
             "相对 URL 按 base 解析"
         );
+    }
+
+    // ---- 响应体预算：超预算等同抓取失败（降级） ----
+
+    #[test]
+    fn oversized_bodies_are_skipped_within_budget_path_unchanged() {
+        let fetcher = MockFetcher::new();
+        // 样式表预算 10 MB：超预算的表整体跳过
+        let huge_css = vec![b' '; MAX_STYLESHEET_BODY_BYTES + 1];
+        fetcher.serve("https://page.test/huge.css", &huge_css);
+        // 图片预算 50 MB：超预算跳过
+        let huge_image = vec![0u8; MAX_IMAGE_BODY_BYTES + 1];
+        fetcher.serve("https://page.test/huge.png", &huge_image);
+        // 预算内的正常路径回归
+        fetcher.serve("https://page.test/ok.css", b"p { color: red }");
+        fetcher.serve("https://page.test/ok.png", &tiny_png());
+        let document = document(
+            "<head><link rel=stylesheet href=huge.css>\
+             <link rel=stylesheet href=ok.css></head>\
+             <body><img src=huge.png><img src=ok.png></body>",
+        );
+
+        let resources = fetch_subresources(&fetcher, BASE, &document);
+        assert_eq!(
+            resources.stylesheets.len(),
+            1,
+            "超预算样式表跳过，预算内的保留"
+        );
+        assert_eq!(resources.images.len(), 1, "超预算图片跳过，预算内的保留");
     }
 }

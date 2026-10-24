@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nexty_layout::{Fragment, TextMap};
-use nexty_network::{Method, NetworkFetcher, ReqwestFetcher};
+use nexty_network::{Method, NetworkError, NetworkFetcher, ReqwestFetcher};
 use nexty_paint::{Pixmap, Scene, Size};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -455,30 +455,36 @@ impl BrowserApp {
                 };
                 // 全部加载在后台线程完成：文档抓取 → 解析 → 子资源并发抓取
                 // → 级联 → 页面就绪。主线程只做布局与呈现。
+                // 错误串收敛为「错误类别 + 状态码」：不回显上游原始错误
+                //（reqwest 的错误文本内含目标 URL），错误页只显示类别。
                 let result = match fetcher.fetch(&request) {
                     Ok(response) if (200..300).contains(&response.status) => {
-                        match String::from_utf8(response.body) {
-                            Ok(html) => {
-                                let document = nexty_html::parse_document(
-                                    &html,
-                                    nexty_html::ParseOptions::default(),
-                                );
-                                let resources = crate::resources::fetch_subresources(
-                                    fetcher.as_ref(),
-                                    &url,
-                                    &document,
-                                );
-                                Ok(pipeline::build_page(
-                                    document,
-                                    resources.stylesheets,
-                                    resources.images,
-                                ))
+                        if response.body.len() > crate::resources::MAX_DOCUMENT_BODY_BYTES {
+                            Err("响应体超出预算".to_owned())
+                        } else {
+                            match String::from_utf8(response.body) {
+                                Ok(html) => {
+                                    let document = nexty_html::parse_document(
+                                        &html,
+                                        nexty_html::ParseOptions::default(),
+                                    );
+                                    let resources = crate::resources::fetch_subresources(
+                                        fetcher.as_ref(),
+                                        &url,
+                                        &document,
+                                    );
+                                    Ok(pipeline::build_page(
+                                        document,
+                                        resources.stylesheets,
+                                        resources.images,
+                                    ))
+                                }
+                                Err(_) => Err("响应不是有效的文本".to_owned()),
                             }
-                            Err(error) => Err(error.to_string()),
                         }
                     }
                     Ok(response) => Err(format!("HTTP {}", response.status)),
-                    Err(error) => Err(format!("{error:?}")),
+                    Err(error) => Err(load_error_text(&error).to_owned()),
                 };
                 let _ = proxy.send_event(BackgroundEvent::PageLoaded { url, result });
             })
@@ -504,12 +510,7 @@ impl BrowserApp {
                 eprintln!("load {url} failed: {error}");
                 // 失败也要出错误页：只打日志会让画面停在上一帧或空白，
                 // 用户看不到任何反馈。
-                let html = format!(
-                    "<body style=\"font-family: sans-serif; padding: 24px\">\
-                     <h1 style=\"color: #c5221f\">无法加载此页</h1>\
-                     <p>{url}</p>\
-                     <p style=\"color: #5f6368\">{error}</p></body>"
-                );
+                let html = error_page_html(&url, &error);
                 self.set_page(pipeline::load_page(&html, ""), true);
                 if let Some(window) = &self.window {
                     window.set_title("加载失败 - Nexty");
@@ -1236,6 +1237,50 @@ fn pad_rows(data: &[u8], width: u32, height: u32, padded: u32) -> Vec<u8> {
     out
 }
 
+/// 传输失败 → 错误类别文本。
+///
+/// 不回显上游原始错误串：reqwest 的错误文本内含目标 URL，而错误页是按
+/// 页面语义渲染的 HTML——错误信息只保留「类别」这一用户需要知道的内容。
+fn load_error_text(error: &NetworkError) -> &'static str {
+    match error {
+        NetworkError::InvalidUrl => "无效的地址",
+        NetworkError::Timeout => "请求超时",
+        NetworkError::Transport => "网络错误",
+    }
+}
+
+/// HTML 实体转义（`&` `<` `>` `"` `'`）。
+///
+/// 错误页把不可信文本（URL、错误类别）拼进 HTML：不转义的话，形如
+/// `<img src=//evil.test/1>` 的 URL 会被解析成标记，触发对第三方地址的
+/// 子资源请求并泄露用户正在访问的 URL。
+fn escape_html(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+/// 加载失败的错误页 HTML：URL 与错误文本均经转义。
+fn error_page_html(url: &str, error: &str) -> String {
+    format!(
+        "<body style=\"font-family: sans-serif; padding: 24px\">\
+         <h1 style=\"color: #c5221f\">无法加载此页</h1>\
+         <p>{}</p>\
+         <p style=\"color: #5f6368\">{}</p></body>",
+        escape_html(url),
+        escape_html(error),
+    )
+}
+
 fn blit_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("nexty-blit-bgl"),
@@ -1410,5 +1455,87 @@ mod tests {
         // 数据长度不足：补零而非 panic
         let padded = pad_rows(&[1, 2, 3], 800, 3, 3328);
         assert_eq!(padded.len(), 3328 * 3);
+    }
+}
+
+#[cfg(test)]
+mod error_page_tests {
+    use super::{error_page_html, escape_html};
+    use nexty_dom::NodeKind;
+
+    /// 按树序收集文档中的元素局部名。
+    fn element_names(document: &nexty_dom::Document) -> Vec<String> {
+        fn walk(document: &nexty_dom::Document, node: nexty_dom::NodeId, out: &mut Vec<String>) {
+            for child in document.children(node) {
+                if let Some(NodeKind::Element(data)) = document.node(child) {
+                    out.push(data.name.clone());
+                }
+                walk(document, child, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(document, document.root(), &mut out);
+        out
+    }
+
+    /// 拼接文档全部文本。
+    fn text_content(document: &nexty_dom::Document) -> String {
+        fn walk(document: &nexty_dom::Document, node: nexty_dom::NodeId, out: &mut String) {
+            for child in document.children(node) {
+                if let Some(NodeKind::Text(data)) = document.node(child) {
+                    out.push_str(data);
+                }
+                walk(document, child, out);
+            }
+        }
+        let mut out = String::new();
+        walk(document, document.root(), &mut out);
+        out
+    }
+
+    #[test]
+    fn escape_html_neutralizes_all_five_entities() {
+        assert_eq!(escape_html("a&b<c>\"d'e"), "a&amp;b&lt;c&gt;&quot;d&#39;e");
+        // 正常文本不受影响
+        assert_eq!(
+            escape_html("https://page.test/dir/page.html?q=1"),
+            "https://page.test/dir/page.html?q=1"
+        );
+    }
+
+    #[test]
+    fn error_page_rejects_url_markup_injection() {
+        // URL 含 <img src=//evil.test/1>：错误页 DOM 中不得出现 img 元素，
+        // 不得有对第三方地址的子资源请求
+        let url = "http://x.test/<img src=//evil.test/1>";
+        let html = error_page_html(url, "HTTP 404");
+        let document = nexty_html::parse_document(&html, nexty_html::ParseOptions::default());
+        let names = element_names(&document);
+        assert!(
+            !names.iter().any(|name| name == "img"),
+            "无 img 元素：{names:?}"
+        );
+        assert!(
+            nexty_html::collect_image_resources(&document).is_empty(),
+            "无第三方子资源请求"
+        );
+        assert!(
+            nexty_html::collect_style_resources(&document).is_empty(),
+            "无第三方样式表请求"
+        );
+        // 显示文本为字面转义后的 URL
+        assert!(
+            text_content(&document).contains("<img src=//evil.test/1>"),
+            "URL 按字面显示"
+        );
+    }
+
+    #[test]
+    fn error_page_keeps_normal_url_rendering() {
+        let html = error_page_html("https://page.test/dir/page.html?q=1&x=2", "请求超时");
+        let document = nexty_html::parse_document(&html, nexty_html::ParseOptions::default());
+        let text = text_content(&document);
+        assert!(text.contains("https://page.test/dir/page.html?q=1&x=2"));
+        assert!(text.contains("请求超时"));
     }
 }
