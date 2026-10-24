@@ -33,6 +33,27 @@ fn find<'a>(document: &Document, fragment: &'a Fragment, name: &str) -> Option<&
         .find_map(|child| find(document, child, name))
 }
 
+/// [`find`] 的盒感知版：同时搜索行内原子盒片段（`line.boxes`）。
+fn find_box<'a>(document: &Document, fragment: &'a Fragment, name: &str) -> Option<&'a Fragment> {
+    if matches!(
+        document.node(fragment.node),
+        Some(NodeKind::Element(data)) if data.name == name
+    ) {
+        return Some(fragment);
+    }
+    for line in &fragment.lines {
+        for atomic in &line.boxes {
+            if let Some(found) = find_box(document, atomic, name) {
+                return Some(found);
+            }
+        }
+    }
+    fragment
+        .children
+        .iter()
+        .find_map(|child| find_box(document, child, name))
+}
+
 fn direct_text_node(document: &Document, node: NodeId) -> NodeId {
     document
         .children(node)
@@ -231,7 +252,7 @@ fn point_on_glyph(
     right_half: bool,
 ) -> (f32, f32) {
     let (content_x, content_y) = content_origin(document, root, name).expect("element origin");
-    let fragment = find(document, root, name).expect("element fragment");
+    let fragment = find_box(document, root, name).expect("element fragment");
     let top: f32 = content_y
         + fragment.lines[..line_index]
             .iter()
@@ -539,4 +560,89 @@ fn map_all_lines(root: &nexty_layout::Fragment) -> usize {
         fragment.lines.len() + fragment.children.iter().map(walk).sum::<usize>()
     }
     walk(root)
+}
+
+/// 元素的全部直接文本子节点（按 DOM 序）。
+fn element_text_nodes(document: &Document, node: NodeId) -> Vec<NodeId> {
+    document
+        .children(node)
+        .filter(|child| matches!(document.node(*child), Some(NodeKind::Text(_))))
+        .collect()
+}
+
+#[test]
+fn hit_prefers_inner_lines_of_inline_box() {
+    // M8：外层行的 y 区间完全覆盖行内原子盒的内部行——命中须取最深行
+    let (document, root) = layout(
+        "<p>ab<span style=\"display:inline-block\">xy<br>zw</span>cd</p>",
+        "",
+        400.0,
+    );
+    let map = TextMap::new(&root);
+    let span = find_box(&document, &root, "span").expect("span fragment");
+    let text_nodes = element_text_nodes(&document, span.node);
+    assert_eq!(text_nodes.len(), 2, "xy 与 zw 两个文本节点");
+    let (xy_node, zw_node) = (text_nodes[0], text_nodes[1]);
+    let p = find(&document, &root, "p").expect("p fragment");
+    let ab_node = element_text_nodes(&document, p.node)[0];
+
+    // 点击原子盒内部两行的文本：命中内部文本（缺陷下第二行命中外层 cd）
+    let (x, y) = point_on_glyph(&document, &root, "span", 0, 0, false);
+    assert_eq!(map.hit(x, y), Some(text_position(xy_node, 0)), "内部首行 x");
+    let (x, y) = point_on_glyph(&document, &root, "span", 1, 0, false);
+    assert_eq!(
+        map.hit(x, y),
+        Some(text_position(zw_node, 0)),
+        "内部次行 z（父行 y 区间覆盖它，仍取最深处）"
+    );
+
+    // 点击外层行文本：不回归
+    let (x, y) = point_on_glyph(&document, &root, "p", 0, 0, false);
+    assert_eq!(map.hit(x, y), Some(text_position(ab_node, 0)), "外层 a");
+
+    // 双击选词（原子盒内部）
+    let (from, to) = map.word_range(text_position(xy_node, 1)).expect("word");
+    assert_eq!(map.text(from, to), "xy");
+
+    // 内部行的选区矩形与内部行盒几何一致（非外层行）
+    let rects = map.rects(text_position(xy_node, 0), text_position(zw_node, 2));
+    assert_eq!(rects.len(), 2, "内部两行各一个矩形");
+    let span_top = content_origin(&document, &root, "span")
+        .expect("span origin")
+        .1;
+    assert!(
+        (rects[0].y - span_top).abs() < 0.5,
+        "矩形 y 与内部行盒一致：{} vs {span_top}",
+        rects[0].y
+    );
+
+    // 内部两行的复制文本完整（`<br>` 硬断行插换行）
+    assert_eq!(
+        map.text(text_position(xy_node, 0), text_position(zw_node, 2)),
+        "xy\nzw"
+    );
+}
+
+#[test]
+fn nearest_in_inline_box_gap_snaps_inward() {
+    // 原子盒带 padding：点落在盒内 padding 空隙（无内部行的 y 区间覆盖）
+    // 时，吸附到盒子内部行而非外层行
+    let (document, root) = layout(
+        "<p>ab<span style=\"display:inline-block; padding: 8px 4px\">xy<br>zw</span>cd</p>",
+        "",
+        400.0,
+    );
+    let map = TextMap::new(&root);
+    let span = find_box(&document, &root, "span").expect("span fragment");
+    let text_nodes = element_text_nodes(&document, span.node);
+    let (xy_node, zw_node) = (text_nodes[0], text_nodes[1]);
+    let (content_x, content_y) = content_origin(&document, &root, "span").expect("span origin");
+
+    // padding 顶隙（在盒内、内部首行上方 4px）
+    let (x, y) = (content_x + 2.0, content_y - 4.0);
+    let position = map.nearest(x, y).expect("position");
+    assert!(
+        position.node == xy_node || position.node == zw_node,
+        "padding 空隙吸附到盒内文本（缺陷下跳到外层 ab/cd）"
+    );
 }
