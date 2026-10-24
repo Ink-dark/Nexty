@@ -431,3 +431,49 @@ fn all_is_none_without_text() {
     let map = TextMap::new(&root);
     assert!(map.all().is_none());
 }
+
+#[test]
+fn spacing_keeps_hit_and_rect_geometry_per_glyph() {
+    // letter-spacing 下的命中与矩形：cluster → 源偏移映射不受间距影响
+    let (document, root) = layout("<p style=\"letter-spacing: 4px\">abcd</p>", "", 400.0);
+    let map = TextMap::new(&root);
+    let node = direct_text_node(&document, find(&document, &root, "p").unwrap().node);
+
+    // 逐簇命中：每簇左半 → 本簇起点，右半 → 下一簇起点
+    for index in 0..4 {
+        let (x, y) = point_on_glyph(&document, &root, "p", 0, index, false);
+        assert_eq!(
+            map.hit(x, y),
+            Some(text_position(node, index)),
+            "簇 {index} 左半"
+        );
+        let (x, y) = point_on_glyph(&document, &root, "p", 0, index, true);
+        let expected = if index == 3 { 4 } else { index + 1 };
+        assert_eq!(
+            map.hit(x, y),
+            Some(text_position(node, expected)),
+            "簇 {index} 右半"
+        );
+    }
+
+    // 全选矩形宽：3 个簇间隙各 +4px
+    let spaced = map.rects(text_position(node, 0), text_position(node, 4));
+    assert_eq!(spaced.len(), 1);
+    let plain = {
+        let (document, root) = layout("<p>abcd</p>", "", 400.0);
+        let map = TextMap::new(&root);
+        let node = direct_text_node(&document, find(&document, &root, "p").unwrap().node);
+        map.rects(text_position(node, 0), text_position(node, 4))
+    };
+    assert_eq!(plain.len(), 1);
+    assert!(
+        (spaced[0].width - plain[0].width - 3.0 * 4.0).abs() < 0.01,
+        "选区矩形宽差 = 3×4px：{} - {}",
+        spaced[0].width,
+        plain[0].width
+    );
+
+    // 复制文本完整（间距不改源映射）
+    let (from, to) = map.all().unwrap();
+    assert_eq!(map.text(from, to), "abcd");
+}

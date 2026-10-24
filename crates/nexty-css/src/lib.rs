@@ -46,5 +46,6 @@ pub use value::{
     FontFamilyValue, FontSizeValue, FontStyleValue, FontWeightValue, GapValue, GridAutoFlowValue,
     GridTrack, GridTrackList, InsetValue, JustifyContentValue, LineHeightValue, MAX_CSS_LENGTH,
     MarginValue, OverflowValue, OverflowWrapValue, PaddingValue, PositionValue, PropertyId,
-    PropertyValue, Rgba, SizeValue, TextAlignValue, ViewportUnit, WhiteSpaceValue, WordBreakValue,
+    PropertyValue, Rgba, SizeValue, SpacingValue, TabSizeValue, TextAlignValue, TextIndentValue,
+    ViewportUnit, WhiteSpaceValue, WordBreakValue,
 };

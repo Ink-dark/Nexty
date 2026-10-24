@@ -1130,3 +1130,85 @@ fn huge_css_values_still_layout_finite() {
     );
     assert!(approx(div.border_box.y, 0.0), "margin-top 无效回落 0");
 }
+
+// ---- CSS Text 间距：letter-spacing / word-spacing（CSS Text 3 §8） ----
+
+#[test]
+fn letter_spacing_widens_line_by_internal_boundaries() {
+    // N 个字形簇的文本加字距 s：行净宽差 = (N−1)×s（行末簇的字距不计）
+    let (document, root) = layout("<body>abcd</body>", "", 400.0);
+    let plain = line_extent(&body(&document, &root).lines[0]).1;
+
+    let (document, root) = layout("<body>abcd</body>", "body { letter-spacing: 4px }", 400.0);
+    let spaced = line_extent(&body(&document, &root).lines[0]).1;
+    assert!(
+        approx(spaced - plain, 3.0 * 4.0),
+        "4 簇文本行净宽差 = 3×4px：{spaced} - {plain}"
+    );
+
+    // 负字距收窄且不 panic（字形可重叠）
+    let (document, root) = layout("<body>abcd</body>", "body { letter-spacing: -2px }", 400.0);
+    let narrow = line_extent(&body(&document, &root).lines[0]).1;
+    assert!(
+        approx(narrow - plain, -3.0 * 2.0),
+        "负字距按 (N−1)×|s| 收窄：{narrow} - {plain}"
+    );
+}
+
+#[test]
+fn letter_spacing_trailing_excluded_from_right_alignment() {
+    // 右对齐用净宽：行末字距不占位，行尾贴内容盒右缘
+    let (document, root) = layout(
+        "<body>abcd</body>",
+        "body { text-align: right; letter-spacing: 4px }",
+        400.0,
+    );
+    let (first, end) = line_extent(&body(&document, &root).lines[0]);
+    assert!(approx(end, 400.0), "行尾贴右缘（end={end}）");
+    let plain_width = {
+        let (document, root) = layout("<body>abcd</body>", "", 400.0);
+        line_extent(&body(&document, &root).lines[0]).1
+    };
+    assert!(
+        approx(first, 400.0 - plain_width - 3.0 * 4.0),
+        "行首 x = 可用宽 − 净宽（first={first}）"
+    );
+}
+
+#[test]
+fn word_spacing_widens_single_line_by_separator_count() {
+    let (document, root) = layout("<body>a b c</body>", "", 400.0);
+    let plain = line_extent(&body(&document, &root).lines[0]).1;
+
+    let (document, root) = layout("<body>a b c</body>", "body { word-spacing: 8px }", 400.0);
+    let spaced = line_extent(&body(&document, &root).lines[0]).1;
+    assert!(
+        approx(spaced - plain, 2.0 * 8.0),
+        "两个分隔符各 +8px：{spaced} - {plain}"
+    );
+}
+
+#[test]
+fn word_spacing_separators_count_into_narrow_measurement() {
+    // width: 0 逐 span 成行 = 最窄测量路径：每个分隔符落在行尾仍占宽
+    //（break-spaces 行尾空白不裁剪）→ 行净宽差合计 = 8px × 分隔符数
+    let (document, root) = layout(
+        "<div style=\"width: 0; white-space: break-spaces\">a b c</div>",
+        "",
+        400.0,
+    );
+    let div = find(&document, &root, "div").expect("div fragment");
+    let plain: Vec<f32> = div.lines.iter().map(|line| line_extent(line).1).collect();
+    assert_eq!(plain.len(), 3, "逐词成行");
+
+    let (document, root) = layout(
+        "<div style=\"width: 0; white-space: break-spaces; word-spacing: 8px\">a b c</div>",
+        "",
+        400.0,
+    );
+    let div = find(&document, &root, "div").expect("div fragment");
+    let spaced: Vec<f32> = div.lines.iter().map(|line| line_extent(line).1).collect();
+    assert_eq!(spaced.len(), 3);
+    let diff: f32 = spaced.iter().zip(&plain).map(|(s, p)| s - p).sum();
+    assert!(approx(diff, 2.0 * 8.0), "行尾分隔符各 +8px：差合计 {diff}");
+}
