@@ -517,3 +517,26 @@ fn selection_works_across_justified_lines() {
     // 复制文本完整（软折行补空格）
     assert_eq!(map.text(from, to), "aaa bbb ccc ddd eee fff ggg hhh");
 }
+
+#[test]
+fn copy_keeps_hanging_spaces_across_pre_wrap_lines() {
+    // pre-wrap 软折行处行尾空格悬挂（不占行宽）但源映射保留：跨行复制
+    // 文本完整、不额外补空格
+    let (_document, root) = layout(
+        "<body><p style=\"width: 40px; white-space: pre-wrap\">abc   def</p></body>",
+        "",
+        400.0,
+    );
+    let map = TextMap::new(&root);
+    assert!(map_all_lines(&root) >= 2, "折成两行");
+    let (from, to) = map.all().unwrap();
+    assert_eq!(map.text(from, to), "abc   def", "悬挂空格保留在复制文本中");
+}
+
+/// 片段树的行数（辅助断言）。
+fn map_all_lines(root: &nexty_layout::Fragment) -> usize {
+    fn walk(fragment: &nexty_layout::Fragment) -> usize {
+        fragment.lines.len() + fragment.children.iter().map(walk).sum::<usize>()
+    }
+    walk(root)
+}

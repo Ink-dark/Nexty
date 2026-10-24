@@ -1484,3 +1484,116 @@ fn text_indent_excluded_from_intrinsic_sizes() {
         "min-content 不含缩进：{plain_min} vs {indented_min}"
     );
 }
+
+// ---- tab-size 与 pre-wrap 行尾悬挂（CSS Text 3 §5） ----
+
+/// pre 单行内全部字形的 (x, advance)。
+fn pre_glyphs(document: &Document, root: &Fragment) -> Vec<(f32, f32)> {
+    let pre = find(document, root, "pre").expect("pre fragment");
+    pre.lines[0]
+        .runs
+        .iter()
+        .flat_map(|run| {
+            run.glyphs
+                .iter()
+                .map(|glyph| (glyph.x, glyph.advance))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[test]
+fn tab_size_advances_to_next_stop() {
+    // a\tb（tab-size 4）：制表推进到 4 × 空格宽的下一整数倍 → b 在第 4 列
+    let (document, root) = layout("<pre>a\tb</pre>", "pre { tab-size: 4 }", 400.0);
+    let glyphs = pre_glyphs(&document, &root);
+    assert_eq!(glyphs.len(), 3, "a、制表、b 三个字形");
+
+    let (document, root) = layout("<pre>a b</pre>", "", 400.0);
+    let reference = pre_glyphs(&document, &root);
+    let space_advance = reference[1].1;
+    let (a_x, a_advance) = glyphs[0];
+    assert!(approx(a_x, 0.0));
+    assert!(
+        approx(glyphs[2].0, 4.0 * space_advance),
+        "b 推进到第 4 列：{} vs 4×{space_advance}",
+        glyphs[2].0
+    );
+    assert!(approx(a_advance, reference[0].1), "a 宽不受影响");
+}
+
+#[test]
+fn tab_size_zero_collapses_tab() {
+    let (document, root) = layout("<pre>a\tb</pre>", "pre { tab-size: 0 }", 400.0);
+    let glyphs = pre_glyphs(&document, &root);
+    assert_eq!(glyphs.len(), 3);
+    let (a_x, a_advance) = glyphs[0];
+    assert!(approx(glyphs[2].0, a_x + a_advance), "tab-size 0：制表零宽");
+}
+
+#[test]
+fn tab_size_length_form_uses_pixel_stops() {
+    // tab-size: 40px：制表推进到 40px 的下一整数倍
+    let (document, root) = layout("<pre>a\tb</pre>", "pre { tab-size: 40px }", 400.0);
+    let glyphs = pre_glyphs(&document, &root);
+    let (a_x, _) = glyphs[0];
+    assert!(
+        approx(glyphs[2].0, 40.0),
+        "b 推进到 40px 整数倍：{}",
+        glyphs[2].0
+    );
+    assert!(approx(a_x, 0.0));
+}
+
+#[test]
+fn tab_stops_accumulate_across_multiple_tabs() {
+    // a\t\tb：第一个制表到第 4 列，第二个从第 4 列到第 8 列
+    let (document, root) = layout("<pre>a\t\tb</pre>", "pre { tab-size: 4 }", 400.0);
+    let glyphs = pre_glyphs(&document, &root);
+    let (document, root) = layout("<pre>a b</pre>", "", 400.0);
+    let space_advance = pre_glyphs(&document, &root)[1].1;
+    let b_x = glyphs.last().expect("b glyph").0;
+    assert!(approx(b_x, 8.0 * space_advance), "b 推进到第 8 列：{b_x}");
+}
+
+#[test]
+fn pre_wrap_trailing_spaces_hang_at_line_end() {
+    // pre-wrap 行尾保留空格悬挂：不占对齐宽度（右对齐时可见文本贴右缘），
+    // break-spaces 不悬挂（空格把可见文本往左推）
+    let visible_end = |white_space: &str| {
+        let (document, root) = layout(
+            &format!(
+                "<body><div style=\"width: 300px; text-align: right;\
+                 white-space: {white_space}\">abc   </div></body>"
+            ),
+            "",
+            400.0,
+        );
+        let div = find(&document, &root, "div").expect("div");
+        // 第三个字形（c）的右缘 = 可见文本末尾
+        let glyph = &div.lines[0].runs[0].glyphs[2];
+        glyph.x + glyph.advance
+    };
+    let pre_wrap_end = visible_end("pre-wrap");
+    assert!(
+        approx(pre_wrap_end, 300.0),
+        "pre-wrap 悬挂：可见文本贴右缘 {pre_wrap_end}"
+    );
+    let break_spaces_end = visible_end("break-spaces");
+    assert!(
+        break_spaces_end < 300.0,
+        "break-spaces 不悬挂，行尾空格占宽：{break_spaces_end}"
+    );
+}
+
+#[test]
+fn pre_wrap_hanging_spaces_do_not_force_wrap() {
+    // 行尾空格不触发折行：可用宽恰容纳可见文本时，空格悬挂不产生第二行
+    let (document, root) = layout(
+        "<body><p style=\"width: 60px; white-space: pre-wrap\">aaaa   </p></body>",
+        "",
+        400.0,
+    );
+    let p = find(&document, &root, "p").expect("p fragment");
+    assert_eq!(p.lines.len(), 1, "悬挂空格不触发折行");
+}

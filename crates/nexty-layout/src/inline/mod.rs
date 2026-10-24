@@ -28,6 +28,17 @@
 //! 元素边界（`<b>x</b>y` 的 x→y）不加距；相邻块间游标保留前块行尾字距
 //! （对齐浏览器在元素边界施加字距的行为）。
 //!
+//! # 制表与行尾悬挂（CSS Text 3 §5 / white-space 处理）
+//!
+//! 保留模式的制表符按一个空格整形，放置期把该簇的 advance 替换为「推进到
+//! `tab-size` × 空格 advance 的下一整数倍」（`tab-size: 0` 零宽；整数形态
+//! 依赖字体度量，`tab-size: <length>` 为固定步长）；折叠模式的制表照常
+//! 折叠。`pre-wrap` 软折行/硬断行前的行尾空格**悬挂**：字形不进入 run
+//! （不占行宽、可溢出边沿、不触发折行），字节区间保留——复制文本与选区
+//! 源映射完整；`break-spaces` 不悬挂（照常占宽），`pre` 硬断行前空格不
+//! 悬挂（沿用占宽）。悬挂空格的字形簇不在 TextMap 中（命中吸附到相邻
+//! 可见簇），选区矩形不包含它们。
+//!
 //! # 两端对齐（CSS Text 3 §7）
 //!
 //! `text-align: justify` 同样是放置期修正：先按现有断行成行（断行结果
@@ -67,8 +78,8 @@
 //! 千行级（当前约 400 行）。
 //!
 //! 已知偏差：`vertical-align` 仅 baseline（原子盒/图片底边对齐基线）；
-//! `pre-wrap` 行尾空格未做悬挂（按占宽处理）；bidi 未实现；跨行内元素
-//! 边界的断行上下文只回看两个字符（见 `uax14::rules::breaks_between_text`）。
+//! bidi 未实现；跨行内元素边界的断行上下文只回看两个字符
+//! （见 `uax14::rules::breaks_between_text`）。
 //!
 //! feature `block` 关闭时本模块无消费方（行内流的唯一下游是 taffy 管线），
 //! 按模块整体抑制 dead_code；`replaced` 单独开启时 `lib.rs` 不 re-export 本模块
@@ -82,7 +93,7 @@ use std::sync::Arc;
 
 use nexty_css::{
     ComputedStyle, DisplayValue, LineHeightValue, MAX_CSS_LENGTH, OverflowWrapValue, SpacingValue,
-    TextAlignValue, WordBreakValue,
+    TabSizeValue, TextAlignValue, WhiteSpaceValue, WordBreakValue,
 };
 use nexty_dom::{Document, ElementData, Namespace, NodeId, NodeKind};
 use nexty_text::{FontMetrics, Glyph, ResolvedFont, ShapedText, TextShaper, TextStyle};
@@ -142,6 +153,9 @@ pub(crate) struct TextChunk {
     pub source_map: Arc<[SourceChar]>,
     /// 该文本的样式（直接包含它的元素的 computed style）。
     pub style: ComputedStyle,
+    /// `text` 中由制表符映射来的空格的字节偏移（保留模式；放置期按
+    /// `tab-size` 推进到下一制表位，CSS Text 3 §5）。
+    pub tabs: Arc<[u32]>,
 }
 
 /// `<img>` 的盒尺寸（CSS px）。
@@ -230,6 +244,8 @@ struct Collector<'a> {
     last_space_node: Option<NodeId>,
     text_buffer: String,
     text_source: Vec<SourceChar>,
+    /// 当前缓冲文本中制表符映射空格的字节偏移。
+    text_tabs: Vec<u32>,
     /// 当前缓冲的文本节点。
     text_node: Option<NodeId>,
     /// 当前缓冲的样式来源元素。
@@ -265,6 +281,7 @@ impl Collector<'_> {
             text_node: self.text_node.take().expect("text has a source node"),
             text: Arc::from(std::mem::take(&mut self.text_buffer)),
             source_map: Arc::from(std::mem::take(&mut self.text_source)),
+            tabs: Arc::from(std::mem::take(&mut self.text_tabs)),
             style: self.text_style.take().expect("text has a style"),
         }));
         self.last_space_node = None;
@@ -328,8 +345,11 @@ impl Collector<'_> {
             } else {
                 match character {
                     '\n' | '\r' => self.push_break(),
-                    // 偏差：tab-size 不实现，制表按一个空格保留
+                    // 保留模式的制表符按一个空格整形，放置期按 tab-size
+                    // 推进到下一制表位（CSS Text 3 §5）
                     '\t' => {
+                        self.ensure_style(text_node, style_node, style);
+                        self.text_tabs.push(self.text_buffer.len() as u32);
                         self.push_char(' ', text_node, style_node, style, source);
                         self.last_collapsible_space = false;
                         self.last_space_node = None;
@@ -418,6 +438,7 @@ impl<'a> InlineRun<'a> {
                 last_space_node: None,
                 text_buffer: String::new(),
                 text_source: Vec::new(),
+                text_tabs: Vec::new(),
                 text_node: None,
                 text_style_node: None,
                 text_style: None,
@@ -473,6 +494,7 @@ impl<'a> InlineRun<'a> {
             InlineItem::Text(chunk) => {
                 !chunk.style.white_space.collapses()
                     || !chunk.text.chars().all(|character| character == ' ')
+                    || !chunk.tabs.is_empty()
             }
             _ => true,
         });
@@ -703,17 +725,21 @@ struct ClusterGroup {
     glyphs: Range<usize>,
     /// 簇的基准 advance 合计（无间距）。
     base: f32,
-    /// 是否为 word-separator 簇。
+    /// 是否为 word-separator 簇（制表符映射的空格不算）。
     separator: bool,
+    /// 是否为制表符映射的空格簇（advance 按 tab-size 推进）。
+    tab: bool,
 }
 
 /// 把 glyph 区间按 cluster 切组；簇不跨区间（span 只在 cluster 边界切开）。
-/// `span_end` 是区间的字节终点（chunk 文本内），用于末簇的字节区间。
+/// `span_end` 是区间的字节终点（chunk 文本内），用于末簇的字节区间；
+/// `tabs` 是制表符映射空格的字节偏移（升序）。
 fn cluster_groups(
     shaped: &ShapedText,
     glyphs: &Range<usize>,
     span_end: usize,
     text: &str,
+    tabs: &[u32],
 ) -> Vec<ClusterGroup> {
     let mut groups: Vec<ClusterGroup> = Vec::new();
     for index in glyphs.clone() {
@@ -728,6 +754,7 @@ fn cluster_groups(
                 glyphs: index..index + 1,
                 base: glyph.advance,
                 separator: false,
+                tab: false,
             }),
         }
     }
@@ -738,23 +765,13 @@ fn cluster_groups(
         last.bytes.end = span_end.min(text.len());
     }
     for group in &mut groups {
-        group.separator = text
-            .get(group.bytes.start..group.bytes.end)
-            .is_some_and(|bytes| !bytes.is_empty() && bytes.chars().all(is_word_separator));
+        group.tab = tabs.binary_search(&(group.bytes.start as u32)).is_ok();
+        group.separator = !group.tab
+            && text
+                .get(group.bytes.start..group.bytes.end)
+                .is_some_and(|bytes| !bytes.is_empty() && bytes.chars().all(is_word_separator));
     }
     groups
-}
-
-/// 间距对一段 glyph 区间总宽的修正量：每簇 +letter；分隔符簇 advance
-/// 收缩后不小于 0（CSS Text 3 §8.2）。
-fn spacing_extra(groups: &[ClusterGroup], spacing: &Spacing) -> f32 {
-    let mut extra = spacing.letter * groups.len() as f32;
-    for group in groups {
-        if group.separator {
-            extra += (group.base + spacing.word).max(0.0) - group.base;
-        }
-    }
-    extra
 }
 
 /// 行内流中的一个已放置片段。
@@ -956,10 +973,67 @@ impl LineBuilder<'_> {
             })
     }
 
+    /// 一个文本片段的簇分组与每簇的 advance 增量。
+    ///
+    /// 增量 = letter-spacing（每簇）+ word-spacing（分隔符簇）+ 制表推进
+    /// （制表簇 advance 到 `tab-size` 的下一整数倍，CSS Text 3 §5；依赖
+    /// 簇的行内 x，故 `start_x` 必须是该片段的放置 x）。
+    fn span_groups_deltas(
+        &self,
+        item_index: usize,
+        glyphs: &Range<usize>,
+        span_end: usize,
+        start_x: f32,
+    ) -> (Vec<ClusterGroup>, Vec<f32>) {
+        let InlineItem::Text(chunk) = &self.items[item_index] else {
+            return (Vec::new(), Vec::new());
+        };
+        let Some(shaped) = self.shaped_items[item_index].as_ref() else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut groups = cluster_groups(shaped, glyphs, span_end, &chunk.text, &chunk.tabs);
+        let spacing = Spacing::of(&chunk.style);
+        let mut deltas = Vec::with_capacity(groups.len());
+        let mut x = start_x;
+        for group in &mut groups {
+            let mut delta = spacing.letter;
+            if group.separator {
+                delta += (group.base + spacing.word).max(0.0) - group.base;
+            }
+            if group.tab {
+                let stop = match chunk.style.tab_size {
+                    TabSizeValue::Integer(count) => (count as f32 * group.base).min(MAX_CSS_LENGTH),
+                    TabSizeValue::Length(px) => px.min(MAX_CSS_LENGTH),
+                    // computed 阶段已折算；防御按一个空格
+                    TabSizeValue::Em(_) => group.base,
+                };
+                let advance = if stop <= 0.0 {
+                    0.0
+                } else {
+                    let remainder = if x.is_finite() && x > 0.0 {
+                        x % stop
+                    } else {
+                        0.0
+                    };
+                    if remainder < 0.01 {
+                        stop
+                    } else {
+                        stop - remainder
+                    }
+                };
+                delta += advance - group.base;
+            }
+            x += group.base + delta;
+            deltas.push(delta);
+        }
+        (groups, deltas)
+    }
+
     /// 文本片段在「行首裁前导空格」后的有效区间与**净宽**。
     ///
     /// 净宽已扣除本片段末簇的 letter-spacing（行末字距不计行宽，断行判定
-    /// 与对齐都用净宽，CSS Text 3 §8.1）；word-spacing 的分隔符修正计入。
+    /// 与对齐都用净宽，CSS Text 3 §8.1）；word-spacing 的分隔符修正与
+    /// 制表推进计入。
     fn prepare_span(
         &self,
         item_index: usize,
@@ -983,15 +1057,15 @@ impl LineBuilder<'_> {
             return None;
         }
         let spacing = Spacing::of(&chunk.style);
-        let groups = cluster_groups(shaped, &glyphs, end, &chunk.text);
-        let total = glyph_width(shaped, &glyphs) + spacing_extra(&groups, &spacing);
+        let (_, deltas) = self.span_groups_deltas(item_index, &glyphs, end, self.cursor);
+        let total = glyph_width(shaped, &glyphs) + deltas.iter().sum::<f32>();
         Some((start, end, total - spacing.letter))
     }
 
     /// 放置一个文本片段（行内游标处；调用方已处理断行决策）。
     ///
-    /// 游标推进计全部间距（含本片段末簇的 letter-spacing——它与下一片段之间
-    /// 的间隙是真实间距）；行末扣减在 `flush` 做。
+    /// 游标推进计全部间距与制表推进（含本片段末簇的 letter-spacing——它与
+    /// 下一片段之间的间隙是真实间距）；行末扣减在 `flush` 做。
     fn place_span_at(&mut self, item_index: usize, start: usize, end: usize) {
         let InlineItem::Text(chunk) = &self.items[item_index] else {
             return;
@@ -1008,8 +1082,8 @@ impl LineBuilder<'_> {
         let spacing = Spacing::of(&chunk.style);
         let width = {
             let shaped = self.shaped_items[item_index].as_ref().expect("shaped");
-            let groups = cluster_groups(shaped, &glyphs, end, &chunk.text);
-            glyph_width(shaped, &glyphs) + spacing_extra(&groups, &spacing)
+            let (_, deltas) = self.span_groups_deltas(item_index, &glyphs, end, self.cursor);
+            glyph_width(shaped, &glyphs) + deltas.iter().sum::<f32>()
         };
         self.placed.push(PlacedItem {
             item_index,
@@ -1188,28 +1262,32 @@ impl LineBuilder<'_> {
         let mut boosts = vec![0.0_f32; self.placed.len()];
         if justify && self.placed.len() > 1 {
             let mut net = self.cursor - self.trailing_letter_spacing;
-            // 折叠模式末项被裁掉的行尾空格不占宽（软断点消费的空格）
+            // 行尾被裁掉（折叠）或悬挂（pre-wrap）的空格不占行宽
             if let Some(last) = self.placed.last()
                 && let InlineItem::Text(chunk) = &self.items[last.item_index]
-                && chunk.style.white_space.collapses()
-                && let Some((start, end)) = last.span
+                && let (Some((start, end)), Some(range)) = (last.span, last.glyphs.as_ref())
             {
                 let stop = trailing_space_start(&chunk.text, start, end);
                 if stop < end
-                    && let (Some(shaped), Some(range)) = (
-                        self.shaped_items[last.item_index].as_ref(),
-                        last.glyphs.as_ref(),
-                    )
+                    && let Some(shaped) = self.shaped_items[last.item_index].as_ref()
                 {
                     let cut = shaped
                         .glyphs
                         .partition_point(|glyph| (glyph.cluster as usize) < stop);
-                    let trimmed = cut.max(range.start)..range.end;
-                    if trimmed.start < trimmed.end {
-                        let groups = cluster_groups(shaped, &trimmed, end, &chunk.text);
-                        let base: f32 = groups.iter().map(|group| group.base).sum();
-                        let spacing = Spacing::of(&chunk.style);
-                        net -= base + spacing_extra(&groups, &spacing);
+                    if cut < range.end {
+                        let (groups, deltas) = self.span_groups_deltas(
+                            last.item_index,
+                            &(range.start..range.end),
+                            end,
+                            last.x,
+                        );
+                        let mut excluded = 0.0_f32;
+                        for (group, delta) in groups.iter().zip(&deltas) {
+                            if group.glyphs.start >= cut {
+                                excluded += group.base + delta;
+                            }
+                        }
+                        net -= excluded;
                     }
                 }
             }
@@ -1290,40 +1368,53 @@ impl LineBuilder<'_> {
                     let mut glyphs = placed_item.glyphs.clone().expect("text has glyphs");
                     let (span_start, span_end) = placed_item.span.expect("text has span");
                     let mut visible_end = span_end;
-                    // 行尾：折叠模式丢弃尾部空格（CSS Text §4.1 Phase II）
-                    if position == last_index && chunk.style.white_space.collapses() {
-                        let stop = trailing_space_start(&chunk.text, span_start, span_end);
-                        if stop < span_end {
-                            let cut = shaped
-                                .glyphs
-                                .partition_point(|glyph| (glyph.cluster as usize) < stop);
-                            glyphs.end = cut.max(glyphs.start);
-                            visible_end = stop;
+                    // 行尾（仅最后一个放置项）：
+                    // - 折叠模式丢弃尾部空格（CSS Text §4.1 Phase II）；
+                    // - pre-wrap 的行尾空格悬挂（不占行宽可溢出边沿），但
+                    //   字节区间保留——复制文本与选区源映射完整
+                    if position == last_index {
+                        if chunk.style.white_space.collapses() {
+                            let stop = trailing_space_start(&chunk.text, span_start, span_end);
+                            if stop < span_end {
+                                let cut = shaped
+                                    .glyphs
+                                    .partition_point(|glyph| (glyph.cluster as usize) < stop);
+                                glyphs.end = cut.max(glyphs.start);
+                                visible_end = stop;
+                            }
+                        } else if chunk.style.white_space == WhiteSpaceValue::PreWrap {
+                            let stop = trailing_space_start(&chunk.text, span_start, span_end);
+                            if stop < span_end {
+                                let cut = shaped
+                                    .glyphs
+                                    .partition_point(|glyph| (glyph.cluster as usize) < stop);
+                                glyphs.end = cut.max(glyphs.start);
+                            }
                         }
                     }
                     if glyphs.is_empty() {
                         mergeable = false;
                         continue;
                     }
-                    // 间距施加（CSS Text 3 §8）：簇坐标按既有簇的间距修正量
-                    // 右移；每簇末字形 advance += letter-spacing（分隔符簇另计
-                    // word-spacing，收缩后不小于 0）
+                    // 间距与制表推进（CSS Text 3 §8/§5）：每簇 advance =
+                    // base + delta（letter/word 间距、制表推进），簇坐标随
+                    // 既有簇的增量右移
+                    let (groups, deltas) = self.span_groups_deltas(
+                        placed_item.item_index,
+                        &glyphs,
+                        visible_end,
+                        placed_item.x,
+                    );
                     let spacing = Spacing::of(&chunk.style);
-                    let groups = cluster_groups(shaped, &glyphs, visible_end, &chunk.text);
                     let base = shaped.glyphs[glyphs.start].x;
                     let mut glyphs: Vec<Glyph> = Vec::with_capacity(glyphs.len());
                     let mut prior_boost = 0.0_f32;
-                    for group in &groups {
+                    for (group, delta) in groups.iter().zip(&deltas) {
                         let last_in_group = group.glyphs.end - 1;
-                        let word_delta = if group.separator {
-                            (group.base + spacing.word).max(0.0) - group.base
-                        } else {
-                            0.0
-                        };
                         for index in group.glyphs.clone() {
                             let glyph = &shaped.glyphs[index];
                             let advance = if index == last_in_group {
-                                glyph.advance + spacing.letter + word_delta
+                                glyph.advance + delta
                             } else {
                                 glyph.advance
                             };
@@ -1336,7 +1427,7 @@ impl LineBuilder<'_> {
                                 cluster: glyph.cluster,
                             });
                         }
-                        prior_boost += spacing.letter + word_delta;
+                        prior_boost += delta;
                     }
                     // justify 分配：机会点加在该项末字形 advance 上
                     if boosts[position] != 0.0
