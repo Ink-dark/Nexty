@@ -38,8 +38,8 @@ use html5ever::{Attribute as HtmlAttribute, LocalName, Namespace as HtmlNamespac
 
 #[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 use nexty_dom::{
-    Attribute, Document, DocumentTypeData, ElementData, Namespace, NodeId, NodeKind,
-    ProcessingInstructionData, QuirksMode as DocumentQuirksMode,
+    Attribute, Document, DocumentTypeData, ElementData, MAX_TREE_DEPTH, Namespace, NodeId,
+    NodeKind, ProcessingInstructionData, QuirksMode as DocumentQuirksMode,
 };
 // 仅开resources（不开解析）时，只需要遍历用的类型。
 #[cfg(all(
@@ -361,6 +361,19 @@ impl HtmlTreeSink {
     }
 }
 
+/// 挂接前的深度防线：父节点已到 [`MAX_TREE_DEPTH`] 时拒绝再挂。
+///
+/// 单点主防线：超深的子树在解析入口截断，树深度全局有界，下游各递归遍历
+/// （css walk / 布局 build / 资源收集等）不再各自设防。截断是「资源防护降级」：
+/// 被拒节点保持游离，其后续子内容挂在游离子树上，`finish` 后自然不可达。
+/// 截断只影响树形状，不触碰 html5ever 状态机（被拒节点仍留在其 open elements
+/// 栈上照常出栈）。已知偏差：超深内容不按 CSS 语义保留。
+#[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
+fn depth_allows(document: &Document, parent: NodeId) -> bool {
+    let parent_depth = document.depth(parent);
+    (parent_depth as usize) < MAX_TREE_DEPTH
+}
+
 #[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 impl TreeSink for HtmlTreeSink {
     type Handle = NodeId;
@@ -440,6 +453,9 @@ impl TreeSink for HtmlTreeSink {
 
     fn append(&self, parent: &NodeId, child: NodeOrText<NodeId>) {
         let mut document = self.document.borrow_mut();
+        if !depth_allows(&document, *parent) {
+            return;
+        }
         match child {
             AppendText(text) => {
                 if let Some(last) = document.last_child(*parent)
@@ -463,6 +479,9 @@ impl TreeSink for HtmlTreeSink {
         let parent = document
             .parent(reference)
             .expect("append_before_sibling called on a parentless node");
+        if !depth_allows(&document, parent) {
+            return;
+        }
         match new_node {
             AppendText(text) => {
                 if let Some(previous) = document.previous_sibling(reference)
@@ -947,5 +966,79 @@ mod tests {
     fn image_without_src_is_skipped() {
         let document = parse("<body><img alt=\"no src\"></body>");
         assert!(collect_image_resources(&document).is_empty());
+    }
+
+    // ---- 深度防线：超深嵌套在解析入口截断 ----
+
+    /// 按树序统计局部名匹配的元素个数。
+    fn count_elements(document: &Document, root: NodeId, name: &str) -> usize {
+        descendants(document, root)
+            .into_iter()
+            .filter(|id| {
+                matches!(document.node(*id), Some(NodeKind::Element(data)) if data.name == name)
+            })
+            .count()
+    }
+
+    #[test]
+    fn deep_nesting_truncates_at_max_tree_depth() {
+        // 规模取上限的 2 倍即可钉住截断语义。不用更大的语料：html5ever 对每个
+        // 起始标签都要在 open elements 栈上线性扫描（button scope 查 p），解析
+        // 耗时随深度平方增长（实测 debug 1000 层 ≈ 0.8s、2000 层 ≈ 3s）——这是
+        // 上游固有特性，与截断无关，留给性能轮处理。
+        let html = format!("{}{}", "<div>".repeat(1_000), "</div>".repeat(1_000));
+        let document = parse(&html);
+
+        // 树中任意节点深度 ≤ 上限；解析在有限时间内完成（能走到这里即未崩）
+        for id in descendants(&document, document.root()) {
+            assert!(
+                (document.depth(id) as usize) <= MAX_TREE_DEPTH,
+                "节点深度越界"
+            );
+        }
+        // html(1) / body(2) 之后 div 从 3 层起算，最深的 div 在第 512 层
+        assert_eq!(
+            count_elements(&document, document.root(), "div"),
+            MAX_TREE_DEPTH - 2,
+            "只保留上限以内的 div，截断内容不在树里"
+        );
+        // 截断点以下没有更深内容：最深 div 无子节点
+        let body = find_element(&document, document.root(), "body").unwrap();
+        let mut deepest = body;
+        while let Some(child) = document.first_child(deepest) {
+            deepest = child;
+        }
+        assert_eq!(document.depth(deepest), MAX_TREE_DEPTH as u32);
+        assert_eq!(document.children(deepest).count(), 0, "截断点是叶子");
+    }
+
+    #[test]
+    fn fragment_parse_is_depth_capped_from_zero() {
+        let html = format!("{}{}", "<div>".repeat(1_000), "</div>".repeat(1_000));
+        let (document, fragment) = parse_fragment(
+            &html,
+            &FragmentContext::html("body"),
+            ParseOptions::default(),
+        );
+        for id in descendants(&document, fragment) {
+            assert!((document.depth(id) as usize) <= MAX_TREE_DEPTH);
+        }
+        // 片段根（深度 0）之下 div 从 1 层起算
+        assert_eq!(
+            count_elements(&document, fragment, "div"),
+            MAX_TREE_DEPTH - 1
+        );
+    }
+
+    #[test]
+    fn shallow_documents_keep_full_depth_budget() {
+        // 深度预算从文档根 0 起算：正常语料（深度远小于 512）不受影响
+        let html = format!("{}{}", "<div>".repeat(505), "</div>".repeat(505));
+        let document = parse(&html);
+        assert_eq!(
+            count_elements(&document, document.root(), "div"),
+            505,
+            "505 层 div（最深到 507 层）在预算内，不截断"
+        );
     }
 }
