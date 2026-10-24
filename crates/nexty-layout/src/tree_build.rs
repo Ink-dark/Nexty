@@ -43,7 +43,7 @@ use taffy::tree::{LayoutInput, LayoutOutput, NodeId as TaffyNode, RunMode, Taffy
 
 use crate::Context;
 use crate::fragment::LineFragment;
-use crate::inline::{InlineItem, InlineRun};
+use crate::inline::{InlineItem, InlineRun, InlineSegment};
 use crate::style_map::map_style;
 
 /// 构建产物：taffy 盒树 + 映射表。
@@ -491,10 +491,11 @@ fn collect_children_boxes<'a>(
     }
 }
 
-/// 把当前行内流刷成一个匿名 run 叶节点（CSS Display §3.3 / CSS Flexbox §4）。
+/// 把当前行内流刷成参与盒（CSS Display §3.3 / CSS Flexbox §4）。
 ///
-/// 空白序列不产生空叶节点；建节点失败时该段行内内容降级丢弃（与 build_box 的
-/// 降级策略一致）。
+/// 行内流按块级子元素标记分段（CSS 2.2 §9.2.1.1）：Inline 段各自包装成
+/// 匿名 run 叶节点，Block 段按普通块盒布局。纯空白段不产叶节点；建节点
+/// 失败时该段行内内容降级丢弃（与 build_box 的降级策略一致）。
 fn flush_run<'a>(
     state: &mut CollectState<'a>,
     ctx: &'a Context<'a>,
@@ -504,22 +505,30 @@ fn flush_run<'a>(
     let Some(finished) = state.run.take() else {
         return;
     };
-    let (items, indent_first_line) = finished.finish();
-    if items.is_empty() {
-        return;
-    }
-    if let Ok(taffy) = boxes.tree.new_leaf(run_leaf_style()) {
-        boxes.runs.insert(
-            taffy,
-            InlineRunNode {
-                ctx,
-                items: RefCell::new(items),
-                indent_first_line,
-                strut_style: strut_style.clone(),
-                lines_cache: RefCell::new(Vec::new()),
-            },
-        );
-        state.participants.push(taffy);
+    let (segments, indent_first_line) = finished.finish();
+    for segment in segments {
+        match segment {
+            InlineSegment::Inline(items) => {
+                if let Ok(taffy) = boxes.tree.new_leaf(run_leaf_style()) {
+                    boxes.runs.insert(
+                        taffy,
+                        InlineRunNode {
+                            ctx,
+                            items: RefCell::new(items),
+                            indent_first_line,
+                            strut_style: strut_style.clone(),
+                            lines_cache: RefCell::new(Vec::new()),
+                        },
+                    );
+                    state.participants.push(taffy);
+                }
+            }
+            InlineSegment::Block(node) => {
+                if let Some(taffy) = build_box(ctx, boxes, node) {
+                    state.participants.push(taffy);
+                }
+            }
+        }
     }
 }
 

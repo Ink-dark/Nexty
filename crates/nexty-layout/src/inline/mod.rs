@@ -79,7 +79,9 @@
 //!
 //! 已知偏差：`vertical-align` 仅 baseline（原子盒/图片底边对齐基线）；
 //! bidi 未实现；跨行内元素边界的断行上下文只回看两个字符
-//! （见 `uax14::rules::breaks_between_text`）。
+//! （见 `uax14::rules::breaks_between_text`）；行内盒被嵌套块级子元素拆分
+//! 时（CSS 2.2 §9.2.1.1），其 border / background 只画在各半自身范围，
+//! 不跨匿名块连续。
 //!
 //! feature `block` 关闭时本模块无消费方（行内流的唯一下游是 taffy 管线），
 //! 按模块整体抑制 dead_code；`replaced` 单独开启时 `lib.rs` 不 re-export 本模块
@@ -139,6 +141,14 @@ pub(crate) enum InlineItem {
     Block(Box<AtomicBlock>),
     /// 硬断行（`<br>` 或保留模式下的 `\n`）。
     Break,
+}
+
+/// 行内收集器产出的一段：连续行内项，或行内流中遇到的块级子元素标记
+/// （CSS 2.2 §9.2.1.1：块级子盒把行内流拆成两段，各成匿名块）。
+pub(crate) enum InlineSegment {
+    Inline(Vec<InlineItem>),
+    /// 块级子元素节点（按普通块盒布局）。
+    Block(NodeId),
 }
 
 /// 一段样式一致的文本（空白已按 `white-space` 处理）。
@@ -237,7 +247,8 @@ fn is_collapsible(character: char) -> bool {
 /// 行内项收集状态。
 struct Collector<'a> {
     ctx: &'a Context<'a>,
-    items: Vec<InlineItem>,
+    /// 收集产物：行内项段（与块级子元素标记按 DOM 序交替）。
+    items: Vec<InlineSegment>,
     /// 上一个发出的字符是否为折叠空格（跨文本节点去重）。
     last_collapsible_space: bool,
     /// 上一个折叠空格所属的文本节点（用于把源区间扩展到整段空白）。
@@ -268,12 +279,20 @@ impl Collector<'_> {
         self.text_style = Some(style.clone());
     }
 
+    /// 把一个行内项追加到当前 Inline 段（无段则新开一段）。
+    fn push_item(&mut self, item: InlineItem) {
+        match self.items.last_mut() {
+            Some(InlineSegment::Inline(items)) => items.push(item),
+            _ => self.items.push(InlineSegment::Inline(vec![item])),
+        }
+    }
+
     /// 把缓冲中的文本刷入结果。
     fn flush_text(&mut self) {
         if self.text_buffer.is_empty() {
             return;
         }
-        self.items.push(InlineItem::Text(TextChunk {
+        let chunk = TextChunk {
             node: self
                 .text_style_node
                 .take()
@@ -283,7 +302,18 @@ impl Collector<'_> {
             source_map: Arc::from(std::mem::take(&mut self.text_source)),
             tabs: Arc::from(std::mem::take(&mut self.text_tabs)),
             style: self.text_style.take().expect("text has a style"),
-        }));
+        };
+        self.push_item(InlineItem::Text(chunk));
+        self.last_space_node = None;
+    }
+
+    /// 行内收集途中遇到块级子元素：终止当前 run（CSS 2.2 §9.2.1.1），
+    /// 前半 run 与后半 run 各自包装成匿名块，块级子元素按普通块盒布局。
+    /// 偏差：拆分处行内盒的 border / background 只画在各半自身范围。
+    fn push_block_child(&mut self, node: NodeId) {
+        self.flush_text();
+        self.items.push(InlineSegment::Block(node));
+        self.last_collapsible_space = false;
         self.last_space_node = None;
     }
 
@@ -367,7 +397,7 @@ impl Collector<'_> {
     /// 收集一个硬断行（`<br>` 或保留的 `\n`）。
     fn push_break(&mut self) {
         self.flush_text();
-        self.items.push(InlineItem::Break);
+        self.push_item(InlineItem::Break);
         self.last_collapsible_space = false;
         self.last_space_node = None;
     }
@@ -376,7 +406,7 @@ impl Collector<'_> {
     fn push_image(&mut self, node: NodeId, style: &ComputedStyle) {
         let (width, height) = image_box_size(self.ctx.document, node, self.ctx.image_sizes);
         self.flush_text();
-        self.items.push(InlineItem::Image(AtomicImage {
+        self.push_item(InlineItem::Image(AtomicImage {
             node,
             width,
             height,
@@ -390,7 +420,7 @@ impl Collector<'_> {
     /// run 叶的 measure 期（届时才知道 taffy 分配的可用宽）。
     fn push_atomic_block(&mut self, node: NodeId, style: &ComputedStyle) {
         self.flush_text();
-        self.items.push(InlineItem::Block(Box::new(AtomicBlock {
+        self.push_item(InlineItem::Block(Box::new(AtomicBlock {
             fragment: Fragment {
                 node,
                 anonymous: false,
@@ -485,24 +515,28 @@ impl<'a> InlineRun<'a> {
         }
     }
 
-    /// 结束收集，刷出文本缓冲。纯折叠空白（且没有其他行内项）不产 run。
-    /// 返回行内项与「是否容器首 run」（供 text-indent 使用）。
-    pub(crate) fn finish(mut self) -> (Vec<InlineItem>, bool) {
+    /// 结束收集，刷出文本缓冲。产出按块级标记切分的段：纯折叠空白
+    ///（且没有其他行内项）的 Inline 段丢弃，块级标记保留。
+    /// 返回段列表与「是否容器首 run」（供 text-indent 使用）。
+    pub(crate) fn finish(mut self) -> (Vec<InlineSegment>, bool) {
         self.collector.flush_text();
-        let items = &self.collector.items;
-        let has_content = items.iter().any(|item| match item {
-            InlineItem::Text(chunk) => {
-                !chunk.style.white_space.collapses()
-                    || !chunk.text.chars().all(|character| character == ' ')
-                    || !chunk.tabs.is_empty()
-            }
-            _ => true,
-        });
-        if has_content {
-            (self.collector.items, self.first_line_indent)
-        } else {
-            (Vec::new(), self.first_line_indent)
-        }
+        let segments: Vec<InlineSegment> = self
+            .collector
+            .items
+            .into_iter()
+            .filter(|segment| match segment {
+                InlineSegment::Inline(items) => items.iter().any(|item| match item {
+                    InlineItem::Text(chunk) => {
+                        !chunk.style.white_space.collapses()
+                            || !chunk.text.chars().all(|character| character == ' ')
+                            || !chunk.tabs.is_empty()
+                    }
+                    _ => true,
+                }),
+                InlineSegment::Block(_) => true,
+            })
+            .collect();
+        (segments, self.first_line_indent)
     }
 }
 
@@ -547,8 +581,9 @@ fn collect_children(collector: &mut Collector<'_>, node: NodeId, style: &Compute
                     DisplayValue::Inline => {
                         collect_children(collector, child, child_style);
                     }
-                    // 块级子元素不属于行内流（由块级分组处理），跳过
-                    _ => {}
+                    // 块级子元素终止当前行内流（CSS 2.2 §9.2.1.1）：前半 run
+                    // 与后半 run 各自包装成匿名块，块级子元素按普通块盒布局
+                    _ => collector.push_block_child(child),
                 }
             }
             // 注释与处理指令不产生行内内容

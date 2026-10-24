@@ -1597,3 +1597,82 @@ fn pre_wrap_hanging_spaces_do_not_force_wrap() {
     let p = find(&document, &root, "p").expect("p fragment");
     assert_eq!(p.lines.len(), 1, "悬挂空格不触发折行");
 }
+
+// ---- M9：行内子树中的块级子元素不再丢弃（CSS 2.2 §9.2.1.1） ----
+
+#[test]
+fn block_in_inline_subtree_splits_into_anonymous_blocks() {
+    // <div>a <span><div>X</div></span> b</div>：span 内的块级 X 终止当前
+    // 行内流——「a 」与「 b」各成匿名块，X 按普通块盒布局，三者垂直堆叠
+    let (document, root) = layout(
+        "<body><div>a <span><div>X</div></span> b</div></body>",
+        "",
+        400.0,
+    );
+    let outer = find(&document, &root, "div").expect("outer div");
+    assert!(outer.lines.is_empty(), "混排容器：行盒由匿名块承接");
+    assert_eq!(outer.children.len(), 3, "匿名块(a) + X + 匿名块(b)");
+    let before = &outer.children[0];
+    let x = &outer.children[1];
+    let after = &outer.children[2];
+    assert!(before.anonymous && after.anonymous, "两段行内流为匿名块");
+    assert!(!x.anonymous, "X 是真实元素盒");
+    assert_eq!(before.lines.len(), 1, "前半 run 成行");
+    assert_eq!(after.lines.len(), 1, "后半 run 成行");
+    // 垂直堆叠不重叠
+    assert!(
+        before.border_box.y + before.border_box.height <= x.border_box.y + 0.01,
+        "X 接在前半行内流下方"
+    );
+    assert!(
+        x.border_box.y + x.border_box.height <= after.border_box.y + 0.01,
+        "后半行内流接在 X 下方"
+    );
+
+    // X 的文本可被 TextMap 命中并复制；块边界插换行
+    let map = nexty_layout::TextMap::new(&root);
+    let (start, end) = map.all().expect("document has text");
+    let text = map.text(start, end);
+    assert_eq!(text, "a\nX\nb", "复制文本含 X（块边界换行）");
+    // X 的行盒有内容（「X」字形存在）
+    assert_eq!(x.lines.len(), 1);
+    assert_eq!(x.lines[0].runs.len(), 1);
+}
+
+#[test]
+fn deeply_nested_block_in_inline_subtree_survives() {
+    // 两层行内元素包一层块级：块级子盒仍提升为容器的参与盒
+    let (document, root) = layout("<body><span><em><div>Y</div></em></span></body>", "", 400.0);
+    let body_fragment = body(&document, &root);
+    assert_eq!(body_fragment.children.len(), 1, "Y 是 body 的参与盒");
+    let y = &body_fragment.children[0];
+    assert!(!y.anonymous);
+    assert_eq!(y.lines.len(), 1, "Y 的内容成行");
+    assert!(
+        !y.lines[0].runs.is_empty(),
+        "Y 的文本不丢（M9 缺陷下整棵子树消失）"
+    );
+}
+
+#[test]
+fn display_none_and_contents_in_inline_subtree_unchanged() {
+    // none 子树不产内容；contents 透传文本；混合后行内流连续
+    let (document, root) = layout(
+        "<body><div>a<span>\
+         <div style=\"display: none\">gone</div>\
+         <section style=\"display: contents\">C</section>\
+         b</span></div></body>",
+        "",
+        400.0,
+    );
+    let outer = find(&document, &root, "div").expect("outer div");
+    assert_eq!(
+        outer.children.len(),
+        0,
+        "无块级子盒（none 跳过、contents 穿透）"
+    );
+    assert_eq!(outer.lines.len(), 1, "全部行内内容在一个 run 叶");
+    let line = &outer.lines[0];
+    let text: String = line.runs.iter().map(|run| run.text.as_ref()).collect();
+    assert_eq!(text, "aCb", "none 丢弃、contents 穿透、其余连续");
+}
