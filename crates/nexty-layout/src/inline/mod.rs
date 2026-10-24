@@ -56,10 +56,10 @@
 //! `text-indent` 只作用于块容器的首个格式化行（每容器一次；run 叶按
 //! 「容器首 run」判定，flex 匿名 item 全部视为首 run）。缩进从首行可用宽
 //! 中扣减（影响首行断行），并与对齐正交：先缩进，后 center/right/justify。
-//! min/max-content 测量不含缩进（css-sizing 语义）。偏差：percentage 按
-//! run 叶可用宽（元素自身内容盒宽）折算，非规范要求的「元素的包含块宽」
-//! ——auto 宽元素二者相同，显式宽度元素不一致。`each-line` / `hanging`
-//! 关键字未实现。
+//! min/max-content 测量不含缩进（css-sizing 语义）。percentage 按行盒的
+//! 包含块（即块容器自身内容盒宽，= run 叶可用宽）折算——与 Chromium 一致
+//! （实机对照：420px 宽元素上 `10%` 两端引擎同为 ~42px）。
+//! `each-line` / `hanging` 关键字未实现。
 //!
 //! # 三分离模块
 //!

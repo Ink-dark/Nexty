@@ -1393,8 +1393,8 @@ fn text_indent_percentage_resolves_against_containing_block() {
     let first_x = p.lines[0].runs[0].glyphs[0].x;
     assert!(approx(first_x, 40.0), "10% 按可用宽折算：{first_x}");
 
-    // 偏差钉住：显式宽度元素按自身内容盒宽折算（run 叶的可用宽），
-    // 非规范要求的「元素包含块宽」——200 × 10% = 20
+    // 行盒的包含块 = 块容器自身内容盒：显式宽度元素按自身内容宽折算
+    //（与 Chromium 一致，Edge 实机对照 420px 宽 × 10% ≈ 42px）——200 × 10% = 20
     let (document, root) = layout(
         "<body><p style=\"width: 200px; text-indent: 10%\">abc</p></body>",
         "",
