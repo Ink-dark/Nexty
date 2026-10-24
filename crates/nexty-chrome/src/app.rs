@@ -9,10 +9,10 @@
 //! surface present。像素 1:1 上屏，无缩放采样。
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use nexty_layout::Fragment;
-use nexty_network::{Method, NetworkFetcher, ReqwestFetcher};
+use nexty_layout::{Fragment, TextMap};
+use nexty_network::{Method, NetworkError, NetworkFetcher, ReqwestFetcher};
 use nexty_paint::{Pixmap, Scene, Size};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -24,10 +24,14 @@ use crate::history::History;
 use crate::pipeline::{self, HoverKind, Page};
 use crate::render::RenderThread;
 use crate::scrollbar::{self, ScrollGeometry, Scrollbar, ScrollbarHit};
+use crate::selection::{self, Selection};
 use crate::ui::{self, AddressBar, BAR_HEIGHT, BarCommand, CaretDirection, UiEvent};
 
 /// 滚轮一格（LineDelta 1.0）对应的滚动距离，px。
 const WHEEL_LINE_PX: f32 = 40.0;
+
+/// 双击判定窗口。
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 /// 应用错误。
 #[derive(Debug)]
@@ -87,6 +91,13 @@ struct Gpu {
     texture: Option<(wgpu::Texture, [u32; 2])>,
 }
 
+/// 页面左键按下手势（链接目标在按下时解析，释放且未拖动才导航）。
+struct Press {
+    x: f32,
+    y: f32,
+    link: Option<String>,
+}
+
 /// 浏览器应用状态。
 struct BrowserApp {
     proxy: EventLoopProxy<BackgroundEvent>,
@@ -109,6 +120,14 @@ struct BrowserApp {
     page: Option<Page>,
     /// 当前页面布局好的根片段（滚动时按偏移重建显示列表）。
     root: Option<Fragment>,
+    /// 当前布局的文本地图（选区命中/矩形/复制文本）。
+    text_map: Option<TextMap>,
+    /// 页面文本选区（端点按文本节点 + 源偏移保存，重排后重新解析）。
+    selection: Selection,
+    /// 页面左键按下手势：释放时判定「点击链接」还是「拖拽选择」。
+    press: Option<Press>,
+    /// 上一次点击的时间与位置（双击选词）。
+    last_click: Option<(Instant, f32, f32)>,
     /// 根片段内容总高，px（滚动条与 clamp 的依据）。
     content_height: f32,
     /// 页面滚动量，px ∈ [0, max_scroll]。
@@ -135,6 +154,10 @@ impl BrowserApp {
             shift_down: false,
             page: None,
             root: None,
+            text_map: None,
+            selection: Selection::new(),
+            press: None,
+            last_click: None,
             content_height: 0.0,
             scroll_y: 0.0,
             cursor: (0.0, 0.0),
@@ -223,6 +246,16 @@ impl BrowserApp {
             .unwrap_or(0.0);
         self.root = root;
         self.page = Some(page);
+        // 文本地图随布局重建；已有选区按新布局夹取端点（resize 后保持选中）。
+        self.text_map = self.root.as_ref().map(TextMap::new);
+        if self.selection.positions().is_some() {
+            match &self.text_map {
+                Some(map) => {
+                    self.selection.resolve(map);
+                }
+                None => self.selection.clear(),
+            }
+        }
         if reset_scroll {
             self.scroll_y = 0.0;
         } else if let Some(geometry) = self.geometry() {
@@ -279,14 +312,16 @@ impl BrowserApp {
         }
     }
 
-    /// 页面区域左键按下：滚动条优先（拖拽 thumb / 轨道翻页），其次链接命中导航。
+    /// 页面区域左键按下：滚动条优先（拖拽 thumb / 轨道翻页），其次开始选择
+    /// 手势（点击链接在释放且未拖动时导航）。
     fn press_page(&mut self, x: f32, y: f32) {
         let Some(geometry) = self.geometry() else {
             return;
         };
         match self.scrollbar.hit(&geometry, self.scroll_y, x, y) {
-            ScrollbarHit::None => self.open_link_at(x, y),
+            ScrollbarHit::None => self.begin_page_gesture(x, y),
             _ => {
+                self.press = None;
                 if let Some(scroll) = self.scrollbar.on_press(&geometry, self.scroll_y, x, y) {
                     self.set_scroll(scrollbar::clamp_scroll(scroll, geometry.max_scroll()));
                 }
@@ -294,13 +329,44 @@ impl BrowserApp {
         }
     }
 
-    /// 页面区域点击：命中测试 → 最近 `<a href>` → 相对地址归一 → 导航。
-    ///
-    /// 未命中链接（点空白/非锚元素）时不动。
-    fn open_link_at(&mut self, x: f32, y: f32) {
+    /// 开始一次页面点击/选择手势。
+    fn begin_page_gesture(&mut self, x: f32, y: f32) {
+        // 页面点击让地址栏失焦：之后 Ctrl+A / Ctrl+C 作用于页面。
+        self.bar.blur();
         let page_y = y - BAR_HEIGHT + self.scroll_y;
-        let target = self
-            .root
+        let link = self.link_at(x, page_y);
+        let position = self.text_map.as_ref().and_then(|map| map.hit(x, page_y));
+        let now = Instant::now();
+        let double_click = self.last_click.is_some_and(|(time, last_x, last_y)| {
+            now.duration_since(time) <= DOUBLE_CLICK
+                && (x - last_x).abs() <= selection::CLICK_SLOP
+                && (y - last_y).abs() <= selection::CLICK_SLOP
+        });
+        self.last_click = Some((now, x, y));
+        match position {
+            Some(position) => {
+                if double_click
+                    && let Some((from, to)) = self
+                        .text_map
+                        .as_ref()
+                        .and_then(|map| map.word_range(position))
+                {
+                    self.selection.select(from, to);
+                } else {
+                    self.selection.begin(position, self.shift_down);
+                }
+            }
+            None => self.selection.clear(),
+        }
+        self.press = Some(Press { x, y, link });
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// 页面点命中的链接绝对地址（无链接或解析失败返回 `None`）。
+    fn link_at(&self, x: f32, page_y: f32) -> Option<String> {
+        self.root
             .as_ref()
             .and_then(|root| pipeline::hit_test(root, x, page_y))
             .and_then(|node| {
@@ -308,10 +374,7 @@ impl BrowserApp {
                     .as_ref()
                     .and_then(|page| pipeline::link_target(page, node))
             })
-            .and_then(|href| nexty_network::resolve(self.history.current(), &href).ok());
-        if let Some(url) = target {
-            self.navigate(&url);
-        }
+            .and_then(|href| nexty_network::resolve(self.history.current(), &href).ok())
     }
 
     /// 导航：入历史栈并加载。
@@ -350,6 +413,11 @@ impl BrowserApp {
 
     /// 加载：更新地址栏并后台抓取（不改历史栈）。
     fn load(&mut self, url: &str) {
+        // 导航丢弃旧页面的选区与按下手势（新页面的节点 id 从 arena 重新分配）。
+        self.selection.clear();
+        self.press = None;
+        self.text_map = None;
+        self.last_click = None;
         self.bar.set_url(url.to_owned());
         self.bar.set_loading(true);
 
@@ -387,30 +455,36 @@ impl BrowserApp {
                 };
                 // 全部加载在后台线程完成：文档抓取 → 解析 → 子资源并发抓取
                 // → 级联 → 页面就绪。主线程只做布局与呈现。
+                // 错误串收敛为「错误类别 + 状态码」：不回显上游原始错误
+                //（reqwest 的错误文本内含目标 URL），错误页只显示类别。
                 let result = match fetcher.fetch(&request) {
                     Ok(response) if (200..300).contains(&response.status) => {
-                        match String::from_utf8(response.body) {
-                            Ok(html) => {
-                                let document = nexty_html::parse_document(
-                                    &html,
-                                    nexty_html::ParseOptions::default(),
-                                );
-                                let resources = crate::resources::fetch_subresources(
-                                    fetcher.as_ref(),
-                                    &url,
-                                    &document,
-                                );
-                                Ok(pipeline::build_page(
-                                    document,
-                                    resources.stylesheets,
-                                    resources.images,
-                                ))
+                        if response.body.len() > crate::resources::MAX_DOCUMENT_BODY_BYTES {
+                            Err("响应体超出预算".to_owned())
+                        } else {
+                            match String::from_utf8(response.body) {
+                                Ok(html) => {
+                                    let document = nexty_html::parse_document(
+                                        &html,
+                                        nexty_html::ParseOptions::default(),
+                                    );
+                                    let resources = crate::resources::fetch_subresources(
+                                        fetcher.as_ref(),
+                                        &url,
+                                        &document,
+                                    );
+                                    Ok(pipeline::build_page(
+                                        document,
+                                        resources.stylesheets,
+                                        resources.images,
+                                    ))
+                                }
+                                Err(_) => Err("响应不是有效的文本".to_owned()),
                             }
-                            Err(error) => Err(error.to_string()),
                         }
                     }
                     Ok(response) => Err(format!("HTTP {}", response.status)),
-                    Err(error) => Err(format!("{error:?}")),
+                    Err(error) => Err(load_error_text(&error).to_owned()),
                 };
                 let _ = proxy.send_event(BackgroundEvent::PageLoaded { url, result });
             })
@@ -436,12 +510,7 @@ impl BrowserApp {
                 eprintln!("load {url} failed: {error}");
                 // 失败也要出错误页：只打日志会让画面停在上一帧或空白，
                 // 用户看不到任何反馈。
-                let html = format!(
-                    "<body style=\"font-family: sans-serif; padding: 24px\">\
-                     <h1 style=\"color: #c5221f\">无法加载此页</h1>\
-                     <p>{url}</p>\
-                     <p style=\"color: #5f6368\">{error}</p></body>"
-                );
+                let html = error_page_html(&url, &error);
                 self.set_page(pipeline::load_page(&html, ""), true);
                 if let Some(window) = &self.window {
                     window.set_title("加载失败 - Nexty");
@@ -478,10 +547,18 @@ impl BrowserApp {
         let track = geometry.track();
 
         // 页面按滚动偏移重建显示列表（内容从工具带下方开始）
+        let highlights = match &self.text_map {
+            Some(map) if !self.selection.is_empty() => self.selection.rects(map),
+            _ => Vec::new(),
+        };
         let mut scene = match (&self.page, &self.root) {
-            (Some(page), Some(root)) => {
-                pipeline::build_scene_at(page, root, 0.0, BAR_HEIGHT - self.scroll_y)
-            }
+            (Some(page), Some(root)) => pipeline::build_scene_at_with_highlights(
+                page,
+                root,
+                0.0,
+                BAR_HEIGHT - self.scroll_y,
+                &highlights,
+            ),
             _ => Scene::default(),
         };
         // 画布底色：pipeline 的画布保持透明，直接 blit 会把透明像素交给
@@ -591,6 +668,22 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
                 {
                     self.set_scroll(scrollbar::clamp_scroll(scroll, geometry.max_scroll()));
                 }
+                // 拖拽选择：光标离开行盒时按最近文本吸附（拖到页尾仍扩展）。
+                if self.selection.is_dragging()
+                    && self.cursor.1 > BAR_HEIGHT
+                    && let Some(map) = &self.text_map
+                {
+                    let page_y = self.cursor.1 - BAR_HEIGHT + self.scroll_y;
+                    if let Some(position) = map
+                        .hit(self.cursor.0, page_y)
+                        .or_else(|| map.nearest(self.cursor.0, page_y))
+                    {
+                        self.selection.extend_to(position);
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                }
                 // 悬停态变化只影响滚动条配色，需要一帧重绘
                 if let Some(geometry) = self.geometry()
                     && self.scrollbar.on_hover(
@@ -642,6 +735,17 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
                 ..
             } => {
                 self.scrollbar.on_release();
+                if let Some(press) = self.press.take() {
+                    self.selection.finish();
+                    let dragged = !selection::is_click((press.x, press.y), self.cursor);
+                    // 释放且未拖动才算点击：链接此时导航，拖过链接文字只选择。
+                    if !dragged && let Some(url) = press.link {
+                        self.navigate(&url);
+                    }
+                }
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 let state = modifiers.state();
@@ -740,9 +844,23 @@ impl BrowserApp {
                 let _ = self.bar.handle(UiEvent::FocusAndSelect);
             }
             ui::Shortcut::SelectAll => {
-                // 页面文本选择尚未实现（见 goal.md 非目标），本轮只对地址栏生效
                 if self.bar.is_focused() {
                     let _ = self.bar.handle(UiEvent::SelectAll);
+                } else if let Some((from, to)) = self.text_map.as_ref().and_then(TextMap::all) {
+                    self.selection.select(from, to);
+                }
+            }
+            ui::Shortcut::Copy => {
+                // 地址栏聚焦时不处理（地址栏复制不在本轮范围）。
+                if !self.bar.is_focused()
+                    && let Some(map) = &self.text_map
+                {
+                    let text = self.selection.text(map);
+                    if !text.is_empty()
+                        && let Err(error) = selection::write_clipboard(&text)
+                    {
+                        eprintln!("clipboard write failed: {error}");
+                    }
                 }
             }
             ui::Shortcut::Escape => {
@@ -1119,6 +1237,50 @@ fn pad_rows(data: &[u8], width: u32, height: u32, padded: u32) -> Vec<u8> {
     out
 }
 
+/// 传输失败 → 错误类别文本。
+///
+/// 不回显上游原始错误串：reqwest 的错误文本内含目标 URL，而错误页是按
+/// 页面语义渲染的 HTML——错误信息只保留「类别」这一用户需要知道的内容。
+fn load_error_text(error: &NetworkError) -> &'static str {
+    match error {
+        NetworkError::InvalidUrl => "无效的地址",
+        NetworkError::Timeout => "请求超时",
+        NetworkError::Transport => "网络错误",
+    }
+}
+
+/// HTML 实体转义（`&` `<` `>` `"` `'`）。
+///
+/// 错误页把不可信文本（URL、错误类别）拼进 HTML：不转义的话，形如
+/// `<img src=//evil.test/1>` 的 URL 会被解析成标记，触发对第三方地址的
+/// 子资源请求并泄露用户正在访问的 URL。
+fn escape_html(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+/// 加载失败的错误页 HTML：URL 与错误文本均经转义。
+fn error_page_html(url: &str, error: &str) -> String {
+    format!(
+        "<body style=\"font-family: sans-serif; padding: 24px\">\
+         <h1 style=\"color: #c5221f\">无法加载此页</h1>\
+         <p>{}</p>\
+         <p style=\"color: #5f6368\">{}</p></body>",
+        escape_html(url),
+        escape_html(error),
+    )
+}
+
 fn blit_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("nexty-blit-bgl"),
@@ -1293,5 +1455,87 @@ mod tests {
         // 数据长度不足：补零而非 panic
         let padded = pad_rows(&[1, 2, 3], 800, 3, 3328);
         assert_eq!(padded.len(), 3328 * 3);
+    }
+}
+
+#[cfg(test)]
+mod error_page_tests {
+    use super::{error_page_html, escape_html};
+    use nexty_dom::NodeKind;
+
+    /// 按树序收集文档中的元素局部名。
+    fn element_names(document: &nexty_dom::Document) -> Vec<String> {
+        fn walk(document: &nexty_dom::Document, node: nexty_dom::NodeId, out: &mut Vec<String>) {
+            for child in document.children(node) {
+                if let Some(NodeKind::Element(data)) = document.node(child) {
+                    out.push(data.name.clone());
+                }
+                walk(document, child, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(document, document.root(), &mut out);
+        out
+    }
+
+    /// 拼接文档全部文本。
+    fn text_content(document: &nexty_dom::Document) -> String {
+        fn walk(document: &nexty_dom::Document, node: nexty_dom::NodeId, out: &mut String) {
+            for child in document.children(node) {
+                if let Some(NodeKind::Text(data)) = document.node(child) {
+                    out.push_str(data);
+                }
+                walk(document, child, out);
+            }
+        }
+        let mut out = String::new();
+        walk(document, document.root(), &mut out);
+        out
+    }
+
+    #[test]
+    fn escape_html_neutralizes_all_five_entities() {
+        assert_eq!(escape_html("a&b<c>\"d'e"), "a&amp;b&lt;c&gt;&quot;d&#39;e");
+        // 正常文本不受影响
+        assert_eq!(
+            escape_html("https://page.test/dir/page.html?q=1"),
+            "https://page.test/dir/page.html?q=1"
+        );
+    }
+
+    #[test]
+    fn error_page_rejects_url_markup_injection() {
+        // URL 含 <img src=//evil.test/1>：错误页 DOM 中不得出现 img 元素，
+        // 不得有对第三方地址的子资源请求
+        let url = "http://x.test/<img src=//evil.test/1>";
+        let html = error_page_html(url, "HTTP 404");
+        let document = nexty_html::parse_document(&html, nexty_html::ParseOptions::default());
+        let names = element_names(&document);
+        assert!(
+            !names.iter().any(|name| name == "img"),
+            "无 img 元素：{names:?}"
+        );
+        assert!(
+            nexty_html::collect_image_resources(&document).is_empty(),
+            "无第三方子资源请求"
+        );
+        assert!(
+            nexty_html::collect_style_resources(&document).is_empty(),
+            "无第三方样式表请求"
+        );
+        // 显示文本为字面转义后的 URL
+        assert!(
+            text_content(&document).contains("<img src=//evil.test/1>"),
+            "URL 按字面显示"
+        );
+    }
+
+    #[test]
+    fn error_page_keeps_normal_url_rendering() {
+        let html = error_page_html("https://page.test/dir/page.html?q=1&x=2", "请求超时");
+        let document = nexty_html::parse_document(&html, nexty_html::ParseOptions::default());
+        let text = text_content(&document);
+        assert!(text.contains("https://page.test/dir/page.html?q=1&x=2"));
+        assert!(text.contains("请求超时"));
     }
 }

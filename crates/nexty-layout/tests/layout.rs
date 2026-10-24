@@ -1012,3 +1012,121 @@ fn flex_baseline_without_text_still_lays_out() {
     assert_eq!(flex.children.len(), 2);
     assert!(flex.children[0].border_box.y >= 0.0);
 }
+
+// ---- 不可信输入边界：巨数属性注入（数值卫生） ----
+
+#[test]
+fn huge_img_attribute_falls_back_to_natural_size_on_both_paths() {
+    // 45 位巨数：旧实现 parse::<f32>() 得 inf 且通过 > 0 过滤，沿布局扩散
+    let huge = "9".repeat(45);
+
+    // 行内路径：属性无效回落默认对象尺寸（CSS Images §5.1 的 300×150）
+    let (document, root) = layout(
+        &format!("<body><img width=\"{huge}\" height=\"{huge}\" src=a.png></body>"),
+        "",
+        400.0,
+    );
+    let body_fragment = body(&document, &root);
+    let image = &body_fragment.lines[0].images[0];
+    assert!(
+        approx(image.width, 300.0) && approx(image.height, 150.0),
+        "行内 <img> 巨数属性回落，实际 {:?}",
+        (image.width, image.height)
+    );
+
+    // 块级路径（display: block 的替换盒）同样回落
+    let (document, root) = layout(
+        &format!(
+            "<body><img style=\"display: block\" width=\"{huge}\" height=\"{huge}\" src=a.png></body>"
+        ),
+        "",
+        400.0,
+    );
+    let img = find(&document, &root, "img").expect("img fragment");
+    assert!(
+        approx(img.border_box.width, 300.0) && approx(img.border_box.height, 150.0),
+        "块级 <img> 巨数属性回落，实际 {:?}",
+        (img.border_box.width, img.border_box.height)
+    );
+}
+
+#[test]
+fn img_attribute_boundary_respects_max_css_length() {
+    // 恰好 1e7 通过（有效，按属性值布局）
+    let (document, root) = layout(
+        "<body><img width=\"10000000\" height=\"10000000\" src=a.png></body>",
+        "",
+        400.0,
+    );
+    let image = &body(&document, &root).lines[0].images[0];
+    assert!(approx(image.width, 1.0e7) && approx(image.height, 1.0e7));
+
+    // 超限 1px 即无效，回落自然尺寸
+    let (document, root) = layout(
+        "<body><img width=\"10000001\" height=\"10000001\" src=a.png></body>",
+        "",
+        400.0,
+    );
+    let image = &body(&document, &root).lines[0].images[0];
+    assert!(
+        approx(image.width, 300.0) && approx(image.height, 150.0),
+        "超限属性回落，实际 {:?}",
+        (image.width, image.height)
+    );
+}
+
+#[test]
+fn huge_attribute_does_not_pollute_sibling_coordinates() {
+    // 巨数图片夹在两段文本之间：同行其余元素的坐标必须保持有限、不受污染
+    let huge = "9".repeat(45);
+    let (document, root) = layout(
+        &format!("<body>a <img width=\"{huge}\" height=\"{huge}\" src=a.png> b</body>"),
+        "",
+        400.0,
+    );
+    let line = &body(&document, &root).lines[0];
+    assert!(line.height.is_finite(), "行高有限");
+    assert!(line.baseline.is_finite(), "baseline 有限");
+    for run in &line.runs {
+        assert!(
+            run.glyphs
+                .iter()
+                .all(|glyph| glyph.x.is_finite() && glyph.advance.is_finite()),
+            "文本 run 字形坐标有限（绝对坐标 = 字形 x，污染即在此可见）"
+        );
+    }
+    for image in &line.images {
+        assert!(image.x.is_finite() && image.y.is_finite());
+        assert!(image.width.is_finite() && image.height.is_finite());
+    }
+}
+
+#[test]
+fn huge_css_values_still_layout_finite() {
+    // font-size 巨数 em：计算出口钳到上限，页面可布局
+    let (document, root) = layout(
+        "<body><p style=\"font-size: 1e30em\">x</p></body>",
+        "",
+        400.0,
+    );
+    let p = find(&document, &root, "p").expect("p fragment");
+    assert!(p.border_box.width.is_finite() && p.border_box.height.is_finite());
+    assert!(
+        p.border_box.height <= 1.0e7 * 2.0,
+        "字号钳在 1e7 量级内，实际 {}",
+        p.border_box.height
+    );
+
+    // width: 1e40px → 声明无效回落 auto；巨数 margin 同理
+    let (document, root) = layout(
+        "<body><div style=\"width: 1e40px; margin-top: 1e40px; height: 20px\"></div></body>",
+        "",
+        400.0,
+    );
+    let div = find(&document, &root, "div").expect("div fragment");
+    assert!(
+        approx(div.border_box.width, 400.0),
+        "width 无效回落 auto=包含块宽"
+    );
+    assert!(approx(div.border_box.y, 0.0), "margin-top 无效回落 0");
+}

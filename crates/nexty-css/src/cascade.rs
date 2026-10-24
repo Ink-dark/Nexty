@@ -20,9 +20,9 @@ use crate::value::{
     AbsoluteSize, AlignItemsValue, AlignSelfValue, BorderColorValue, BorderStyle, BorderWidthValue,
     BoxSizingValue, CssWideKeyword, DeclaredValue, DisplayValue, FlexDirectionValue, FlexWrapValue,
     FontFamilyValue, FontSizeValue, FontStyleValue, FontWeightValue, GapValue, GridAutoFlowValue,
-    GridTrackList, InsetValue, JustifyContentValue, LineHeightValue, MarginValue, OverflowValue,
-    OverflowWrapValue, PaddingValue, PositionValue, PropertyId, PropertyValue, Rgba, SizeValue,
-    TextAlignValue, ViewportUnit, WhiteSpaceValue, WordBreakValue,
+    GridTrackList, InsetValue, JustifyContentValue, LineHeightValue, MAX_CSS_LENGTH, MarginValue,
+    OverflowValue, OverflowWrapValue, PaddingValue, PositionValue, PropertyId, PropertyValue, Rgba,
+    SizeValue, TextAlignValue, ViewportUnit, WhiteSpaceValue, WordBreakValue,
 };
 
 /// 本层 UA 的 medium 字号基准（CSS Fonts 4 §2.5：initial 值由 UA 决定，
@@ -576,6 +576,8 @@ fn decide<'a>(
 }
 
 /// 视口单位折算为 px：1v* = 视口对应边的 1%（CSS Values 4 §6.2）。
+///
+/// 折算乘积同样过卫生钳：巨数量 × 视口基数不得产生 `inf`。
 fn viewport_px(amount: f32, unit: ViewportUnit, viewport: MediaViewport) -> f32 {
     let base = match unit {
         ViewportUnit::Vw => viewport.width,
@@ -583,7 +585,17 @@ fn viewport_px(amount: f32, unit: ViewportUnit, viewport: MediaViewport) -> f32 
         ViewportUnit::Vmin => viewport.width.min(viewport.height),
         ViewportUnit::Vmax => viewport.width.max(viewport.height),
     };
-    amount * base / 100.0
+    clamp_computed(amount * base / 100.0)
+}
+
+/// 计算出口的长度卫生：有限值 clamp 到上限；±inf 钳到边界；NaN 归 0
+/// （相对单位乘积可能越过解析期的钳值，计算值必须仍落在预算内）。
+fn clamp_computed(value: f32) -> f32 {
+    if value.is_nan() {
+        0.0
+    } else {
+        value.clamp(-MAX_CSS_LENGTH, MAX_CSS_LENGTH)
+    }
 }
 
 macro_rules! resolve_viewport {
@@ -649,9 +661,11 @@ fn resolve_all(
                 //（按本元素自身 font-size，已在 PROPERTY_ORDER 中先求）
                 style.line_height = match *value {
                     LineHeightValue::Percent(fraction) => {
-                        LineHeightValue::Length(style.font_size * fraction)
+                        LineHeightValue::Length(clamp_computed(style.font_size * fraction))
                     }
-                    LineHeightValue::Em(em) => LineHeightValue::Length(style.font_size * em),
+                    LineHeightValue::Em(em) => {
+                        LineHeightValue::Length(clamp_computed(style.font_size * em))
+                    }
                     other => other,
                 };
             }
@@ -917,15 +931,17 @@ fn resolve_border_color(value: BorderColorValue, color: Rgba) -> Rgba {
 }
 
 /// `font-size` 计算值（CSS Fonts 4 §2.5：长度/百分比相对父元素计算字号）。
+///
+/// 相对单位乘积过卫生钳：继承链上的巨数 em/百分比不得算出 `inf`。
 fn compute_font_size(value: &FontSizeValue, parent_font_size: f32) -> f32 {
-    match value {
+    clamp_computed(match value {
         FontSizeValue::Px(px) => *px,
         FontSizeValue::Em(em) => parent_font_size * em,
         FontSizeValue::Percent(fraction) => parent_font_size * fraction,
         FontSizeValue::Absolute(size) => MEDIUM_FONT_SIZE * size.factor(),
         FontSizeValue::Larger => adjacent_size(parent_font_size, true),
         FontSizeValue::Smaller => adjacent_size(parent_font_size, false),
-    }
+    })
 }
 
 /// `larger` / `smaller`：父字号恰为绝对尺寸表项时取相邻项
@@ -1148,6 +1164,24 @@ mod tests {
         document.insert_node(span, p, None);
         let span_style = cascade(&document, span, &[&parsed], None, Some(&p_style));
         assert_eq!(span_style.font_size, 30.0, "继承计算字号而非声明值");
+    }
+
+    #[test]
+    fn huge_relative_font_size_and_line_height_stay_finite() {
+        // 巨数 em 的解析值已钳到上限，计算乘积再钳一次：inf 不得进入布局
+        let style = style_of(
+            "<p style=\"font-size: 1e30em; line-height: 1.5em\">x</p>",
+            &[],
+            "p",
+        );
+        assert_eq!(style.font_size, MAX_CSS_LENGTH, "16 × 1e30 → 钳到上限");
+        let LineHeightValue::Length(line_height) = style.line_height else {
+            panic!("em 行高应折算为绝对长度");
+        };
+        assert_eq!(line_height, MAX_CSS_LENGTH, "1.5 × 1e7 → 钳到上限");
+        // 负字号钳到下界
+        let style = style_of("<p style=\"font-size: -1e30em\">x</p>", &[], "p");
+        assert_eq!(style.font_size, -MAX_CSS_LENGTH);
     }
 
     #[test]

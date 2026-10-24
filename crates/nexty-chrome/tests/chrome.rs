@@ -716,3 +716,169 @@ fn image_natural_size_flows_from_decoding_into_layout() {
         (drawn[0].width, drawn[0].height)
     );
 }
+
+// ---- 不可信输入边界加固：全链回归（本轮验收旗舰用例） ----
+
+use nexty_dom::MAX_TREE_DEPTH;
+use nexty_dom::NodeKind;
+use nexty_layout::Fragment;
+
+/// CRC-32（IEEE，PNG chunk 校验用）。
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// 真实 1×1 PNG，IHDR 尺寸改写为 65535×65535（重算 CRC）——头部声明巨图、
+/// 像素数据只有 1×1 的攻击样本。
+fn declared_huge_png() -> Vec<u8> {
+    let mut png = tiny_png();
+    png[16..20].copy_from_slice(&65535u32.to_be_bytes());
+    png[20..24].copy_from_slice(&65535u32.to_be_bytes());
+    let crc = crc32(&png[12..29]);
+    png[29..33].copy_from_slice(&crc.to_be_bytes());
+    png
+}
+
+/// 片段树所有几何值必须有限（污染即在此可见）。
+fn assert_geometry_finite(fragment: &Fragment) {
+    let border_box = fragment.border_box;
+    assert!(
+        border_box.x.is_finite()
+            && border_box.y.is_finite()
+            && border_box.width.is_finite()
+            && border_box.height.is_finite(),
+        "片段几何有限，实际 {border_box:?}"
+    );
+    for line in &fragment.lines {
+        assert!(line.baseline.is_finite() && line.height.is_finite());
+        for run in &line.runs {
+            assert!(
+                run.glyphs
+                    .iter()
+                    .all(|glyph| glyph.x.is_finite() && glyph.advance.is_finite())
+            );
+        }
+        for image in &line.images {
+            assert!(
+                image.x.is_finite()
+                    && image.y.is_finite()
+                    && image.width.is_finite()
+                    && image.height.is_finite()
+            );
+        }
+    }
+    for child in &fragment.children {
+        assert_geometry_finite(child);
+    }
+}
+
+/// 组合攻击面（深嵌套 + 巨数属性 + 巨图声明 + 巨数 CSS）走完整管线：
+/// parse → 子资源抓取（含解码预检）→ 级联 → 布局 → TextMap → 标题/资源清单
+/// ——不崩、有限时间、几何有限。
+///
+/// 嵌套规模取上限 2 倍（1000 层）：html5ever 对每个起始标签都在 open
+/// elements 栈上线性扫描（O(深度²)），更大语料在测试里不可行（实测
+/// debug 1000 层 ≈ 0.8s、2000 层 ≈ 3s）；截断语义已由 nexty-html 单测钉住。
+///
+/// 栈预算（实测）：512 层布局递归（taffy 解算 + 片段装配的栈帧合计约
+/// 10 KB/层）需 5–6 MB 栈。生产路径中布局只跑在主线程，Windows PE 主线程
+/// 栈默认仅 1 MiB——曾直接栈溢出拖垮进程（实机验收抓到），已由
+/// `nexty-chrome/build.rs` 提到 16 MiB。渲染隔离线程只光栅化、抓取线程
+/// 只解析（均为迭代或浅递归）。测试线程默认栈只有 2 MB，故显式放到
+/// 32 MB 线程执行——顺带把「布局递归的栈需求 ≤ 主线程预算」这一资源
+/// 约束钉在本用例里。
+#[test]
+fn hardening_full_chain_survives_adversarial_page() {
+    // panic 通过 join 传回测试线程，失败仍计入本用例。
+    let result = std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(hardening_full_chain_body)
+        .expect("spawn test thread")
+        .join();
+    assert!(result.is_ok(), "全链用例在线程内失败：{result:?}");
+}
+
+fn hardening_full_chain_body() {
+    let huge = "9".repeat(45);
+    let mut html = String::from(
+        "<html><head><title>加固回归</title>\
+         <style>p { margin: 1e40px; font-size: 1e30em } img { width: 1e40px }</style></head>\
+         <body>",
+    );
+    // 深嵌套部分：超上限，解析入口截断
+    html.push_str(&"<div>".repeat(1_000));
+    html.push_str(&"</div>".repeat(1_000));
+    // 浅层部分：巨数尺寸属性 + 指向巨图声明的 <img>（在截断预算内存活）
+    html.push_str(&format!(
+        "<p>before <img width=\"{huge}\" height=\"{huge}\" src=huge.png> after</p></body></html>"
+    ));
+
+    let fetcher = MockFetcher::new();
+    fetcher.serve("https://page.test/huge.png", &declared_huge_png());
+
+    // parse → 子资源抓取（解码预检在 fetch 阶段拒绝巨图声明）
+    let (document, sub) = load_page_with_resources(&fetcher, "https://page.test/index.html", &html);
+    assert!(sub.images.is_empty(), "巨图声明预检被拒，无像素");
+
+    // 深度截断：树中任意节点 ≤ MAX_TREE_DEPTH，深嵌套部分只保留预算内的层
+    let mut max_depth = 0u32;
+    let mut div_count = 0usize;
+    let mut stack = vec![document.root()];
+    while let Some(id) = stack.pop() {
+        max_depth = max_depth.max(document.depth(id));
+        if let Some(NodeKind::Element(data)) = document.node(id)
+            && data.name == "div"
+        {
+            div_count += 1;
+        }
+        for child in document.children(id) {
+            stack.push(child);
+        }
+    }
+    assert!((max_depth as usize) <= MAX_TREE_DEPTH, "深度有界");
+    assert_eq!(
+        div_count,
+        MAX_TREE_DEPTH - 2,
+        "html/body 之外只保留预算内 div"
+    );
+
+    // 标题与资源清单在全链末端仍可用
+    assert_eq!(
+        pipeline::document_title(&document).as_deref(),
+        Some("加固回归")
+    );
+    assert_eq!(nexty_html::collect_image_resources(&document).len(), 1);
+
+    // 级联 → 布局 → TextMap：页面可布局且几何全部有限
+    let page = pipeline::build_page(document, sub.stylesheets, sub.images);
+    let shaper = ParleyTextShaper::new();
+    let root = pipeline::layout_page(&page, &shaper, 400.0).expect("root");
+    let text_map = nexty_layout::TextMap::new(&root);
+    let _ = &text_map;
+    assert_geometry_finite(&root);
+
+    // 显示列表可构建：文本指令在（浅层段落的 before/after）
+    let scene = pipeline::build_scene(&page, &root);
+    assert!(
+        scene
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::DrawText { .. })),
+        "文本照常下发"
+    );
+    assert!(
+        !scene
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::DrawImage { .. })),
+        "巨图声明无像素、无 DrawImage"
+    );
+}

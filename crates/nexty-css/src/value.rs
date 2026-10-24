@@ -1108,17 +1108,16 @@ fn parse_property_value(property: PropertyId, input: &mut Parser<'_>) -> Result<
 fn parse_line_height(input: &mut Parser<'_>) -> Result<LineHeightValue, ()> {
     match input.next().map_err(|_| ())? {
         Token::Ident(name) if name.eq_ignore_ascii_case("normal") => Ok(LineHeightValue::Normal),
-        Token::Number { value, .. } => {
-            if *value >= 0.0 {
-                Ok(LineHeightValue::Number(*value))
-            } else {
-                Err(())
-            }
-        }
-        Token::Percentage { unit_value, .. } => Ok(LineHeightValue::Percent(*unit_value)),
+        Token::Number { value, .. } => sanitize_number(*value)
+            .filter(|value| *value >= 0.0)
+            .map(LineHeightValue::Number)
+            .ok_or(()),
+        Token::Percentage { unit_value, .. } => sanitize_number(*unit_value)
+            .map(LineHeightValue::Percent)
+            .ok_or(()),
         Token::Dimension { value, unit, .. } => {
             if unit.eq_ignore_ascii_case("em") {
-                Ok(LineHeightValue::Em(*value))
+                sanitize_number(*value).map(LineHeightValue::Em).ok_or(())
             } else {
                 length_to_px(*value, unit)
                     .map(LineHeightValue::Length)
@@ -1191,13 +1190,17 @@ fn parse_size(input: &mut Parser<'_>) -> Result<SizeValue, ()> {
     match input.next().map_err(|_| ())? {
         Token::Ident(name) if name.eq_ignore_ascii_case("auto") => Ok(SizeValue::Auto),
         Token::Number { value: 0.0, .. } => Ok(SizeValue::Length(0.0)),
-        Token::Percentage { unit_value, .. } => Ok(SizeValue::Percent(*unit_value)),
+        Token::Percentage { unit_value, .. } => sanitize_number(*unit_value)
+            .map(SizeValue::Percent)
+            .ok_or(()),
         Token::Dimension { value, unit, .. } => {
             if *value < 0.0 {
                 return Err(());
             }
             if let Some((amount, unit)) = viewport_length(*value, unit) {
-                return Ok(SizeValue::Viewport(amount, unit));
+                return sanitize_number(amount)
+                    .map(|amount| SizeValue::Viewport(amount, unit))
+                    .ok_or(());
             }
             length_to_px(*value, unit).map(SizeValue::Length).ok_or(())
         }
@@ -1230,7 +1233,7 @@ fn parse_overflow(input: &mut Parser<'_>) -> Result<OverflowValue, ()> {
 /// `flex-grow`：<number [0,∞]>（CSS Flexbox §7.1；负数非法）。
 fn parse_flex_grow(input: &mut Parser<'_>) -> Result<f32, ()> {
     match input.next().map_err(|_| ())? {
-        Token::Number { value, .. } if *value >= 0.0 => Ok(*value),
+        Token::Number { value, .. } if *value >= 0.0 => sanitize_number(*value).ok_or(()),
         _ => Err(()),
     }
 }
@@ -1260,10 +1263,14 @@ fn parse_inset(input: &mut Parser<'_>) -> Result<InsetValue, ()> {
     match input.next().map_err(|_| ())? {
         Token::Ident(name) if name.eq_ignore_ascii_case("auto") => Ok(InsetValue::Auto),
         Token::Number { value: 0.0, .. } => Ok(InsetValue::Length(0.0)),
-        Token::Percentage { unit_value, .. } => Ok(InsetValue::Percent(*unit_value)),
+        Token::Percentage { unit_value, .. } => sanitize_number(*unit_value)
+            .map(InsetValue::Percent)
+            .ok_or(()),
         Token::Dimension { value, unit, .. } => {
             if let Some((amount, unit)) = viewport_length(*value, unit) {
-                return Ok(InsetValue::Viewport(amount, unit));
+                return sanitize_number(amount)
+                    .map(|amount| InsetValue::Viewport(amount, unit))
+                    .ok_or(());
             }
             length_to_px(*value, unit).map(InsetValue::Length).ok_or(())
         }
@@ -1308,7 +1315,7 @@ fn parse_flex_wrap(input: &mut Parser<'_>) -> Result<FlexWrapValue, ()> {
 /// `flex-shrink`：<number [0,∞]>（CSS Flexbox §7.2；负数非法）。
 fn parse_flex_shrink(input: &mut Parser<'_>) -> Result<f32, ()> {
     match input.next().map_err(|_| ())? {
-        Token::Number { value, .. } if *value >= 0.0 => Ok(*value),
+        Token::Number { value, .. } if *value >= 0.0 => sanitize_number(*value).ok_or(()),
         _ => Err(()),
     }
 }
@@ -1385,10 +1392,14 @@ fn parse_gap(input: &mut Parser<'_>) -> Result<GapValue, ()> {
     match input.next().map_err(|_| ())? {
         Token::Ident(name) if name.eq_ignore_ascii_case("normal") => Ok(GapValue::Normal),
         Token::Number { value: 0.0, .. } => Ok(GapValue::Length(0.0)),
-        Token::Percentage { unit_value, .. } => Ok(GapValue::Percent(*unit_value)),
+        Token::Percentage { unit_value, .. } => sanitize_number(*unit_value)
+            .map(GapValue::Percent)
+            .ok_or(()),
         Token::Dimension { value, unit, .. } => {
             if let Some((amount, unit)) = viewport_length(*value, unit) {
-                return Ok(GapValue::Viewport(amount, unit));
+                return sanitize_number(amount)
+                    .map(|amount| GapValue::Viewport(amount, unit))
+                    .ok_or(());
             }
             length_to_px(*value, unit).map(GapValue::Length).ok_or(())
         }
@@ -1466,10 +1477,12 @@ fn parse_grid_track_size(input: &mut Parser<'_>) -> Result<GridTrack, ()> {
     match input.next().map_err(|_| ())? {
         Token::Ident(name) if name.eq_ignore_ascii_case("auto") => Ok(GridTrack::Auto),
         Token::Number { value: 0.0, .. } => Ok(GridTrack::Length(0.0)),
-        Token::Percentage { unit_value, .. } => Ok(GridTrack::Percent(*unit_value)),
+        Token::Percentage { unit_value, .. } => sanitize_number(*unit_value)
+            .map(GridTrack::Percent)
+            .ok_or(()),
         Token::Dimension { value, unit, .. } => {
             if unit.eq_ignore_ascii_case("fr") {
-                Ok(GridTrack::Fr(*value))
+                sanitize_number(*value).map(GridTrack::Fr).ok_or(())
             } else {
                 length_to_px(*value, unit).map(GridTrack::Length).ok_or(())
             }
@@ -1483,10 +1496,14 @@ fn parse_margin(input: &mut Parser<'_>) -> Result<MarginValue, ()> {
     match input.next().map_err(|_| ())? {
         Token::Ident(name) if name.eq_ignore_ascii_case("auto") => Ok(MarginValue::Auto),
         Token::Number { value: 0.0, .. } => Ok(MarginValue::Length(0.0)),
-        Token::Percentage { unit_value, .. } => Ok(MarginValue::Percent(*unit_value)),
+        Token::Percentage { unit_value, .. } => sanitize_number(*unit_value)
+            .map(MarginValue::Percent)
+            .ok_or(()),
         Token::Dimension { value, unit, .. } => {
             if let Some((amount, unit)) = viewport_length(*value, unit) {
-                return Ok(MarginValue::Viewport(amount, unit));
+                return sanitize_number(amount)
+                    .map(|amount| MarginValue::Viewport(amount, unit))
+                    .ok_or(());
             }
             length_to_px(*value, unit)
                 .map(MarginValue::Length)
@@ -1500,13 +1517,17 @@ fn parse_margin(input: &mut Parser<'_>) -> Result<MarginValue, ()> {
 fn parse_padding(input: &mut Parser<'_>) -> Result<PaddingValue, ()> {
     match input.next().map_err(|_| ())? {
         Token::Number { value: 0.0, .. } => Ok(PaddingValue::Length(0.0)),
-        Token::Percentage { unit_value, .. } => Ok(PaddingValue::Percent(*unit_value)),
+        Token::Percentage { unit_value, .. } => sanitize_number(*unit_value)
+            .map(PaddingValue::Percent)
+            .ok_or(()),
         Token::Dimension { value, unit, .. } => {
             if *value < 0.0 {
                 return Err(());
             }
             if let Some((amount, unit)) = viewport_length(*value, unit) {
-                return Ok(PaddingValue::Viewport(amount, unit));
+                return sanitize_number(amount)
+                    .map(|amount| PaddingValue::Viewport(amount, unit))
+                    .ok_or(());
             }
             length_to_px(*value, unit)
                 .map(PaddingValue::Length)
@@ -1739,9 +1760,26 @@ fn parse_angle(input: &mut Parser<'_>) -> Result<f32, ()> {
     }
 }
 
-/// `<length-percentage>` 折算为 px；返回 `None` 表示该单位不受支持。
+/// 长度类数值的卫生上限（CSS px）。
+///
+/// 不可信输入里的巨数 token（`1e40px` 在 f32 中溢出为 `inf`）与相对单位
+/// 乘积在解析/计算出口被钳到该量级（与 Chromium 的传统长度上限同量级；
+/// 超出按 UA clamp 记偏差），`inf`/`NaN` 直接拒绝——非有限值一旦进入
+/// 布局会沿几何扩散污染整页坐标。
+pub const MAX_CSS_LENGTH: f32 = 1.0e7;
+
+/// 解析出口的数值卫生：非有限值拒绝（整条声明按无效处理），有限值 clamp
+/// 到 `[-MAX_CSS_LENGTH, MAX_CSS_LENGTH]`。
+pub(crate) fn sanitize_number(value: f32) -> Option<f32> {
+    value
+        .is_finite()
+        .then(|| value.clamp(-MAX_CSS_LENGTH, MAX_CSS_LENGTH))
+}
+
+/// `<length-percentage>` 折算为 px；返回 `None` 表示该单位不受支持或数值
+/// 非有限。
 fn length_to_px(value: f32, unit: &str) -> Option<f32> {
-    if unit.eq_ignore_ascii_case("px") {
+    let px = if unit.eq_ignore_ascii_case("px") {
         Some(value)
     } else if unit.eq_ignore_ascii_case("pt") {
         // 1pt = 1/72in，1in = 96px（CSS Values 4 绝对长度定义）
@@ -1758,7 +1796,8 @@ fn length_to_px(value: f32, unit: &str) -> Option<f32> {
         Some(value * 96.0 / 101.6)
     } else {
         None
-    }
+    }?;
+    sanitize_number(px)
 }
 
 /// 视口单位（[CSS Values 4 §6.2](https://drafts.csswg.org/css-values-4/#viewport-relative-units)）：
@@ -1796,10 +1835,12 @@ fn parse_font_size(input: &mut Parser<'_>) -> Result<FontSizeValue, ()> {
         // <length> 为 0 时单位可省略（CSS Values 4）
         Token::Number { value: 0.0, .. } => Ok(FontSizeValue::Px(0.0)),
         Token::Number { .. } => Err(()),
-        Token::Percentage { unit_value, .. } => Ok(FontSizeValue::Percent(*unit_value)),
+        Token::Percentage { unit_value, .. } => sanitize_number(*unit_value)
+            .map(FontSizeValue::Percent)
+            .ok_or(()),
         Token::Dimension { value, unit, .. } => {
             if unit.eq_ignore_ascii_case("em") {
-                Ok(FontSizeValue::Em(*value))
+                sanitize_number(*value).map(FontSizeValue::Em).ok_or(())
             } else {
                 length_to_px(*value, unit).map(FontSizeValue::Px).ok_or(())
             }
@@ -3137,5 +3178,55 @@ mod tests {
         );
         assert!(parse_declared("#fff important").is_err());
         assert!(parse_declared("#fff ! bogus").is_err());
+    }
+
+    // ---- 数值卫生：巨数 token 与非有限值不进入值模型 ----
+
+    #[test]
+    fn length_boundary_at_max_is_kept_and_overflow_clamped() {
+        // 恰好 1e7 通过
+        assert_eq!(
+            parse_one(PropertyId::Width, "10000000px"),
+            PropertyValue::Size(SizeValue::Length(MAX_CSS_LENGTH))
+        );
+        // 超限的有限值 clamp 到上限（UA clamp 偏差）
+        assert_eq!(
+            parse_one(PropertyId::Width, "10000001px"),
+            PropertyValue::Size(SizeValue::Length(MAX_CSS_LENGTH))
+        );
+        // 负方向同理
+        assert_eq!(
+            parse_one(PropertyId::MarginTop, "-99999999999px"),
+            PropertyValue::Margin(MarginValue::Length(-MAX_CSS_LENGTH))
+        );
+    }
+
+    #[test]
+    fn non_finite_length_tokens_are_rejected() {
+        // 1e40 溢出 f32 为 inf：整条声明按无效处理
+        parse_err(PropertyId::Width, "1e40px");
+        parse_err(PropertyId::MarginTop, "1e40px");
+        parse_err(PropertyId::FontSize, "1e40px");
+        parse_err(PropertyId::FlexGrow, "1e40");
+        // 百分比 token 存的是除以 100 后的比值（50% → 0.5），1e42% 比值溢出
+        parse_err(PropertyId::PaddingTop, "1e42%");
+    }
+
+    #[test]
+    fn relative_units_clamp_to_bound() {
+        // em / 百分比 / 无单位数值按比值 clamp 到同一上限，计算期乘积再钳（cascade）
+        assert_eq!(
+            parse_one(PropertyId::FontSize, "1e30em"),
+            PropertyValue::FontSize(FontSizeValue::Em(MAX_CSS_LENGTH))
+        );
+        // 1e40% 的比值是 1e38（有限）→ clamp；溢出比值见 non_finite 测试
+        assert_eq!(
+            parse_one(PropertyId::PaddingTop, "1e40%"),
+            PropertyValue::Padding(PaddingValue::Percent(MAX_CSS_LENGTH))
+        );
+        assert_eq!(
+            parse_one(PropertyId::LineHeight, "1e30"),
+            PropertyValue::LineHeight(LineHeightValue::Number(MAX_CSS_LENGTH))
+        );
     }
 }

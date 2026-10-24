@@ -14,6 +14,13 @@
 
 use crate::node::{DomError, NodeId, NodeKind, QuirksMode};
 
+/// 文档树深度上限。
+///
+/// 下游（HTML 解析入口、布局遍历）以此作为不可信输入的深度防线：超深内容在
+/// 解析入口截断，树深度全局有界，下游递归遍历（栈溢出是 abort，panic 兜底
+/// 兜不住）因此安全。512 层 × 每层约百字节栈帧 ≪ 默认 8 MB 栈预算。
+pub const MAX_TREE_DEPTH: usize = 512;
+
 /// arena 中的一个节点：节点数据 + 树结构指针。
 #[derive(Debug)]
 struct Node {
@@ -23,6 +30,9 @@ struct Node {
     last_child: Option<NodeId>,
     previous_sibling: Option<NodeId>,
     next_sibling: Option<NodeId>,
+    /// 树深度：文档根为 0，每下探一层加 1。游离节点该值无意义（detach 不清，
+    /// 重挂时按新父节点覆盖）。
+    depth: u32,
     /// `<template>` 元素的[模板内容](https://html.spec.whatwg.org/multipage/#template-contents)。
     template_contents: Option<NodeId>,
 }
@@ -36,6 +46,7 @@ impl Node {
             last_child: None,
             previous_sibling: None,
             next_sibling: None,
+            depth: 0,
             template_contents: None,
         }
     }
@@ -71,6 +82,14 @@ impl Document {
     #[must_use]
     pub fn root(&self) -> NodeId {
         NodeId(0)
+    }
+
+    /// 节点的树深度：文档根为 0，每下探一层加 1。
+    ///
+    /// 游离节点（从未挂接或已摘下）的返回值无意义。
+    #[must_use]
+    pub fn depth(&self, id: NodeId) -> u32 {
+        self.nodes.get(id.0).map_or(0, |node| node.depth)
     }
 
     /// 在 arena 中追加一个游离节点，返回其索引。
@@ -116,9 +135,14 @@ impl Document {
     }
 
     /// 设置 `<template>` 元素的模板内容片段。
+    ///
+    /// 模板内容是独立片段，深度从 0 重新起算。
     pub fn set_template_contents(&mut self, id: NodeId, contents: NodeId) {
         if let Some(node) = self.nodes.get_mut(id.0) {
             node.template_contents = Some(contents);
+        }
+        if let Some(node) = self.nodes.get_mut(contents.0) {
+            node.depth = 0;
         }
     }
 
@@ -363,17 +387,27 @@ impl Document {
     }
 
     /// 把游离节点 `node` 挂到 `parent` 中 `child` 之前（`child` 为 `None` 时挂到末尾）。
+    ///
+    /// 所有挂接路径（insert / remove-重挂 / replace / replace_all / clone）都收敛到
+    /// 这里，深度维护不漏：node 及其子树整体按 `parent.depth + 1` 重新起算。
     fn link_before(&mut self, node: NodeId, parent: NodeId, child: Option<NodeId>) {
         let (previous, next) = match child {
             Some(id) => (self.previous_sibling(id), Some(id)),
             None => (self.last_child(parent), None),
         };
 
+        let depth = self
+            .nodes
+            .get(parent.0)
+            .map_or(0, |parent| parent.depth)
+            .saturating_add(1);
+
         {
             let entry = &mut self.nodes[node.0];
             entry.parent = Some(parent);
             entry.previous_sibling = previous;
             entry.next_sibling = next;
+            entry.depth = depth;
         }
 
         match previous {
@@ -383,6 +417,21 @@ impl Document {
         match next {
             Some(id) => self.nodes[id.0].previous_sibling = Some(node),
             None => self.nodes[parent.0].last_child = Some(node),
+        }
+
+        // 子树随节点移动整体平移深度（迭代走，深树不递归）。
+        let mut stack: Vec<(NodeId, u32)> = self
+            .first_child(node)
+            .map_or(Vec::new(), |first| vec![(first, depth + 1)]);
+        while let Some((id, child_depth)) = stack.pop() {
+            self.nodes[id.0].depth = child_depth;
+            let next_sibling = self.next_sibling(id);
+            if let Some(sibling) = next_sibling {
+                stack.push((sibling, child_depth));
+            }
+            if let Some(first) = self.first_child(id) {
+                stack.push((first, child_depth + 1));
+            }
         }
     }
 

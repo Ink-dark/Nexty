@@ -44,7 +44,7 @@ pub use value::{
     AbsoluteSize, AlignItemsValue, AlignSelfValue, BorderColorValue, BorderStyle, BorderWidthValue,
     BoxSizingValue, CssWideKeyword, DeclaredValue, DisplayValue, FlexDirectionValue, FlexWrapValue,
     FontFamilyValue, FontSizeValue, FontStyleValue, FontWeightValue, GapValue, GridAutoFlowValue,
-    GridTrack, GridTrackList, InsetValue, JustifyContentValue, LineHeightValue, MarginValue,
-    OverflowValue, OverflowWrapValue, PaddingValue, PositionValue, PropertyId, PropertyValue, Rgba,
-    SizeValue, TextAlignValue, ViewportUnit, WhiteSpaceValue, WordBreakValue,
+    GridTrack, GridTrackList, InsetValue, JustifyContentValue, LineHeightValue, MAX_CSS_LENGTH,
+    MarginValue, OverflowValue, OverflowWrapValue, PaddingValue, PositionValue, PropertyId,
+    PropertyValue, Rgba, SizeValue, TextAlignValue, ViewportUnit, WhiteSpaceValue, WordBreakValue,
 };

@@ -21,12 +21,15 @@ ignore = [
 [licenses]
 version = 2
 # 白名单：MIT / Apache-2.0 / BSD / ISC / MPL-2.0 / LGPL；禁 GPL / AGPL。
-# 下列 4 个许可证同为宽松、非 copyleft，且是已选 crate 栈的必需传递依赖，
-# 无法在不替换 wgpu / parley / reqwest 的前提下移除：
+# 下列 5 个许可证同为宽松、非 copyleft，且是已选 crate 栈的必需传递依赖，
+# 无法在不替换 wgpu / parley / reqwest / arboard 的前提下移除：
 #   Zlib                 —— foldhash、slotmap（wgpu 生态）
 #   CC0-1.0              —— hexf-parse（naga ← wgpu）
 #   Unicode-3.0          —— icu4x 全家（url→idna、parley→icu_segmenter）
 #   CDLA-Permissive-2.0  —— webpki-root-certs（rustls ← reqwest 根证书数据）
+#   BSL-1.0              —— clipboard-win、error-code（arboard ← chrome 剪贴板）
+#                           BSL-1.0 与 MIT 等价宽松（无 copyleft、无源码公开义务、
+#                           OSI/FSF 认可）；自研 Win32 剪贴板需要 unsafe，违反硬规则
 allow = [
     "MIT",
     "Apache-2.0",
@@ -38,6 +41,7 @@ allow = [
     "CC0-1.0",
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
+    "BSL-1.0",
     "LGPL-2.1-only",
     "LGPL-2.1-or-later",
     "LGPL-3.0-only",

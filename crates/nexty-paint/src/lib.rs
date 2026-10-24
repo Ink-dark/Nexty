@@ -34,36 +34,68 @@ pub enum DecodeError {
     /// 上游解码器的错误类型不得外泄，故折叠为单一变体：调用方（chrome 层）
     /// 对解码失败的处理是「跳过该资源」，不需要区分具体原因。
     InvalidImage,
-    /// 图像尺寸为0 或超出可渲染范围。
+    /// 图像尺寸为 0、超出资源防护上限，或后端不支持（预检失败与不可渲染
+    /// 同错误变体）。
+    ///
+    /// 上限见 [`MAX_DIMENSION`] / [`MAX_PIXEL_AREA`]：几 KB 的 PNG 可声明
+    /// 65535×65535，先只读头部校验、再分配像素——分配失败是 abort，渲染
+    /// 隔离的 panic 兜底兜不住（超限返回本变体而非尝试分配）。
     SizeUnsupported,
 }
+
+/// 解码预检的单边长度上限。
+///
+/// 旧值为 65535（vello 渲染目标 u16 上限）；收紧到 16384 与光栅目标、
+/// 内存预算同量级——任何实际可绘制的图片远小于此。
+#[cfg(feature = "cpu")]
+pub const MAX_DIMENSION: u32 = 16384;
+
+/// 解码预检的像素面积上限（2^26，约 256 MB RGBA8 缓冲）。
+#[cfg(feature = "cpu")]
+pub const MAX_PIXEL_AREA: u64 = 1 << 26;
 
 /// 从字节流解码一幅图片（格式由内容嗅探，不依赖扩展名）。
 ///
 /// 支持 PNG / JPEG / GIF / WebP（编译期 feature 决定）。产出非预乘 RGBA8，
 /// 供 [`Command::DrawImage`] 消费。
 ///
+/// 解码前先 `into_dimensions()` 只读头部做尺寸预检：边长 ≤ [`MAX_DIMENSION`]
+/// 且 `宽 × 高` ≤ [`MAX_PIXEL_AREA`]，超限返回 [`DecodeError::SizeUnsupported`]
+/// 而不进入像素解码；预检通过后才 `decode()`。
+///
 /// # Errors
 ///
-/// 字节无法识别为受支持格式、格式数据损坏、或尺寸不可渲染时返回 [`DecodeError`]。
+/// 字节无法识别为受支持格式、格式数据损坏、或头部尺寸预检不通过时返回
+/// [`DecodeError`]。
 ///
 /// 上游 `image` 系列的错误一律映射为 [`DecodeError::InvalidImage`]，不引入
 /// `image::error::ImageError`——依赖类型不得出现在 pub 导出中。
 #[cfg(feature = "cpu")]
 pub fn decode(bytes: &[u8]) -> Result<Image, DecodeError> {
-    // 尺寸上限与光栅目标一致（vello 的渲染目标为 u16 像素），
-    // 避免解出一幅无法绘制的巨图。
-    const MAX_DIMENSION: u32 = 65535;
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| DecodeError::InvalidImage)?;
+    let (width, height) = reader
+        .into_dimensions()
+        .map_err(|_| DecodeError::InvalidImage)?;
+    if width == 0
+        || height == 0
+        || width > MAX_DIMENSION
+        || height > MAX_DIMENSION
+        || u64::from(width) * u64::from(height) > MAX_PIXEL_AREA
+    {
+        return Err(DecodeError::SizeUnsupported);
+    }
 
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|_| DecodeError::InvalidImage)?;
     let decoded = reader.decode().map_err(|_| DecodeError::InvalidImage)?;
-
-    let (width, height) = (decoded.width(), decoded.height());
-    if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
-        return Err(DecodeError::SizeUnsupported);
-    }
+    debug_assert_eq!(
+        (decoded.width(), decoded.height()),
+        (width, height),
+        "解码后尺寸与头部预检一致"
+    );
 
     // 统一转RGBA8（灰度 / 调色板 / RGB 均在此归一），行优先连续排列。
     let rgba = decoded.into_rgba8();
@@ -278,7 +310,10 @@ pub trait Rasterizer {
 pub enum RasterError {
     /// 宽或高为 0。
     EmptySize,
-    /// 尺寸超出后端上限（vello_cpu 的渲染目标为 u16 像素）。
+    /// 尺寸超出后端上限（vello_cpu 的渲染目标为 u16 像素；GPU 后端同形语义）。
+    ///
+    /// 与 [`DecodeError::SizeUnsupported`] 的区别：本变体描述渲染目标上限，
+    /// 解码侧的资源防护预检在 [`decode`] 内完成。
     SizeExceedsLimit,
     /// 后端不支持场景中的指令。
     UnsupportedCommand,
@@ -1034,6 +1069,71 @@ mod tests {
         assert_eq!(error, DecodeError::InvalidImage);
         // 空字节
         assert_eq!(decode(&[]).expect_err("empty"), DecodeError::InvalidImage);
+    }
+
+    // ---- 解码预检：头部声明的巨图不进入像素解码（H3 防线） ----
+
+    /// CRC-32（IEEE，PNG chunk 校验用）。
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc: u32 = 0xFFFF_FFFF;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    /// 把真实 1×1 PNG 的 IHDR 尺寸改写为声明值（重算 CRC，像素数据保持
+    /// 1×1）——用于探测预检边界：预检通过者会进入像素解码并因数据不足报
+    /// `InvalidImage`，预检不通过者在头部即报 `SizeUnsupported`。
+    fn png_with_declared_size(width: u32, height: u32) -> Vec<u8> {
+        let mut png = encode_png(1, 1, [0, 0, 255, 255]);
+        // 签名 0..8，IHDR 长度 8..12、类型 12..16、数据 16..29、CRC 29..33
+        png[16..20].copy_from_slice(&width.to_be_bytes());
+        png[20..24].copy_from_slice(&height.to_be_bytes());
+        let crc = crc32(&png[12..29]);
+        png[29..33].copy_from_slice(&crc.to_be_bytes());
+        png
+    }
+
+    #[test]
+    fn decode_rejects_huge_declared_dimensions_before_pixel_decode() {
+        // 65535×65535：按旧实现会先分配约 17 GB 再检查
+        let png = png_with_declared_size(65535, 65535);
+        assert_eq!(
+            decode(&png).expect_err("huge"),
+            DecodeError::SizeUnsupported
+        );
+    }
+
+    #[test]
+    fn decode_preflight_boundary_checks() {
+        // 边长上限两侧
+        assert_eq!(
+            decode(&png_with_declared_size(16385, 1)).expect_err("side over"),
+            DecodeError::SizeUnsupported
+        );
+        assert_eq!(
+            decode(&png_with_declared_size(1, 16385)).expect_err("side over"),
+            DecodeError::SizeUnsupported
+        );
+        // 16384×1 在边长与面积预算内：预检通过，进入像素解码（数据不足 → InvalidImage）
+        assert_eq!(
+            decode(&png_with_declared_size(16384, 1)).expect_err("decodes"),
+            DecodeError::InvalidImage
+        );
+        // 面积上限两侧：8192² = 2^26 恰好通过预检；8193² 超限
+        assert_eq!(
+            decode(&png_with_declared_size(8192, 8192)).expect_err("decodes"),
+            DecodeError::InvalidImage
+        );
+        assert_eq!(
+            decode(&png_with_declared_size(8193, 8192)).expect_err("area over"),
+            DecodeError::SizeUnsupported
+        );
     }
 
     #[test]
