@@ -477,3 +477,43 @@ fn spacing_keeps_hit_and_rect_geometry_per_glyph() {
     let (from, to) = map.all().unwrap();
     assert_eq!(map.text(from, to), "abcd");
 }
+
+#[test]
+fn selection_works_across_justified_lines() {
+    // justify 分配发生在放置期，glyph 坐标即最终坐标：TextMap 命中与
+    // 逐行矩形照常工作
+    let (document, root) = layout(
+        "<body><p style=\"width: 100px; text-align: justify\">\
+         aaa bbb ccc ddd eee fff ggg hhh</p></body>",
+        "",
+        400.0,
+    );
+    let p = find(&document, &root, "p").expect("p fragment");
+    let map = TextMap::new(&root);
+    assert!(p.lines.len() >= 2, "折成多行");
+
+    // 跨行选区：每行一个矩形；矩形 y 逐行排布
+    let (from, to) = map.all().unwrap();
+    let rects = map.rects(from, to);
+    assert_eq!(rects.len(), p.lines.len(), "逐行矩形");
+    for (index, rect) in rects.iter().enumerate() {
+        assert!(rect.width.is_finite() && rect.width > 0.0);
+        if index + 1 < rects.len() {
+            assert!(rect.y < rects[index + 1].y, "矩形按行下移");
+        }
+    }
+    // 末行之前的矩形右缘贴容器（justify 行右缘 = 可用宽）
+    for rect in &rects[..rects.len() - 1] {
+        assert!(
+            (rect.x + rect.width - 100.0).abs() < 0.5,
+            "justify 行选区矩形右缘 = 容器宽：{}",
+            rect.x + rect.width
+        );
+    }
+    // 命中落在行内文本上
+    let mid_x = rects[0].x + rects[0].width / 2.0;
+    let mid_y = rects[0].y + rects[0].height / 2.0;
+    assert!(map.hit(mid_x, mid_y).is_some(), "justify 行内命中");
+    // 复制文本完整（软折行补空格）
+    assert_eq!(map.text(from, to), "aaa bbb ccc ddd eee fff ggg hhh");
+}

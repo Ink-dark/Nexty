@@ -28,6 +28,18 @@
 //! 元素边界（`<b>x</b>y` 的 x→y）不加距；相邻块间游标保留前块行尾字距
 //! （对齐浏览器在元素边界施加字距的行为）。
 //!
+//! # 两端对齐（CSS Text 3 §7）
+//!
+//! `text-align: justify` 同样是放置期修正：先按现有断行成行（断行结果
+//! 不变），软折行收尾的非末行在 flush 期把自由空间均匀分配到机会点。
+//! 机会点是 CSS §7 `auto` 方法的可执行近似：折叠空格字形（软折行消费的
+//! 可折叠空格处）+ 同块簇边界（`split_spans` 只在 UAX#14 断点切段）。
+//! 末行与硬断行前的行不分配（§7.3，按 start 对齐）。偏差：不做 inter-word
+//! 空格收缩、不做 `text-justify` 分档；保留空白模式（pre-wrap /
+//! break-spaces）的空格不设空格机会；跨行内元素边界不加距；
+//! `justify-all` / `match-parent` 降级为 start。measure 路径
+//! （min/max-content）不分配。
+//!
 //! # 三分离模块
 //!
 //! UAX#14 相关代码不放在 `build_lines` 同一个文件里，按职责拆为：
@@ -60,7 +72,7 @@ use std::sync::Arc;
 
 use nexty_css::{
     ComputedStyle, DisplayValue, LineHeightValue, MAX_CSS_LENGTH, OverflowWrapValue, SpacingValue,
-    WordBreakValue,
+    TextAlignValue, WordBreakValue,
 };
 use nexty_dom::{Document, ElementData, Namespace, NodeId, NodeKind};
 use nexty_text::{FontMetrics, Glyph, ResolvedFont, ShapedText, TextShaper, TextStyle};
@@ -757,13 +769,10 @@ pub(crate) fn build_lines(
         return Vec::new();
     }
 
-    // 数值卫生兜底：包含块宽度异常为非有限值时按 0 降级，行内坐标不从
-    // 非有限起点扩散（污染隔离在单元素）。
-    let max_width = if max_width.is_finite() {
-        max_width
-    } else {
-        0.0
-    };
+    // 数值卫生兜底：NaN 按 0 降级（污染隔离在单元素）；+inf 是 MaxContent
+    // 测量的合法「不折行」语义，保留（游标累加的都是有限宽度，坐标不扩散
+    // 非有限值）。
+    let max_width = if max_width.is_nan() { 0.0 } else { max_width };
 
     // 每块文本只整形一次（cluster 映射与断点都基于同一结果）
     let shaped_items: Vec<Option<ShapedText>> = items
@@ -810,6 +819,7 @@ pub(crate) fn build_lines(
         current_start: LineStart::Soft { space: false },
         next_start: LineStart::Soft { space: false },
         trailing_letter_spacing: 0.0,
+        justify: block_style.text_align == TextAlignValue::Justify && !min_content,
     };
 
     let mut previous: Option<usize> = None;
@@ -817,8 +827,9 @@ pub(crate) fn build_lines(
         match &items[index] {
             InlineItem::Break => {
                 // 硬断行：结束当前行（空行也保留），下一项从行首开始。
+                // 该行以硬断行收尾，不做 justify 分配（CSS Text 3 §7.3）
                 builder.next_start = LineStart::Hard;
-                builder.flush();
+                builder.flush(false);
                 previous = None;
             }
             InlineItem::Image(image) => {
@@ -882,10 +893,12 @@ pub(crate) fn build_lines(
             }
         }
     }
-    // 末尾：有内容才成行；末尾是硬断行时保留其后的空行（\n 数 + 1）
+    // 末尾：有内容才成行；末尾是硬断行时保留其后的空行（\n 数 + 1）。
+    // 末行不做 justify 分配（CSS Text 3 §7.3：末行走 text-align-last，
+    // 本层按 start 对齐）
     let trailing_break = matches!(items.last(), Some(InlineItem::Break));
     if !builder.placed.is_empty() || trailing_break {
-        builder.flush();
+        builder.flush(false);
     }
     builder.lines
 }
@@ -908,6 +921,8 @@ struct LineBuilder<'a> {
     /// 行内最后一个已放置文本簇的 letter-spacing（行末扣减的量；原子项
     /// 落点归零）。游标在放置期含它，行宽在 flush 期扣除。
     trailing_letter_spacing: f32,
+    /// `text-align: justify` 生效（measure 路径关闭；软折行 flush 时消费）。
+    justify: bool,
 }
 
 impl LineBuilder<'_> {
@@ -1004,7 +1019,7 @@ impl LineBuilder<'_> {
         if !self.placed.is_empty() && self.cursor + width > self.max_width {
             if break_before {
                 self.mark_soft_break(Some(item_index), span.byte_start);
-                self.flush();
+                self.flush(self.justify);
                 let Some((new_start, new_end, new_width)) =
                     self.prepare_span(item_index, span, true)
                 else {
@@ -1061,7 +1076,7 @@ impl LineBuilder<'_> {
             };
             if !self.placed.is_empty() && self.cursor + width > self.max_width {
                 self.mark_soft_break(Some(item_index), part.byte_start);
-                self.flush();
+                self.flush(self.justify);
                 // 新行是空的：本段即使超宽也直接放置（单个 cluster 不可再拆）
                 let Some((start, end, _)) = self.prepare_span(item_index, &part, true) else {
                     continue;
@@ -1077,7 +1092,7 @@ impl LineBuilder<'_> {
     fn place_atomic(&mut self, item_index: usize, width: f32, break_before: bool) {
         if !self.placed.is_empty() && self.cursor + width > self.max_width && break_before {
             self.mark_soft_break(None, 0);
-            self.flush();
+            self.flush(self.justify);
         }
         self.placed.push(PlacedItem {
             item_index,
@@ -1121,8 +1136,83 @@ impl LineBuilder<'_> {
         false
     }
 
+    /// 边界 `index`（已放置项 `index` 与 `index + 1` 之间）是否为 justify
+    /// 机会点：折叠空格字形（软折行消费的可折叠空格处），或同块簇边界
+    /// （`split_spans` 只在 UAX#14 断点切段，排除行首天然成立）。
+    /// 跨块边界不加距；保留空白模式的空格不设空格机会（偏差记账）。
+    fn justify_opportunity(&self, index: usize) -> bool {
+        let placed = &self.placed[index];
+        let InlineItem::Text(chunk) = &self.items[placed.item_index] else {
+            return false;
+        };
+        if chunk.style.white_space.collapses()
+            && let Some((_, end)) = placed.span
+            && chunk
+                .text
+                .get(..end)
+                .is_some_and(|head| head.ends_with(' '))
+        {
+            return true;
+        }
+        self.placed[index + 1].item_index == placed.item_index
+    }
+
     /// 结束当前行（空行也保留：硬断行与 `<pre>` 的 `\n`）。
-    fn flush(&mut self) {
+    ///
+    /// `justify` 为真时（调用方保证：软折行收尾、非末行、`text-align:
+    /// justify` 且非测量路径）在机会点均匀分配自由空间（CSS Text 3 §7
+    /// auto 方法的可执行近似，偏差见模块文档）。
+    fn flush(&mut self, justify: bool) {
+        // justify 分配：先按现有断行成行（自由空间在放置期已知），再算
+        // 每个放置项的 x 平移量与其末字形的 advance 增量
+        let mut shifts = vec![0.0_f32; self.placed.len()];
+        let mut boosts = vec![0.0_f32; self.placed.len()];
+        if justify && self.placed.len() > 1 {
+            let mut net = self.cursor - self.trailing_letter_spacing;
+            // 折叠模式末项被裁掉的行尾空格不占宽（软断点消费的空格）
+            if let Some(last) = self.placed.last()
+                && let InlineItem::Text(chunk) = &self.items[last.item_index]
+                && chunk.style.white_space.collapses()
+                && let Some((start, end)) = last.span
+            {
+                let stop = trailing_space_start(&chunk.text, start, end);
+                if stop < end
+                    && let (Some(shaped), Some(range)) = (
+                        self.shaped_items[last.item_index].as_ref(),
+                        last.glyphs.as_ref(),
+                    )
+                {
+                    let cut = shaped
+                        .glyphs
+                        .partition_point(|glyph| (glyph.cluster as usize) < stop);
+                    let trimmed = cut.max(range.start)..range.end;
+                    if trimmed.start < trimmed.end {
+                        let groups = cluster_groups(shaped, &trimmed, end, &chunk.text);
+                        let base: f32 = groups.iter().map(|group| group.base).sum();
+                        let spacing = Spacing::of(&chunk.style);
+                        net -= base + spacing_extra(&groups, &spacing);
+                    }
+                }
+            }
+            let free = self.max_width - net;
+            if free > 0.0 && free.is_finite() {
+                let count = (0..self.placed.len() - 1)
+                    .filter(|&boundary| self.justify_opportunity(boundary))
+                    .count();
+                if count > 0 {
+                    let extra = free / count as f32;
+                    let mut shift = 0.0_f32;
+                    for index in 0..self.placed.len() {
+                        shifts[index] = shift;
+                        if index + 1 < self.placed.len() && self.justify_opportunity(index) {
+                            boosts[index] += extra;
+                            shift += extra;
+                        }
+                    }
+                }
+            }
+        }
+
         // 行盒几何：baseline = max(各 run 上半部, strut 上半部)（CSS 2.1 §10.8）
         let mut baseline = self.strut_above;
         let mut below = self.strut_below;
@@ -1220,7 +1310,7 @@ impl LineBuilder<'_> {
                             };
                             glyphs.push(Glyph {
                                 id: glyph.id,
-                                x: glyph.x - base + placed_item.x + prior_boost,
+                                x: glyph.x - base + placed_item.x + prior_boost + shifts[position],
                                 y: glyph.y,
                                 advance,
                                 font: glyph.font,
@@ -1228,6 +1318,12 @@ impl LineBuilder<'_> {
                             });
                         }
                         prior_boost += spacing.letter + word_delta;
+                    }
+                    // justify 分配：机会点加在该项末字形 advance 上
+                    if boosts[position] != 0.0
+                        && let Some(glyph) = glyphs.last_mut()
+                    {
+                        glyph.advance += boosts[position];
                     }
                     if position == last_index {
                         final_letter = Some(spacing.letter);
@@ -1263,7 +1359,7 @@ impl LineBuilder<'_> {
                 InlineItem::Image(image) => {
                     images.push(ImageRun {
                         node: image.node,
-                        x: placed_item.x,
+                        x: placed_item.x + shifts[position],
                         y: baseline - image.height,
                         width: image.width,
                         height: image.height,
@@ -1273,7 +1369,7 @@ impl LineBuilder<'_> {
                 InlineItem::Block(atomic) => {
                     let mut fragment = atomic.fragment.clone();
                     // 底边对齐基线：x/y 相对所属片段内容盒
-                    fragment.border_box.x = placed_item.x;
+                    fragment.border_box.x = placed_item.x + shifts[position];
                     fragment.border_box.y = baseline - fragment.border_box.height;
                     boxes.push(fragment);
                     mergeable = false;

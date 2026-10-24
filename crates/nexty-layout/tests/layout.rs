@@ -1212,3 +1212,154 @@ fn word_spacing_separators_count_into_narrow_measurement() {
     let diff: f32 = spaced.iter().zip(&plain).map(|(s, p)| s - p).sum();
     assert!(approx(diff, 2.0 * 8.0), "行尾分隔符各 +8px：差合计 {diff}");
 }
+
+// ---- text-align: justify（CSS Text 3 §7，auto 方法的可执行近似） ----
+
+#[test]
+fn justify_flushes_non_last_lines_to_container_width() {
+    // 非末行右缘贴满容器（机会点均匀分配自由空间），末行左 ragged。
+    // 断言不依赖具体断行位置：任何非末 justify 行的行宽都 = 可用宽。
+    let (document, root) = layout(
+        "<body><p style=\"width: 100px; text-align: justify\">\
+         aaa bbb ccc ddd eee fff ggg hhh</p></body>",
+        "",
+        400.0,
+    );
+    let p = find(&document, &root, "p").expect("p fragment");
+    assert!(p.lines.len() >= 2, "文本折成多行");
+    for (index, line) in p.lines[..p.lines.len() - 1].iter().enumerate() {
+        let (_, end) = line_extent(line);
+        assert!(
+            approx(end, 100.0),
+            "第 {index} 行 justify 后右缘贴容器：{end}"
+        );
+    }
+    let (_, last_end) = line_extent(p.lines.last().expect("last line"));
+    assert!(last_end < 100.0, "末行不分配，左 ragged：{last_end}");
+}
+
+#[test]
+fn justify_line_without_opportunities_stays_left_and_finite() {
+    // 断点恰在唯一空格处：首行只剩 "aaaaaa"——无空格字形、无同块簇边界
+    //（单 span），机会点为 0 → 退化左对齐，与 left 布局逐字形相同
+    let lines_of = |align: &str| {
+        let (document, root) = layout(
+            &format!("<body><p style=\"width: 60px; {align}\">aaaaaa bbbbbb</p></body>"),
+            "",
+            400.0,
+        );
+        let p = find(&document, &root, "p").expect("p fragment");
+        p.lines
+            .iter()
+            .map(|line| {
+                line.runs
+                    .iter()
+                    .flat_map(|run| {
+                        run.glyphs
+                            .iter()
+                            .map(|glyph| (glyph.x, glyph.advance))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+    let justified = lines_of("text-align: justify;");
+    let left = lines_of("");
+    assert_eq!(justified.len(), 2, "两词各自成行");
+    assert_eq!(justified, left, "无机会行退化左对齐（逐字形同构）");
+}
+
+#[test]
+fn justify_does_not_apply_to_pre_lines() {
+    // pre 无折叠空格无软折行：各行以硬断行结尾或为末行，不分配间距
+    let (document, root) = layout(
+        "<body><pre style=\"width: 400px; text-align: justify\">aaaa bbbb cccc\
+         \ndddd</pre></body>",
+        "",
+        400.0,
+    );
+    let pre = find(&document, &root, "pre").expect("pre fragment");
+    assert_eq!(pre.lines.len(), 2);
+    let (first, end) = line_extent(&pre.lines[0]);
+    assert!(approx(first, 0.0));
+    assert!(end < 300.0, "pre 行保持自然宽度，不拉伸：{end}");
+}
+
+#[test]
+fn justify_with_zero_free_space_matches_left_exactly() {
+    // 自由空间为 0（溢出行）：justify 与 left 的字形坐标逐个相同
+    let (document, root) = layout(
+        "<body><p style=\"width: 60px; text-align: justify\">aaaaaaaaaa bbbbbbbbbb</p></body>",
+        "",
+        400.0,
+    );
+    let justified: Vec<Vec<f32>> = find(&document, &root, "p")
+        .expect("p")
+        .lines
+        .iter()
+        .map(|line| {
+            line.runs
+                .iter()
+                .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.x).collect::<Vec<_>>())
+                .collect()
+        })
+        .collect();
+    let (document, root) = layout(
+        "<body><p style=\"width: 60px\">aaaaaaaaaa bbbbbbbbbb</p></body>",
+        "",
+        400.0,
+    );
+    let left: Vec<Vec<f32>> = find(&document, &root, "p")
+        .expect("p")
+        .lines
+        .iter()
+        .map(|line| {
+            line.runs
+                .iter()
+                .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.x).collect::<Vec<_>>())
+                .collect()
+        })
+        .collect();
+    assert_eq!(justified, left, "自由空间为 0 时与 left 逐字形同构");
+}
+
+#[test]
+fn justify_keeps_intrinsic_measurements() {
+    // measure 路径不分配间距：justify 与 left 的 min/max-content 相等
+    //（max-content 经 shrink-to-fit inline-block 宽度观察）
+    let widths = |align: &str| {
+        let (document, root) = layout(
+            &format!(
+                "<body><i style=\"display: inline-block; {align}\">\
+                 aaa bbb ccc ddd eee fff ggg hhh iii jjj</i></body>"
+            ),
+            "",
+            400.0,
+        );
+        let atomic = &body(&document, &root).lines[0].boxes[0];
+        atomic.border_box.width
+    };
+    let max_content_left = widths("");
+    let max_content_justify = widths("text-align: justify;");
+    assert!(
+        approx(max_content_left, max_content_justify),
+        "max-content 不受 justify 影响：{max_content_left} vs {max_content_justify}"
+    );
+
+    // min-content（width: 0 逐 span 成行）同样不受影响
+    let min_widths = |align: &str| {
+        let (document, root) = layout(
+            &format!("<body><div style=\"width: 0; {align}\">aaa bbb ccc</div></body>"),
+            "",
+            400.0,
+        );
+        find(&document, &root, "div")
+            .expect("div")
+            .lines
+            .iter()
+            .map(|line| line_extent(line).1)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(min_widths(""), min_widths("text-align: justify;"));
+}
