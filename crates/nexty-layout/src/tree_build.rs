@@ -115,6 +115,9 @@ impl BoxTree<'_> {
 pub(crate) struct InlineRunNode<'a> {
     ctx: &'a Context<'a>,
     items: RefCell<Vec<InlineItem>>,
+    /// 本 run 是否为其块容器的第一个 run（text-indent 只作用于容器的
+    /// 首个格式化行，CSS Text 3 §4）。
+    indent_first_line: bool,
     /// strut 来源：匿名块的父元素 computed style（CSS 2.1 §10.8.1）。
     strut_style: ComputedStyle,
     /// (可用宽, 是否 min-content 语义, 行盒) 缓存。measure 在 max-content、
@@ -163,11 +166,29 @@ impl InlineRunNode<'_> {
             available_width,
             &self.strut_style,
             min_content,
+            self.first_line_indent(available_width, min_content),
         );
         self.lines_cache
             .borrow_mut()
             .push((available_width, min_content, lines.clone()));
         lines
+    }
+
+    /// 首行缩进的 used value（CSS Text 3 §4）。
+    ///
+    /// 只在定宽布局路径生效：percentage 按包含块内容宽（即可用宽）折算；
+    /// min-content / max-content 测量不含缩进（css-sizing 语义，与
+    /// Chromium 一致），非有限可用宽同理。
+    fn first_line_indent(&self, available_width: f32, min_content: bool) -> f32 {
+        if !self.indent_first_line || min_content || !available_width.is_finite() {
+            return 0.0;
+        }
+        match self.strut_style.text_indent {
+            nexty_css::TextIndentValue::Length(px) => px,
+            nexty_css::TextIndentValue::Percent(fraction) => fraction * available_width,
+            // computed 阶段已折算；防御性处理
+            nexty_css::TextIndentValue::Em(em) => em * self.strut_style.font_size,
+        }
     }
 
     /// measure function：taffy 以可用空间询问内在尺寸。
@@ -309,22 +330,24 @@ pub(crate) fn build_box_tree<'a>(ctx: &'a Context<'a>, root: NodeId) -> BoxTree<
         DisplayValue::None => {}
         // §3.2：contents 根自身无盒，参与盒提升到合成根下。
         DisplayValue::Contents => {
-            let mut run = None;
-            let mut participants = Vec::new();
+            let mut state = CollectState {
+                run: None,
+                participants: Vec::new(),
+                first_run: true,
+            };
             collect_children_boxes(
                 ctx,
                 &mut boxes,
                 root,
                 &style,
                 WalkKind::BlockContainer,
-                &mut run,
-                &mut participants,
+                &mut state,
             );
-            flush_run(&mut run, ctx, &mut boxes, &style, &mut participants);
+            flush_run(&mut state, ctx, &mut boxes, &style);
             boxes.root_is_element_box = false;
             if let Ok(synthetic) = boxes
                 .tree
-                .new_with_children(run_leaf_style(), &participants)
+                .new_with_children(run_leaf_style(), &state.participants)
             {
                 boxes.root = Some(synthetic);
             }
@@ -365,12 +388,16 @@ fn build_box<'a>(ctx: &'a Context<'a>, boxes: &mut BoxTree<'a>, node: NodeId) ->
     // 块级替换元素：以自然尺寸为 definite size 建叶节点，taffy 不再解算内容，
     // 子树（alt 文本等）不参与布局。
     let replaced = replaced_leaf_size(ctx, node);
-    let mut participants = Vec::new();
+    let mut state = CollectState {
+        run: None,
+        participants: Vec::new(),
+        first_run: true,
+    };
     if replaced.is_none() {
-        let mut run = None;
-        collect_children_boxes(ctx, boxes, node, &style, kind, &mut run, &mut participants);
-        flush_run(&mut run, ctx, boxes, &style, &mut participants);
+        collect_children_boxes(ctx, boxes, node, &style, kind, &mut state);
+        flush_run(&mut state, ctx, boxes, &style);
     }
+    let participants = state.participants;
 
     let mut taffy_style = map_style(&style);
     if let Some((width, height)) = replaced {
@@ -389,28 +416,42 @@ fn build_box<'a>(ctx: &'a Context<'a>, boxes: &mut BoxTree<'a>, node: NodeId) ->
     Some(taffy_node)
 }
 
+/// 容器子内容收集的共享状态（跨 `contents` 递归持续）。
+struct CollectState<'a> {
+    /// 进行中的行内流。
+    run: Option<InlineRun<'a>>,
+    /// 已产生的参与盒（run 叶 + 块级子盒，按 DOM 序）。
+    participants: Vec<TaffyNode>,
+    /// 是否尚未产生 run 叶或块级子盒（text-indent 首行判定）。
+    first_run: bool,
+}
+
 /// 收集容器 `node` 的参与盒：块级子盒 + run 叶节点（按 DOM 序）。
 ///
 /// `style` 是容器的 computed style（直接文本子节点的样式来源）；行内收集状态
-/// 跨 `contents` 边界持续，避免跨界空白丢失。
+/// 跨 `contents` 边界持续，避免跨界空白丢失。flex 走法下每个匿名 item 是独立
+/// 块容器，全部按 first 处理。
 fn collect_children_boxes<'a>(
     ctx: &'a Context<'a>,
     boxes: &mut BoxTree<'a>,
     node: NodeId,
     style: &ComputedStyle,
     kind: WalkKind,
-    run: &mut Option<InlineRun<'a>>,
-    participants: &mut Vec<TaffyNode>,
+    state: &mut CollectState<'a>,
 ) {
     debug_assert!(
         (ctx.document.depth(node) as usize) <= MAX_TREE_DEPTH,
         "DOM depth exceeds MAX_TREE_DEPTH"
     );
+    // flex 走法下每段行内流都是独立匿名 item（自身是块容器，首行适用缩进）
+    let indent_every_run = kind == WalkKind::FlexItems;
     for child in ctx.document.children(node) {
         match ctx.document.node(child) {
             Some(NodeKind::Text(text)) => {
                 // 直接文本：样式取父元素，节点身份取文本节点自身
-                run.get_or_insert_with(|| InlineRun::new(ctx))
+                state
+                    .run
+                    .get_or_insert_with(|| InlineRun::new(ctx, indent_every_run || state.first_run))
                     .push_text(text, child, node, style);
             }
             Some(NodeKind::Element(_)) => {
@@ -421,29 +462,26 @@ fn collect_children_boxes<'a>(
                     DisplayValue::None => {}
                     // contents：盒子移除，子内容提升到当前层（穿透；收集状态保持）
                     DisplayValue::Contents => {
-                        collect_children_boxes(
-                            ctx,
-                            boxes,
-                            child,
-                            child_style,
-                            kind,
-                            run,
-                            participants,
-                        );
+                        collect_children_boxes(ctx, boxes, child, child_style, kind, state);
                     }
                     // 块容器走法：行内级子元素进 run 叶
                     _ if kind == WalkKind::BlockContainer
                         && is_inline_level(child_style.display) =>
                     {
-                        run.get_or_insert_with(|| InlineRun::new(ctx))
+                        state
+                            .run
+                            .get_or_insert_with(|| {
+                                InlineRun::new(ctx, indent_every_run || state.first_run)
+                            })
                             .push_element(child, child_style);
                     }
                     // 其余产盒子元素（块级；或 flex 走法下的全部子元素 blockify）
                     _ => {
-                        flush_run(run, ctx, boxes, style, participants);
+                        flush_run(state, ctx, boxes, style);
                         if let Some(taffy) = build_box(ctx, boxes, child) {
-                            participants.push(taffy);
+                            state.participants.push(taffy);
                         }
+                        state.first_run = false;
                     }
                 }
             }
@@ -458,16 +496,15 @@ fn collect_children_boxes<'a>(
 /// 空白序列不产生空叶节点；建节点失败时该段行内内容降级丢弃（与 build_box 的
 /// 降级策略一致）。
 fn flush_run<'a>(
-    run: &mut Option<InlineRun<'a>>,
+    state: &mut CollectState<'a>,
     ctx: &'a Context<'a>,
     boxes: &mut BoxTree<'a>,
     strut_style: &ComputedStyle,
-    participants: &mut Vec<TaffyNode>,
 ) {
-    let Some(finished) = run.take() else {
+    let Some(finished) = state.run.take() else {
         return;
     };
-    let items = finished.finish();
+    let (items, indent_first_line) = finished.finish();
     if items.is_empty() {
         return;
     }
@@ -477,11 +514,12 @@ fn flush_run<'a>(
             InlineRunNode {
                 ctx,
                 items: RefCell::new(items),
+                indent_first_line,
                 strut_style: strut_style.clone(),
                 lines_cache: RefCell::new(Vec::new()),
             },
         );
-        participants.push(taffy);
+        state.participants.push(taffy);
     }
 }
 

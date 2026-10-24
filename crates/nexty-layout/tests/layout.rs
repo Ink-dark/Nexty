@@ -1363,3 +1363,124 @@ fn justify_keeps_intrinsic_measurements() {
     };
     assert_eq!(min_widths(""), min_widths("text-align: justify;"));
 }
+
+// ---- text-indent（CSS Text 3 §4） ----
+
+#[test]
+fn text_indent_shifts_first_line_only() {
+    let (document, root) = layout(
+        "<body><p style=\"width: 80px; text-indent: 40px\">aaa bbb ccc ddd</p></body>",
+        "",
+        400.0,
+    );
+    let p = find(&document, &root, "p").expect("p fragment");
+    assert!(p.lines.len() >= 2, "折成多行");
+    let first_x = p.lines[0].runs[0].glyphs[0].x;
+    let second_x = p.lines[1].runs[0].glyphs[0].x;
+    assert!(approx(first_x, 40.0), "首行缩进 40px：{first_x}");
+    assert!(approx(second_x, 0.0), "第二行不缩进：{second_x}");
+}
+
+#[test]
+fn text_indent_percentage_resolves_against_containing_block() {
+    // auto 宽 p 填满 body（内容宽 400）→ 10% = 40px
+    let (document, root) = layout(
+        "<body><p style=\"text-indent: 10%\">abc</p></body>",
+        "",
+        400.0,
+    );
+    let p = find(&document, &root, "p").expect("p fragment");
+    let first_x = p.lines[0].runs[0].glyphs[0].x;
+    assert!(approx(first_x, 40.0), "10% 按可用宽折算：{first_x}");
+
+    // 偏差钉住：显式宽度元素按自身内容盒宽折算（run 叶的可用宽），
+    // 非规范要求的「元素包含块宽」——200 × 10% = 20
+    let (document, root) = layout(
+        "<body><p style=\"width: 200px; text-indent: 10%\">abc</p></body>",
+        "",
+        400.0,
+    );
+    let p = find(&document, &root, "p").expect("p fragment");
+    let first_x = p.lines[0].runs[0].glyphs[0].x;
+    assert!(
+        approx(first_x, 20.0),
+        "显式宽度下按自身内容宽折算：{first_x}"
+    );
+}
+
+#[test]
+fn text_indent_applies_before_alignment() {
+    // center：先缩进后居中——文本在剩余空间 [40, 200] 内居中
+    let (document, root) = layout(
+        "<body><p style=\"width: 200px; text-indent: 40px; text-align: center\">abc</p></body>",
+        "",
+        400.0,
+    );
+    let p = find(&document, &root, "p").expect("p fragment");
+    let (first, end) = line_extent(&p.lines[0]);
+    let content = end - first;
+    assert!(
+        approx(first, 40.0 + (160.0 - content) / 2.0),
+        "缩进后在剩余空间居中：{first}"
+    );
+}
+
+#[test]
+fn text_indent_participates_in_justified_first_line() {
+    // justify：首行带缩进且右缘仍贴满容器（首行须有 2+ 个放置项才有机会点）
+    let (document, root) = layout(
+        "<body><p style=\"width: 100px; text-indent: 40px; text-align: justify\">\
+         aaa bbb ccc ddd</p></body>",
+        "",
+        400.0,
+    );
+    let p = find(&document, &root, "p").expect("p fragment");
+    assert!(p.lines.len() >= 2);
+    let first_x = p.lines[0].runs[0].glyphs[0].x;
+    let (_, end) = line_extent(&p.lines[0]);
+    assert!(approx(first_x, 40.0), "缩进保留：{first_x}");
+    assert!(approx(end, 100.0), "首行 justify 右缘贴满：{end}");
+}
+
+#[test]
+fn text_indent_excluded_from_intrinsic_sizes() {
+    // css-sizing：min/max-content 测量不含缩进（与 Chromium 一致）
+    let width_of = |indent: &str| {
+        let (document, root) = layout(
+            &format!(
+                "<body><i style=\"display: inline-block; {indent}\">\
+                 aaa bbb ccc ddd eee fff ggg hhh</i></body>"
+            ),
+            "",
+            400.0,
+        );
+        body(&document, &root).lines[0].boxes[0].border_box.width
+    };
+    let plain = width_of("");
+    let indented = width_of("text-indent: 40px;");
+    assert!(
+        approx(plain, indented),
+        "max-content 不含缩进：{plain} vs {indented}"
+    );
+
+    // min-content：容器压到 1px，inline-block 宽被 min-content 托底
+    //（AvailableSpace::MinContent 测量路径不含缩进）
+    let min_content_of = |indent: &str| {
+        let (document, root) = layout(
+            &format!(
+                "<body><div style=\"width: 1px\">\
+                 <i style=\"display: inline-block; {indent}\">aaa bbb ccc</i></div></body>"
+            ),
+            "",
+            400.0,
+        );
+        let div = find(&document, &root, "div").expect("div");
+        div.lines[0].boxes[0].border_box.width
+    };
+    let plain_min = min_content_of("");
+    let indented_min = min_content_of("text-indent: 40px;");
+    assert!(
+        approx(plain_min, indented_min),
+        "min-content 不含缩进：{plain_min} vs {indented_min}"
+    );
+}

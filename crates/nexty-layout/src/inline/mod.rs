@@ -40,6 +40,16 @@
 //! `justify-all` / `match-parent` 降级为 start。measure 路径
 //! （min/max-content）不分配。
 //!
+//! # 首行缩进（CSS Text 3 §4）
+//!
+//! `text-indent` 只作用于块容器的首个格式化行（每容器一次；run 叶按
+//! 「容器首 run」判定，flex 匿名 item 全部视为首 run）。缩进从首行可用宽
+//! 中扣减（影响首行断行），并与对齐正交：先缩进，后 center/right/justify。
+//! min/max-content 测量不含缩进（css-sizing 语义）。偏差：percentage 按
+//! run 叶可用宽（元素自身内容盒宽）折算，非规范要求的「元素的包含块宽」
+//! ——auto 宽元素二者相同，显式宽度元素不一致。`each-line` / `hanging`
+//! 关键字未实现。
+//!
 //! # 三分离模块
 //!
 //! UAX#14 相关代码不放在 `build_lines` 同一个文件里，按职责拆为：
@@ -389,12 +399,17 @@ impl Collector<'_> {
 /// （不递归子树），行内级子元素走 [`InlineRun::push_element`]（递归其子树，
 /// 原子行内盒则独立布局）。空白处理状态（缓冲、跨节点折叠）跨子节点持续，
 /// 保证 `text <b>bold</b>` 这类跨界序列不重复收集、不丢空白。
+///
+/// `first_line_indent` 记录本 run 是否为其块容器的第一个 run（text-indent
+/// 只作用于容器的首个格式化行，CSS Text 3 §4）；flex 走法下每个匿名 item
+/// 都是独立块容器，全部按 first 处理。
 pub(crate) struct InlineRun<'a> {
     collector: Collector<'a>,
+    first_line_indent: bool,
 }
 
 impl<'a> InlineRun<'a> {
-    pub(crate) fn new(ctx: &'a Context<'a>) -> Self {
+    pub(crate) fn new(ctx: &'a Context<'a>, first_line_indent: bool) -> Self {
         Self {
             collector: Collector {
                 ctx,
@@ -407,6 +422,7 @@ impl<'a> InlineRun<'a> {
                 text_style_node: None,
                 text_style: None,
             },
+            first_line_indent,
         }
     }
 
@@ -449,7 +465,8 @@ impl<'a> InlineRun<'a> {
     }
 
     /// 结束收集，刷出文本缓冲。纯折叠空白（且没有其他行内项）不产 run。
-    pub(crate) fn finish(mut self) -> Vec<InlineItem> {
+    /// 返回行内项与「是否容器首 run」（供 text-indent 使用）。
+    pub(crate) fn finish(mut self) -> (Vec<InlineItem>, bool) {
         self.collector.flush_text();
         let items = &self.collector.items;
         let has_content = items.iter().any(|item| match item {
@@ -460,9 +477,9 @@ impl<'a> InlineRun<'a> {
             _ => true,
         });
         if has_content {
-            self.collector.items
+            (self.collector.items, self.first_line_indent)
         } else {
-            Vec::new()
+            (Vec::new(), self.first_line_indent)
         }
     }
 }
@@ -757,13 +774,15 @@ struct PlacedItem {
 /// `block_style` 提供 strut（行盒的高度下限与基线位置）。原子图片按基线
 /// 对齐（底边落在基线上，CSS 2.1 §10.8.1），不参与断行（不可拆）。
 /// `min_content` 为真时按 min-content 语义断行（`overflow-wrap: break-word`
-/// 的紧急断点不参与）。
+/// 的紧急断点不参与）。`first_line_indent` 是已解析的首行缩进（CSS Text
+/// 3 §4；测量路径与后续行由调用方保证传 0）——从首行可用宽中扣减。
 pub(crate) fn build_lines(
     shaper: &dyn TextShaper,
     items: &[InlineItem],
     max_width: f32,
     block_style: &ComputedStyle,
     min_content: bool,
+    first_line_indent: f32,
 ) -> Vec<LineFragment> {
     if items.is_empty() {
         return Vec::new();
@@ -815,7 +834,7 @@ pub(crate) fn build_lines(
         strut_below,
         lines: Vec::new(),
         placed: Vec::new(),
-        cursor: 0.0,
+        cursor: first_line_indent,
         current_start: LineStart::Soft { space: false },
         next_start: LineStart::Soft { space: false },
         trailing_letter_spacing: 0.0,
