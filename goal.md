@@ -1,177 +1,204 @@
-# goal.md — 本轮任务：不可信输入边界加固（DOM 深度上限 / 数值卫生 / 解码与响应体预算 / 错误页转义）
+# goal.md — 本轮任务：CSS Text 排版细化 + 行内布局正确性（justify / text-indent / 字距词距 / tab-size / pre-wrap 悬挂 / M8 选区遮蔽 / M9 块嵌行内丢内容）
 
-日期：2026-10-24。前置：页面文本选择与复制轮已完成（layout 0.1.17 /
-chrome 0.1.18），旧 goal 归档于
-[docs/plans/2026-10-23-round-text-selection-copy.md](docs/plans/2026-10-23-round-text-selection-copy.md)。
-本轮触发依据：[2026-10-24 全仓库性能与安全审查](docs/2026-10-24-perf-security-review.md)
-（只读审查，未改代码）发现 4 项高严重性中有 3 项是「几十 KB 构造输入 →
-进程级 DoS」，且全部**绕过**渲染隔离线程的 `catch_unwind` 兜底。
-当前版本：css 0.1.11 / text 0.1.7 / layout 0.1.17 / paint 0.1.4 /
-html 0.1.4 / dom 0.1.2 / network 0.1.5 / chrome 0.1.18。
+日期：2026-10-24。前置：输入边界加固轮已完成（dom 0.1.3 / html 0.1.5 /
+css 0.1.12 / paint 0.1.5 / layout 0.1.18 / chrome 0.1.20），H1–H3 三项进程级
+DoS 已闭合并有全链回归钉住，旧 goal 归档于
+[docs/plans/2026-10-24-round-input-hardening.md](docs/plans/2026-10-24-round-input-hardening.md)。
+justify + CSS Text 细化在 roadmap 里已连续顺延三轮（先让位断行、再让位选区、
+再让位加固），本轮兑现；同时并入审查报告
+（[2026-10-24 性能与安全审查](docs/2026-10-24-perf-security-review.md)）§8.6
+点名的 M8 / M9 两个行内正确性问题——它们与本轮改的是同两个文件
+（`inline/mod.rs`、`selection.rs`），分开做要重复读同一片上下文。
+当前版本：css 0.1.12 / text 0.1.7 / paint 0.1.5 / layout 0.1.18 /
+chrome 0.1.20 / html 0.1.5 / dom 0.1.3。
 
 ## 本轮为什么做这些
 
-审查报告 §8 的第 1 梯队。三个高风险共享同一性质——**入口不设防，失败模式
-不可恢复**：
+- **justify 是排版保真的显性缺口**：`text-align: justify` 早已能解析
+  （`TextAlignValue::Justify`），但 [block.rs:287](crates/nexty-layout/src/block.rs)
+  的 `alignment_shift` 把 `justify` / `justify-all` / `match-parent` 一律降级为
+  左对齐（模块文档明记为偏差）。中文正文与两栏式版面在当前引擎里全部左 ragged。
+- **字距词距与首行缩进整族缺失**：`letter-spacing` / `word-spacing` /
+  `text-indent` / `tab-size` 在 css 层完全没有（无 PropertyId、无解析、无
+  computed 字段）；layout 侧 `inline/mod.rs:19,38` 明记「制表按一个空格」
+  「pre-wrap 行尾空格未做悬挂」。这些是正牌 CSS Text 3 属性，现代页面
+  （尤其中文排版）使用率高。
+- **M9 内容静默消失（正确性 > 美观）**：块级子元素嵌在行内子树里被直接丢弃
+  （[inline/mod.rs:483](crates/nexty-layout/src/inline/mod.rs) 的 `_ => {}` 分支）。
+  `<div>a <span><div>CONTENT</div></span> b</div>` 中 CONTENT 整棵子树不产生
+  任何盒。CSS 2.2 §9.2.1.1 的规范行为是拆分行内流生成匿名块；审查判定
+  「内容丢失比几何偏差严重」，且该项不在 AGENTS.md 已知未实现清单内（是
+  计划外缺陷，不是已登记偏差）。
+- **M8 选区对原子盒内容系统性失效**：`TextMap::hit`
+  （[selection.rs:146](crates/nexty-layout/src/selection.rs)）取**第一个** y 命中
+  的行，而 `collect`（[selection.rs:533](crates/nexty-layout/src/selection.rs)）
+  先 push 父行、后递归原子盒——父行的 y 区间完全覆盖其内部 inline-block 的行，
+  点击 inline-block 内文本永远先命中外层行。上一轮修的是高亮坐标（0b4b55a），
+  命中遮蔽仍在。
 
-- **H1 深层 DOM 栈溢出**：管线五层（css `walk`、layout `build_box` ↔
-  `collect_children_boxes` / `assemble_element` / `Builder::collect` /
-  `collect_children`、html `collect_from`、dom `clone_node`、chrome
-  `document_title`）对 DOM 深度无界递归。栈溢出在 Rust 中是 **abort 不是
-  panic**，`catch_unwind` 兜不住——任意网页可远程击穿「渲染失败不拖垮主进程」
-  的硬约束底线。
-- **H2 `f32::INFINITY` 注入**：`<img width="999…9">`（40+ 位）经
-  `attribute_px` 的 `parse::<f32>()` 得 `Ok(inf)` 且通过 `> 0.0` 过滤，
-  inf/NaN 沿 taffy / 行内几何扩散污染整页坐标；CSS 值层（`font-size: 1e40px`
-  类）同样无 clamp。整条管线没有任何 `is_finite()` 检查。
-- **H3 OOM abort**：图片解码的尺寸校验发生在 `decode()` **之后**——几 KB 的
-  PNG 声明 `65535×65535` 即先分配约 17 GB 再检查；网络响应体无字节上限，
-  chrome 编排层无预算。分配失败是 abort，同样兜不住。
-- 顺带 **M2 错误页标记注入**：导航失败的 URL / 错误串未转义直接拼进错误页
-  HTML，可触发第三方子资源请求、泄露用户正在访问的 URL。
+### 为什么不是性能轮（H4）或 float / table
 
-四项修复模式一致（入口 clamp + 降级语义），适合一轮收口。
-
-### 为什么插队在 justify 之前
-
-selection 轮的 roadmap 把「justify + CSS Text 排版细化」排为下一轮，本轮将其
-顺延：justify 是视觉保真，H1–H3 是**远程可触发的进程死亡**，且违反 AGENTS.md
-明文的渲染隔离硬约束——安全债优先于功能债。性能项（H4 整形缓存等）同理
-顺延：它们影响帧率而非存活。
-
-### 防线设计取舍（单点 vs 九点）
-
-审查报告列了九条递归链。逐点加深度计数会随未来新增遍历继续漏防（本轮九条
-正是这么长出来的）。本轮采用**单点主防线**：DOM 层维护节点深度，HTML 解析
-入口截断超深内容，使树深度全局有界；下游各递归点无需各自计数（512 层 ×
-每层约百字节栈帧 ≪ 默认 8 MB 栈预算）。`build_box` 加 `debug_assert` 作纵深
-防御。取舍记录：截断意味着超深内容按「资源防护降级」语义消失（浏览器同样
-对超深嵌套截断），记为已知偏差，不尝试按 CSS 语义保留。
+H4（整形缓存）与 M5/M6/M10 是**结构性优化**，不改变可观察行为，适合在
+没有行为轮排队时做，且审查建议先以大页面基准确认热点归属；float / table
+是各自独立的大项（taffy 不覆盖，需整轮预算）。本轮全部任务都改
+`inline` / `selection` 同一片代码，合并成一轮上下文复用最高；性能轮排下一轮。
 
 ## 任务清单与退出条件
 
-### T1 nexty-dom + nexty-html：DOM 深度上限主防线（dom 0.1.2 → 0.1.3、html 0.1.4 → 0.1.5）
+规范依据：CSS Text 3（各属性锚点
+[text-align](https://drafts.csswg.org/css-text-3/#text-align-property) /
+[justification](https://drafts.csswg.org/css-text-3/#justification) /
+[word-spacing](https://drafts.csswg.org/css-text-3/#word-spacing-property) /
+[letter-spacing](https://drafts.csswg.org/css-text-3/#letter-spacing-property) /
+[text-indent](https://drafts.csswg.org/css-text-3/#text-indent-property) /
+[tab-size](https://drafts.csswg.org/css-text-3/#tab-size-property)）；
+M9 依据 CSS 2.2 §9.2.1.1；M8 无规范条款（是我们自己的命中顺序缺陷）。
 
-- dom：`Node` 私有字段 `depth: u32`（文档根 0）；`link_before` 挂接时
-  `depth = parent_depth + 1`，detach 不清（游离节点 depth 无意义，重挂时覆盖）。
-  免校验 `insert_node` 同经 `link_before`，维护不漏。`set_template_contents`
-  时片段根 depth 置 0（模板内容是独立片段，深度独立起算）。新增
-  `pub const MAX_TREE_DEPTH: usize = 512` 与 `Document::depth(NodeId) -> u32`
-  只读访问器（常量与访问器均为自有类型，不涉依赖外泄）。
-- html：`HtmlTreeSink` 的 `append` / `append_based_on_parent_node` 挂接路径上，
-  若 `depth(parent) + 1 > MAX_TREE_DEPTH` 则丢弃该节点（不插入；其后续子内容
-  挂到游离节点上，`finish` 后自然不可达）。截断只影响树形状，不触碰 html5ever
-  状态机本身。
-- layout 纵深防御：`build_box` / `collect_children_boxes` 入口
-  `debug_assert!(depth <= MAX_TREE_DEPTH)`。
-- 退出条件：
-  - dom 单测：append / insert_before / replace / detach 后重挂，depth 正确
-    （重挂到不同深度父节点会变）；template 内容片段独立从 0 起算。
-  - html 测试：10 万层 `<div>` 嵌套的 `parse_document` 在有限时间内完成不崩，
-    产出树中任意节点 depth ≤ 512，被截断内容不在树里；`parse_fragment` 不受
-    影响（片段上下文深度另算或同样受限，写测试钉住选择的行为）。
-  - WPT tree-construction 1854/1959 基线**不回归**（正常语料深度远小于 512）。
+### T1 nexty-css：新增五个文本属性（0.1.13）
+- `PropertyId` + 解析 + computed 字段 + 继承（四个全部是 inherited）：
+  - `letter-spacing`：`normal` | `<length>`（负值合法）；`normal` 计算 0；
+  - `word-spacing`：`normal` | `<length>`；`normal` 的行为留给 layout
+    （computed 存「normal 或定值」语义）；
+  - `text-indent`：`<length-percentage>`；percentage 留给 layout 按包含块
+    解析，computed 存原值；
+  - `tab-size`：`<integer ≥ 0>` | `<length>`（CSS Text 3 两形态都收）。
+- `text-align-last` 本轮**不做**（见非目标），justify 的最后一行走 initial
+  （start）行为即可。
+- 数值卫生沿用现有口径：`MAX_CSS_LENGTH` clamp、非有限值整条声明无效。
+- 退出条件：四属性各有 parse/compute/inherit 单测（含非法值拒绝、负
+  letter-spacing 接受、percentage 保留原值、`em` 折算与现有长度属性一致）；
+  css 既有测试不改仍绿。
 
-### T2 nexty-css + nexty-layout：数值卫生（css 0.1.11 → 0.1.12、layout 0.1.17 → 0.1.18）
+### T2 nexty-layout：letter-spacing 与 word-spacing（0.1.19）
+- 在 `build_lines` 的放置阶段按字形 cluster 施加（整形只做一次，间距是
+  放置期修正，不改 `ShapedText`）：
+  - letter-spacing：每个 grapheme cluster 边界处增加定值；**行末** cluster
+    的字距不计入行宽（对齐与断行判定用净宽）；
+  - word-spacing：word separator（U+0020 / U+00A0 / U+3000 等 CSS Text 3
+    word-spacing 词条列举集）的 cluster advance 增加定值；计入 min-content
+    （一个分隔符 = 自身净宽 + spacing，spacing 为负时收缩不小于 0）；
+  - 间距参与断行机会判定（word-spacing 后的分隔符仍是断点；letter-spacing
+    不产生也不消灭断点）。
+- 退出条件：单测钉住——`letter-spacing: 4px` 使等长两段文本行宽差 =
+  (字符数−1)×4px；右对齐下行末字距不参与（净宽对齐）；`word-spacing: 8px`
+  的 min-content 相差 8px×分隔符数；负 letter-spacing 收窄且不 panic；
+  选区命中/矩形在加间距文本上仍逐字形正确（cluster→源偏移映射不受影响）。
 
-- layout `attribute_px`：前缀解析对齐 HTML 尺寸属性规则（实现前核对
-  WHATWG §2.4 的 dimension 解析，当前 `take_while` 接受 `'.'` 的行为按规范
-  裁决）；解析结果必须 `is_finite()` 且 ≤ `MAX_CSS_LENGTH = 1e7` px，否则返回
-  `None` 回落自然尺寸。
-- css 值层：`f32` 长度/字号/字重类解析出口统一 clamp 到 `[-1e7, 1e7]` 并滤除
-  非有限值（Chromium 传统上限同量级；超出按 UA clamp 记偏差）。
-- layout 几何入口：`map_style` 产出的 taffy definite size、`build_lines` 的
-  行内坐标，遇非有限值降级为 auto / 0——污染隔离在单元素，不向兄弟与整页扩散。
-- 退出条件（failing-first，当前注入会扩散/溢出）：
-  - `<img width="999…9（45 位）">`：块级与行内两条路径的几何均为有限值；
-    同行其他元素坐标不被污染。
-  - `font-size: 1e40px`、`margin-top: calc` 外的裸 `1e40px`、`width: 1e39em`
-    等：computed 值有限、页面可布局。
-  - 数值边界单测：恰好 1e7 通过、超限回落、NaN/inf 拒绝。
+### T3 nexty-layout：`text-align: justify`（0.1.19）
+- 机会集（`auto` 方法的可执行近似，偏差记账）：行内全部 justify 机会 =
+  软折行**消费掉的可折叠空格**处 + CJK 断点（UAX#14 break opportunity，
+  排除行首）。断行结果不变（先按现有断行成行，再在行内分配自由空间）；
+  均匀分配到每个机会点（不做 inter-word 空格收缩，不做 `text-justify`
+  分档——均为偏差，记入模块文档）。
+- 施加位置：非末行且不以硬断行（`<br>` / 保留换行）结尾的行；最后一行
+  与硬断行前的行按 start 对齐（即现有左对齐路径）。`justify` 从
+  `alignment_shift` 的降级名单移除。
+- 内在尺寸不受影响：measure 路径（min-content / max-content）不分配间距，
+  与 justify 无关——单测钉住「justify 与 left 的 min/max-content 相等」。
+- 选区兼容：分配发生在 `build_lines` 放置期，glyph 坐标即最终坐标；
+  TextMap 命中与逐行矩形在 justified 行上照常工作——必须有跨 justify 行
+  的拖拽选区单测。
+- 退出条件：三行文本 justify 后前两行右缘对齐、末行左 ragged；无机会行
+  （单 CJK 长词行）退化为左对齐不崩溃；`white-space: pre` 下 justify 不生效
+  （无折叠空格无软折行）；自由空间为 0 时与 left 逐字节同构。
 
-### T3 nexty-paint + nexty-chrome：解码与响应体预算（paint 0.1.4 → 0.1.5、chrome 0.1.18 → 0.1.19）
+### T4 nexty-layout：`text-indent`（0.1.19）
+- 只作用于块容器的**首个格式化行**（每块一次，`<br>` 后不缩进——
+  `each-line` / `hanging` 关键字不做）；percentage 在布局期按包含块宽度
+  折算；缩进从首行可用宽中扣减（影响首行断行），min-content /
+  max-content 测量不含缩进（css-sizing 语义，与 Chromium 一致）。
+- 退出条件：`text-indent: 40px` 首行右移且第二行不动；`text-indent: 10%`
+  按包含块宽折算；与 justify / center 组合各一条单测（缩进后再对齐 /
+  分配）；内在尺寸测试钉住「含缩进与不含缩进的 min-content 相等」。
 
-- paint `decode`：`ImageReader` 先 `into_dimensions()` 只读头部（不解码像素），
-  校验边长 ≤ 16384 且 `w.checked_mul(h) ≤ 2^26`（约 256 MB RGBA 缓冲上限），
-  超限返回 `SizeUnsupported`；通过后再 `decode()`。doc 注明「预检失败与
-  不可渲染同错误变体」，`RasterError::SizeExceedsLimit` 的双后端语义描述同步。
-- chrome `resources`：`fetch_ok` 增加按类别的字节预算常量（HTML/CSS 10 MB、
-  图片 50 MB 量级，集中定义并写注释），`Response.body` 超预算按既有降级语义
-  跳过该资源。预算放编排层，`NetworkFetcher` trait 与 network crate 本轮不动。
-- 退出条件：
-  - 测试内手工拼 PNG 字节（8 字节签名 + IHDR 声明 65535×65535 + IEND）：
-    `decode` 返回 `SizeUnsupported` 且测试正常跑完（即未发生巨量分配）。
-  - 声明 16385×1、1×16385、`2^26` 边界内外的尺寸各一条断言。
-  - 本地回环服务器（沿用 network 测试模式）返回超预算 body → `fetch_ok`
-    返回 `None`；预算内路径回归绿。
-  - 既有 26 条 paint 测试 + gif/webp 解码测试不改仍绿。
+### T5 nexty-layout：`tab-size` 与 pre-wrap 行尾悬挂（0.1.19）
+- `tab-size`（initial 8）：只作用于**保留的**制表符（`pre` / `pre-wrap` /
+  `break-spaces` 下）；advance = 推进到 tab-size × U+0020 advance 的下一
+  整数倍；normal 流里制表仍按现行折叠语义。现状是
+  [inline/mod.rs:299](crates/nexty-layout/src/inline/mod.rs) 的「按一个空格
+  保留」——改掉后模块文档 19/38 行的两条偏差注销。
+- pre-wrap 悬挂：软折行处行尾的保留空格**悬挂**在行尾（不触发折行、不占
+  对齐宽度、可溢出边沿），`break-spaces` 不悬挂（照常占宽）。复制文本与
+  选区映射仍含被悬挂的空格（源映射不丢字符）。
+- 退出条件：`<pre>` 内 `a\tb`（tab-size 4）advance 到第 4 列而非 1 空格；
+  `tab-size: 0` 制表零宽；pre-wrap 行尾空格不换行且右对齐时行净宽不含它；
+  选区跨悬挂空格复制文本完整。
 
-### T4 nexty-chrome：错误页转义（与 T3 同版 bump）
+### T6 nexty-layout：M9 — 行内子树中的块级子元素不再丢弃（0.1.19）
+- 规范路径（CSS 2.2 §9.2.1.1）：`Collector` 在行内收集途中遇到块级子元素时
+  **终止当前 run**、上抛块级标记，`tree_build` 的块级分组把前半 run 与后半
+  run 各自包装成匿名块、块级子元素按普通块盒布局——即「行内盒被拆分到
+  匿名块两侧」的既有语义扩展到嵌套层。偏差记账：拆分处行内盒的
+  border / background 只画在各半自身范围（不跨块连续）。
+- 退出条件（全部真实 `layout_document` 路径、先写 failing 测试）：
+  `<div>a <span><div>X</div></span> b</div>` 中 X 可见、a 与 b 分居 X 上下、
+  X 的文本可被 TextMap 命中并复制；嵌套两层 inline 包一层 block 的组合
+  同样成立；`display: contents` / `display: none` 混合原语义不回归；
+  WPT 基线 1854/1959 不动。
 
-- `app.rs` 错误页 `format!` 前，对 `url` 与错误串做 HTML 实体转义
-  （`<` `>` `&` `"` `'`）；错误串收敛为错误类别 + 状态码，不再整段回显
-  reqwest 原始错误（其内含目标 URL）。
-- 退出条件：构造 load 失败且 URL 含 `<img src=//x/1>` 的用例——错误页 DOM
-  中无 `img` 元素、无对第三方地址的子资源请求（`collect_image_resources`
-  为空）、显示文本为字面转义后的 URL；正常 URL 的错误页显示不受影响。
+### T7 nexty-layout：M8 — TextMap 命中不再被父行遮蔽（0.1.19）
+- 修 `collect` 顺序：原子盒内部行**先于**父行入列（先深后浅），或 `hit`
+  收集全部 y 命中行取最深处——取一种实现，落选方案与理由写进模块文档。
+  `nearest` 的吸附逻辑同步检查（点在原子盒行间空隙时不再跳到外层）。
+- 退出条件：先写 failing 测试——点击 inline-block 内文本命中其内部文本
+  而非外层行/相邻行；inline-block 内双击选词、跨内外拖拽选区、rects 的
+  y/height 与内部行盒一致；纯块级页面的既有选区测试全部不改仍绿。
 
-### T5 门禁、文档与版本
-
-- 全套门禁：`cargo check --workspace` 零 warning；`cargo test --workspace`
-  全绿；`cargo clippy --workspace --all-targets -- -D warnings`；
+### T8 门禁、文档与版本
+- `cargo check --workspace` 零 warning；`cargo test --workspace` 全绿；
+  `cargo clippy --workspace --all-targets -- -D warnings`；
   `cargo fmt --all -- --check`；`cargo deny check` 通过。
-- feature 组合零 warning：各 crate `--no-default-features --features <单开>`
-  逐一验证（本轮不新增 feature——深度/数值/预算是核心行为，不是可拆能力，
-  Feature 映射表不动）。
-- **全链加固回归测试（本轮验收旗舰）**：5000 层 `<div>` 嵌套 + 巨数属性 +
-  `<img>` 指向巨图声明的组合页面，走 parse → cascade → layout → TextMap →
-  `document_title` → `collect_*_resources` 全链，不崩、有限时间、几何有限。
-- AGENTS.md 同步：八层状态行补「输入边界防护」（深度 512 截断 / CSS 长度
-  clamp 1e7 / 解码面积 2^26 / 响应体按类别预算），已知偏差清单登记
-  「超深内容截断」「超限长度 clamp」两条。
-- 版本 bump：dom 0.1.3 / html 0.1.5 / css 0.1.12 / layout 0.1.18 /
-  paint 0.1.5 / chrome 0.1.19；text / network 本轮无代码改动不动。
-- 分任务 commit（`[dom]` / `[html]` / `[css]` / `[layout]` / `[paint]` /
-  `[chrome]` / `[docs]`），退出条件全部满足后 push。
+- feature 组合零 warning：重点复验 `nexty-layout --no-default-features
+  --features inline` 与 `--features selection`、`nexty-chrome
+  --no-default-features --features selection`（本轮不动 feature 面，
+  不得回归）。
+- AGENTS.md 同步：layout 行补 justify / text-indent / letter-spacing /
+  word-spacing / tab-size / pre-wrap 悬挂 / 块嵌行内拆分；从「未实现」
+  清单划掉对应项；`block.rs` 与 `inline/mod.rs` 的偏差清单同步（新增
+  justify 的 `auto` 近似偏差）；Feature 映射表无新增行；roadmap 改为
+  性能轮（H4 + M5/M6/M10）优先、paint 扩展（text-decoration / 圆角 /
+  渐变 + 背景传播）其后、float / table 再后。
+- 版本号随逻辑提交 +1：nexty-css 0.1.12 → 0.1.13、nexty-layout
+  0.1.18 → 0.1.19；text / paint / chrome 本轮无代码改动则不动。
+- 分任务 commit（`[css]` / `[layout]` / `[docs]`），退出条件全部满足后
+  push。
 
-### T6 实机验收（无头不可测项，轻量）
-
-按项目记忆的 Computer Use 流程与 `.workbuddy/t3-test` 资产：
-
-- 深嵌套页面（本地 serve 5 万层 div）：打开不崩、可滚动、标题栏正常。
-- 巨图声明页面（本地 serve 恶意 PNG）：不崩，显示破图/空白而非拖垮进程。
-- 错误页注入样例（地址栏输入含 `<img ...>` 的失效 URL）：错误页无注入痕迹，
-  URL 字面显示。
-- 正常页面（t3-test 既有资产）回归目测：渲染、选择、滚动无变化。
+### T9 实机验收（无头不可测项）
+- 按项目记忆的 Computer Use 流程：`.workbuddy/t3-test/serve.mjs` + 新页面
+  资产（长中文段落 justify、缩进段落、`letter-spacing` 大字标题、
+  `pre` 含制表、`pre-wrap` 行尾空格、inline-block 内文本选择、
+  `<span><div>` 块嵌行内页面）；`cargo run -p nexty-chrome --bin nexty`。
+- 验收动作：目测 justify 双端对齐与 Edge/Chrome 同页对比；缩进/字距/制表
+  列对齐目测；inline-block 内拖拽选择、双击选词、复制核对；块嵌行内页面
+  内容完整可见。截图留档。
 
 ## 非目标（本轮不做）
 
-- **性能项全部顺延**：H4 整形/度量缓存、M1 `Arc<Image>`、M4–M7、M10–M12 与
-  全部 L 项——留待下一轮「性能：文本整形缓存与渲染热路径」（审查 §8 第 2、4 梯队）。
-- **M3 页面加载竞态**（generation counter）：正确性而非输入边界，并入下轮
-  chrome 小项。
-- **M8 TextMap 行遮蔽 / M9 行内子树块级子元素静默丢弃**：布局正确性独立轮次
-  处理（各需先写 failing 测试钉行为）。
-- **cargo-fuzz 基建**：Windows 环境需 nightly + libFuzzer，另立基础设施任务；
-  本轮以构造输入回归测试（T1–T5 的 failing-first 用例 + 旗舰全链测试）兜底。
-- **network trait 层流式读取 / Content-Length 预检**：编排层预算已挡住本轮
-  风险面，trait 演进随 JSRT 轮再议。
-- **M12 `remap_glyph` 无界索引**等低项、float / table / justify 等既有
-  路线图缺口。
+- `text-align-last` / `text-justify` / `text-indent` 的 `each-line` /
+  `hanging` 关键字；`hanging-punctuation`。
+- `text-decoration`（下划线/删除线）与链接下划线——归「paint 指令集扩展」
+  轮（与圆角 / 渐变、`body` 背景传播同轮，都是 paint 新指令 + chrome 消费）。
+- H4 整形缓存与 M5 / M6 / M10 性能项（下一轮性能轮）；M11 / M12 / 低项
+  随对应模块顺带。
+- float、table、`position: fixed` 包含块、`vertical-align` 非 baseline、
+  bidi / RTL（含 justify 的 RTL 行——本轮 justify 只定义 LTR 行为）。
+- `::first-line` 伪元素。
 
 ## 方向评估（为什么是这轮）
 
 | 候选 | 价值 | 成本 | 结论 |
 | --- | --- | --- | --- |
-| **不可信输入边界加固（本轮）** | 消除 3 条远程进程级 DoS 路径 + 1 条注入；修复模式统一（入口 clamp + 降级），一轮收口 | 中：dom/html 深度机制 + 三层 clamp/预算 + 测试；单点防线改动集中 | ✅ 本轮 |
-| H4 整形缓存等性能轮 | 全量重排开销回落一个档次 | 中：TextChunk 缓存 + chrome 热路径 | 下一轮 |
-| justify + CSS Text 细化 | 视觉保真 | 小–中 | 顺延（原 roadmap 下一轮让位） |
-| M8 + M9 布局正确性 | 选区/内容可见性 | 中：需 failing-first 行为钉住 | 后续轮 |
+| **CSS Text 细化 + M8 / M9（本轮）** | 排版保真（justify / 缩进 / 字距）+ 两个正确性缺陷闭口；同文件高复用；roadmap 欠账兑现 | 中：css 解析一任务 + layout 五任务 | ✅ 本轮 |
+| 性能轮（H4 + M5 / M6 / M10） | 全量重排开销降档 | 中–大：结构改造，建议先基准 | 下一轮 |
+| paint 扩展（text-decoration / 圆角 / 渐变）+ 背景传播 | 视觉保真 | 小–中：paint 新指令 + chrome 消费 | 后续 |
+| float / table | 老页面 / 邮件类兼容 | 大：taffy 不覆盖，各需整轮 | 后续 |
+| vello_hybrid GPU 后端 | 性能 | 中：surface 接入与适配层 | 后续 |
 
 ## 验证流（AGENTS.md Verification Flow）
 
-每个子任务先写 failing 测试看它红，再实现到绿（H1 的深嵌套、H2 的巨数注入、
-H3 的巨图声明在当前 HEAD 上均应红——以崩溃/几何无限/分配失败的形式）；
-每层 `cargo check` 零 warning → `cargo test` 全绿 → `fmt` / `clippy` → commit；
-WPT 基线（1854/1959）与既有全部测试不改仍绿是硬前提。T5 旗舰全链测试是本轮
-完成的判据性用例。退出条件全部满足后 push。
+每个子任务先写 failing 测试（真实 `layout_document` 路径）看它红，再实现到
+绿；T2–T7 的预期几何都要给出可断言的数值（行宽差 / 列位置 / 矩形 y/height），
+不写「大致对齐」类模糊断言。M9（T6）/ M8（T7）按审查建议先以 failing 测试
+钉住当前错误行为再修。每层：`cargo check` 零 warning → `cargo test` 全绿 →
+`fmt` / `clippy` → commit；WPT 基线 1854/1959 与既有测试（含 UAX#14
+conformance 全量）不改仍绿是硬前提。退出条件全部满足后 push。
