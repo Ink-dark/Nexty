@@ -251,6 +251,72 @@ pub struct Scene {
     pub images: Vec<Arc<Image>>,
 }
 
+impl Scene {
+    /// 生成整体平移 `(dx, dy)` 后的场景副本（M6 滚动路径）。
+    ///
+    /// 页面坐标系场景滚动复用时，origin 平移在发送阶段施加：字形与图片
+    /// 像素按 `Arc`/`Vec` 引用计数共享，只有指令包装层重新分配——比整树
+    /// 重新 emit（逐字形坐标重算 + 字体表重建 + 高亮相交判定）便宜一个
+    /// 量级。图片池按下标引用，平移不改下标，`Arc` 逐项共享。
+    #[must_use]
+    pub fn translated(&self, dx: f32, dy: f32) -> Scene {
+        let commands = self
+            .commands
+            .iter()
+            .map(|command| match command {
+                Command::FillRect { rect, color } => Command::FillRect {
+                    rect: Rect {
+                        x: rect.x + dx,
+                        y: rect.y + dy,
+                        ..*rect
+                    },
+                    color: *color,
+                },
+                Command::StrokeRect { rect, color, width } => Command::StrokeRect {
+                    rect: Rect {
+                        x: rect.x + dx,
+                        y: rect.y + dy,
+                        ..*rect
+                    },
+                    color: *color,
+                    width: *width,
+                },
+                Command::DrawText {
+                    glyphs,
+                    baseline,
+                    fonts,
+                    size,
+                    color,
+                } => Command::DrawText {
+                    glyphs: glyphs
+                        .iter()
+                        .map(|glyph| TextGlyph {
+                            x: glyph.x + dx,
+                            ..*glyph
+                        })
+                        .collect(),
+                    baseline: baseline + dy,
+                    fonts: fonts.clone(),
+                    size: *size,
+                    color: *color,
+                },
+                Command::DrawImage { rect, image } => Command::DrawImage {
+                    rect: Rect {
+                        x: rect.x + dx,
+                        y: rect.y + dy,
+                        ..*rect
+                    },
+                    image: *image,
+                },
+            })
+            .collect();
+        Scene {
+            commands,
+            images: self.images.clone(),
+        }
+    }
+}
+
 /// 光栅化结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pixmap {
@@ -576,7 +642,6 @@ mod tests {
 
         assert_eq!(pixmap.size, size(10, 8));
         assert_eq!(pixmap.data.len(), 10 * 8 * 4);
-
         for y in 0..8u32 {
             for x in 0..10u32 {
                 let pixel = pixmap.pixel(x, y).expect("in bounds");
@@ -1237,6 +1302,78 @@ mod tests {
             let decoded =
                 decode(&buffer).unwrap_or_else(|error| panic!("{format:?} 应可解码: {error:?}"));
             assert_eq!((decoded.width, decoded.height), (2, 2), "{format:?} 尺寸");
+        }
+    }
+
+    /// translated 的坐标平移对全部指令生效，字形与图片像素共享不复制（M6）。
+    #[test]
+    fn translated_shifts_all_commands_and_shares_pixels() {
+        let image = Arc::new(Image::new(
+            2,
+            2,
+            vec![1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4],
+        ));
+        let scene = Scene {
+            commands: vec![
+                fill(1.0, 2.0, 3.0, 4.0, Color::opaque(255, 0, 0)),
+                Command::StrokeRect {
+                    rect: rect(5.0, 6.0, 7.0, 8.0),
+                    color: Color::opaque(0, 255, 0),
+                    width: 2.0,
+                },
+                Command::DrawText {
+                    glyphs: vec![TextGlyph {
+                        id: 9,
+                        x: 10.0,
+                        y: -2.0,
+                        font: 0,
+                    }],
+                    baseline: 20.0,
+                    fonts: Vec::new(),
+                    size: 14.0,
+                    color: Color::opaque(0, 0, 255),
+                },
+                Command::DrawImage {
+                    rect: rect(1.0, 1.0, 2.0, 2.0),
+                    image: 0,
+                },
+            ],
+            images: vec![image],
+        };
+        let moved = scene.translated(3.0, -1.0);
+        match &moved.commands[0] {
+            Command::FillRect { rect, color } => {
+                assert_eq!(
+                    (rect.x, rect.y, rect.width, rect.height),
+                    (4.0, 1.0, 3.0, 4.0)
+                );
+                assert_eq!(*color, Color::opaque(255, 0, 0));
+            }
+            other => panic!("first command changed: {other:?}"),
+        }
+        match &moved.commands[2] {
+            Command::DrawText {
+                glyphs, baseline, ..
+            } => {
+                assert_eq!(glyphs[0].x, 13.0);
+                assert_eq!(glyphs[0].y, -2.0, "y 相对基线不平移");
+                assert_eq!(*baseline, 19.0);
+            }
+            other => panic!("text command changed: {other:?}"),
+        }
+        match &moved.commands[3] {
+            Command::DrawImage { rect, image: index } => {
+                assert_eq!((rect.x, rect.y), (4.0, 0.0));
+                assert_eq!(*index, 0);
+            }
+            other => panic!("image command changed: {other:?}"),
+        }
+        // 像素共享：平移副本与源场景的图片是同一份（Arc 引用计数）
+        assert!(Arc::ptr_eq(&scene.images[0], &moved.images[0]));
+        // 源场景不受影响（out-of-place）
+        match &scene.commands[0] {
+            Command::FillRect { rect, .. } => assert_eq!((rect.x, rect.y), (1.0, 2.0)),
+            other => panic!("source changed: {other:?}"),
         }
     }
 }

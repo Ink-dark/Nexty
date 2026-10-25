@@ -40,6 +40,8 @@ const VIEWPORT: MediaViewport = MediaViewport {
 const RUNS: usize = 5;
 const WARMUPS: usize = 1;
 const RESIZE_COUNT: usize = 20;
+/// resize 合帧的事件/帧比（拖动边缘的典型突发：一帧内到多个事件）。
+const RESIZE_EVENTS_PER_FRAME: usize = 4;
 const SCROLL_FRAMES: usize = 50;
 
 /// 首屏各阶段耗时（ms）。
@@ -142,45 +144,62 @@ impl Corpus {
         }
     }
 
-    /// resize 风暴：宽度 ±1 连续 `RESIZE_COUNT` 次重排，返回
-    /// （总耗时 ms，单次中位数 ms，管线执行次数，shape 调用数，metrics 调用数）。
-    fn resize_storm(&self, shaper: &CountingShaper) -> (f64, f64, usize, usize, usize) {
+    /// resize 风暴（M6 合帧后语义）：`RESIZE_COUNT` 个 Resized 事件按
+    /// 每 `RESIZE_EVENTS_PER_FRAME` 个一帧连发（拖动边缘的典型突发），
+    /// 经 [`pipeline::ResizeCoalescer`] 合帧——管线每帧至多一次。返回
+    /// （每帧中位数 ms，帧数=管线执行次数，事件数，shape 调用数，metrics 调用数）。
+    fn resize_storm(&self, shaper: &CountingShaper) -> (f64, usize, usize, usize, usize, usize) {
         let document = nexty_html::parse_document(&self.html, ParseOptions::default());
         let sheet = Stylesheet::parse(&self.css);
         let mut page = pipeline::build_page(document, vec![sheet], self.images.clone());
         pipeline::recascade(&mut page, VIEWPORT);
         pipeline::layout_page(&page, shaper, VIEWPORT.width).expect("layout");
 
+        let mut coalescer = pipeline::ResizeCoalescer::default();
         shaper.reset();
         let storm_start = Instant::now();
-        let mut per_resize = Vec::new();
+        let mut per_frame = Vec::new();
         let mut pipeline_runs = 0;
-        for index in 0..RESIZE_COUNT {
-            let width = VIEWPORT.width + f32::from((index % 2) as i16);
-            let start = Instant::now();
-            pipeline::recascade(
-                &mut page,
-                MediaViewport {
-                    width,
-                    height: VIEWPORT.height,
-                },
-            );
-            pipeline::layout_page(&page, shaper, width).expect("layout");
-            per_resize.push(ms(start.elapsed()));
-            pipeline_runs += 1;
+        let mut events = 0;
+        let mut next_width_step = 0;
+        while events < RESIZE_COUNT {
+            // 一帧内连发若干 Resized 事件（合帧器只置脏）
+            let burst = RESIZE_EVENTS_PER_FRAME.min(RESIZE_COUNT - events);
+            for _ in 0..burst {
+                coalescer.on_resized();
+                events += 1;
+            }
+            if coalescer.take() {
+                let width = VIEWPORT.width + f32::from((next_width_step % 2) as i16);
+                next_width_step += 1;
+                let start = Instant::now();
+                pipeline::recascade(
+                    &mut page,
+                    MediaViewport {
+                        width,
+                        height: VIEWPORT.height,
+                    },
+                );
+                pipeline::layout_page(&page, shaper, width).expect("layout");
+                per_frame.push(ms(start.elapsed()));
+                pipeline_runs += 1;
+            }
         }
-        let total = ms(storm_start.elapsed());
+        let _ = ms(storm_start.elapsed());
         (
-            total,
-            median(per_resize),
+            median(per_frame),
             pipeline_runs,
+            events,
             shaper.shape_calls(),
             shaper.metrics_calls(),
+            RESIZE_COUNT,
         )
     }
 
-    /// 滚动风暴：同一布局下 `SCROLL_FRAMES` 个滚动偏移的 emit + rasterize，
-    /// 返回（emit 中位数 ms，rasterize 中位数 ms，emit 次数）。
+    /// 滚动风暴（M6 场景缓存后语义）：同一布局下 `SCROLL_FRAMES` 个滚动
+    /// 偏移经 [`pipeline::SceneCache`] 取页面坐标系场景（首帧后零 emit），
+    /// emit 阶段 = 缓存命中 + [`nexty_paint::Scene::translated`] origin
+    /// 平移。返回（平移中位数 ms，rasterize 中位数 ms，emit 次数）。
     fn scroll_storm(&self, shaper: &CountingShaper) -> (f64, f64, usize) {
         let document = nexty_html::parse_document(&self.html, ParseOptions::default());
         let sheet = Stylesheet::parse(&self.css);
@@ -189,6 +208,11 @@ impl Corpus {
         let root = pipeline::layout_page(&page, shaper, VIEWPORT.width).expect("layout");
         let content_height = root.border_box.height;
         let max_scroll = (content_height - VIEWPORT.height).max(0.0);
+
+        let mut cache = pipeline::SceneCache::new();
+        // 首帧构建（导航语义），其后统计窗口内的 emit 应为 0
+        let _ = cache.scene_for(0, &page, &root, VIEWPORT.width, &[]);
+        cache.reset_emits();
 
         let rasterizer = VelloCpuRasterizer::new();
         let mut emit_samples = Vec::new();
@@ -201,7 +225,8 @@ impl Corpus {
                 0
             } as f32;
             let start = Instant::now();
-            let scene = pipeline::build_scene_at_with_highlights(&page, &root, 0.0, -scroll, &[]);
+            let page_scene = cache.scene_for(0, &page, &root, VIEWPORT.width, &[]);
+            let scene = page_scene.translated(0.0, -scroll);
             emit_samples.push(ms(start.elapsed()));
             let start = Instant::now();
             let pixmap = rasterizer
@@ -216,7 +241,7 @@ impl Corpus {
             raster_samples.push(ms(start.elapsed()));
             black_box(pixmap);
         }
-        (median(emit_samples), median(raster_samples), SCROLL_FRAMES)
+        (median(emit_samples), median(raster_samples), cache.emits())
     }
 }
 
@@ -257,17 +282,18 @@ fn run() {
             shaper.metrics_calls(),
         );
 
-        let (total, per_resize, runs, shapes, metricses) = corpus.resize_storm(&shaper);
+        let (per_frame, runs, _events, shapes, metricses, total_events) =
+            corpus.resize_storm(&shaper);
         println!(
-            "[{}] resize storm: {} resizes, pipeline runs {runs}, total {total:.0} ms, median/resize {per_resize:.1} ms, shape {shapes} calls ({:.1}x chunks), metrics {metricses} calls",
+            "[{}] resize storm: {total_events} events @ {} events/frame -> pipeline runs {runs} (was {total_events} un-coalesced), median/frame {per_frame:.1} ms, shape {shapes} calls ({:.1}x chunks), metrics {metricses} calls",
             corpus.name,
-            RESIZE_COUNT,
+            RESIZE_EVENTS_PER_FRAME,
             shapes as f64 / chunks.max(1) as f64,
         );
 
         let (emit, raster, emits) = corpus.scroll_storm(&shaper);
         println!(
-            "[{}] scroll storm: {emits} frames, emit median {emit:.1} ms, rasterize median {raster:.1} ms",
+            "[{}] scroll storm: {SCROLL_FRAMES} frames, emit count {emits} (must be 0 after initial build), translate median {emit:.3} ms, rasterize median {raster:.1} ms",
             corpus.name,
         );
     }

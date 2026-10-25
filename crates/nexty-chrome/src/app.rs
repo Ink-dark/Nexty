@@ -89,6 +89,9 @@ struct Gpu {
     pipeline_rgba: wgpu::RenderPipeline,
     pipeline_bgra: wgpu::RenderPipeline,
     texture: Option<(wgpu::Texture, [u32; 2])>,
+    /// 行对齐 staging 缓冲（M6）：键 (宽, 高, padded 步幅) 命中时复用
+    /// 分配，不每帧重建。
+    staging_cache: Option<((u32, u32, u32), Vec<u8>)>,
 }
 
 /// 页面左键按下手势（链接目标在按下时解析，释放且未拖动才导航）。
@@ -135,6 +138,12 @@ struct BrowserApp {
     cursor: (f32, f32),
     /// 当前系统光标种类（仅在变化时调用 `set_cursor`）。
     hover: HoverKind,
+    /// 页面坐标系显示列表缓存（M6）：滚动复用，导航/重排/选区失效。
+    scene_cache: pipeline::SceneCache,
+    /// 页面代次：每次重排（导航 / resize 后 relayout）+1，作缓存键。
+    page_generation: u64,
+    /// resize 合帧器（M6）：连发 Resized 折叠到下一次重绘。
+    resize_coalescer: pipeline::ResizeCoalescer,
 }
 
 impl BrowserApp {
@@ -162,6 +171,9 @@ impl BrowserApp {
             scroll_y: 0.0,
             cursor: (0.0, 0.0),
             hover: HoverKind::Default,
+            scene_cache: pipeline::SceneCache::new(),
+            page_generation: 0,
+            resize_coalescer: pipeline::ResizeCoalescer::default(),
         }
     }
 
@@ -223,6 +235,22 @@ impl BrowserApp {
     /// 必须取新视口。`reset_scroll` 为 false 时保留滚动量（resize 重排
     /// 场景），但按新视口与内容高重新 clamp。
     fn set_page(&mut self, page: Page, reset_scroll: bool) {
+        self.root = None;
+        self.text_map = None;
+        self.page = Some(page);
+        // 导航后的第一帧是全新布局：缓存作废由代次推进表达
+        self.relayout();
+        if reset_scroll {
+            self.scroll_y = 0.0;
+        }
+    }
+
+    /// 按当前视口重级联 + 重排当前页面（M6：resize 合帧后每帧至多一次）。
+    ///
+    /// 由 [`Self::set_page`]（导航）与 `RedrawRequested`（resize 合帧）共用：
+    /// 视口单位折算、文本地图重建、选区端点重解析、滚动 clamp、代次推进
+    /// （使场景缓存失效）都在这里。
+    fn relayout(&mut self) {
         let (viewport_width, viewport_height) = self
             .window
             .as_ref()
@@ -231,7 +259,9 @@ impl BrowserApp {
                 (size.width as f32, size.height as f32)
             })
             .unwrap_or((800.0, 600.0));
-        let mut page = page;
+        let Some(mut page) = self.page.take() else {
+            return;
+        };
         pipeline::recascade(
             &mut page,
             nexty_css::MediaViewport {
@@ -256,9 +286,9 @@ impl BrowserApp {
                 None => self.selection.clear(),
             }
         }
-        if reset_scroll {
-            self.scroll_y = 0.0;
-        } else if let Some(geometry) = self.geometry() {
+        // 新布局结果：页面坐标系场景整体重建（缓存失效）
+        self.page_generation = self.page_generation.wrapping_add(1);
+        if let Some(geometry) = self.geometry() {
             self.scroll_y = scrollbar::clamp_scroll(self.scroll_y, geometry.max_scroll());
         }
         if let Some(window) = &self.window {
@@ -521,9 +551,14 @@ impl BrowserApp {
 
     /// 一帧：合成显示列表并渲染上屏。
     fn redraw(&mut self) {
-        let Some(window) = &self.window else {
+        if self.window.is_none() {
             return;
-        };
+        }
+        // M6 合帧：折叠的 resize 在这里执行一次重排（每帧至多一次）
+        if self.resize_coalescer.take() && self.page.is_some() {
+            self.relayout();
+        }
+        let window = self.window.as_ref().expect("window checked");
         let size = window.inner_size();
         let viewport = Size {
             width: size.width,
@@ -546,35 +581,42 @@ impl BrowserApp {
         let thumb = geometry.thumb(self.scroll_y);
         let track = geometry.track();
 
-        // 页面按滚动偏移重建显示列表（内容从工具带下方开始）
+        // 页面坐标系场景缓存（M6）：滚动只平移 origin，不重建显示列表；
+        // 高亮集合变化（选区）由键失配自然失效重建
         let highlights = match &self.text_map {
             Some(map) if !self.selection.is_empty() => self.selection.rects(map),
             _ => Vec::new(),
         };
-        let mut scene = match (&self.page, &self.root) {
-            (Some(page), Some(root)) => pipeline::build_scene_at_with_highlights(
-                page,
-                root,
-                0.0,
-                BAR_HEIGHT - self.scroll_y,
-                &highlights,
-            ),
-            _ => Scene::default(),
-        };
         // 画布底色：pipeline 的画布保持透明，直接 blit 会把透明像素交给
         // surface（alpha_mode Auto），在部分后端表现为黑屏/花屏。先铺不透明白底。
-        scene.commands.insert(
-            0,
-            nexty_paint::Command::FillRect {
-                rect: nexty_paint::Rect {
-                    x: 0.0,
-                    y: 0.0,
-                    width,
-                    height,
-                },
-                color: nexty_paint::Color::opaque(0xff, 0xff, 0xff),
+        let white_background = nexty_paint::Command::FillRect {
+            rect: nexty_paint::Rect {
+                x: 0.0,
+                y: 0.0,
+                width,
+                height,
             },
-        );
+            color: nexty_paint::Color::opaque(0xff, 0xff, 0xff),
+        };
+        let mut scene = match (&self.page, &self.root) {
+            (Some(page), Some(root)) => {
+                let page_scene = self.scene_cache.scene_for(
+                    self.page_generation,
+                    page,
+                    root,
+                    width,
+                    &highlights,
+                );
+                let mut scene = page_scene.translated(0.0, BAR_HEIGHT - self.scroll_y);
+                scene.commands.insert(0, white_background);
+                scene
+            }
+            _ => {
+                let mut scene = Scene::default();
+                scene.commands.push(white_background);
+                scene
+            }
+        };
         // 滚动条：轨道 + thumb，可拖拽（悬停/拖拽时加深）
         if let (Some(track), Some(thumb)) = (track, thumb) {
             scene.commands.push(nexty_paint::Command::FillRect {
@@ -647,10 +689,10 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(size.width, size.height);
                 }
-                // 按新视口宽重排（保留滚动量，set_page 内重新 clamp）
-                if let Some(page) = self.page.take() {
-                    self.set_page(page, false);
-                }
+                // M6 合帧：只置脏 + 请求重绘，重级联/重排合并到下一次
+                // RedrawRequested 执行一次（拖动边缘连发事件时管线每帧
+                // 至多跑一遍）
+                self.resize_coalescer.on_resized();
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -1005,6 +1047,7 @@ impl Gpu {
             pipeline_rgba,
             pipeline_bgra,
             texture: None,
+            staging_cache: None,
         })
     }
 
@@ -1065,8 +1108,16 @@ impl Gpu {
         if padded == unpadded {
             self.upload_aligned(&texture, &pixmap.data, unpadded, width, height);
         } else {
-            let staging = pad_rows(&pixmap.data, width, height, padded);
+            // staging 缓冲按 (宽, 高, 步幅) 复用（M6）：take → 填充 → 上传
+            // → 还回，避免每帧重新分配整屏对齐缓冲
+            let key = (width, height, padded);
+            let mut staging = match self.staging_cache.take() {
+                Some((cached_key, buffer)) if cached_key == key => buffer,
+                _ => Vec::new(),
+            };
+            pad_rows_into(&mut staging, &pixmap.data, width, height, padded);
             self.upload_aligned(&texture, &staging, padded, width, height);
+            self.staging_cache = Some((key, staging));
         }
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1211,15 +1262,26 @@ impl Gpu {
     }
 }
 
-/// 把紧凑行优先的像素数据按行padding 到 256 字节对齐。
+/// 把紧凑行优先的像素数据按行padding 到 256 字节对齐（M6 起仅测试用，
+/// 生产路径走 [`pad_rows_into`] + staging 缓冲复用）。
 ///
 /// WebGPU 的 `write_texture` 要求 `bytes_per_row` 为 256 的倍数，而 Pixmap
 /// 的行跨度是 `4 * width`。本函数为每行尾部补零，使行跨度变为
 /// `padded`。padding 字节的内容无关紧要（着色器只读实际宽度内的像素），
 /// 但必须是**每行独立补齐**而非只在末尾补一次。
+#[cfg(test)]
 fn pad_rows(data: &[u8], width: u32, height: u32, padded: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    pad_rows_into(&mut out, data, width, height, padded);
+    out
+}
+
+/// [`pad_rows`] 的写入变体（M6）：复用调用方缓冲的容量——staging 缓冲
+/// 按 (宽, 高, 步幅) 缓存后每帧只重填内容，不再整屏重新分配。
+fn pad_rows_into(out: &mut Vec<u8>, data: &[u8], width: u32, height: u32, padded: u32) {
     let unpadded = 4 * width;
-    let mut out = Vec::with_capacity(padded as usize * height as usize);
+    out.clear();
+    out.reserve(padded as usize * height as usize);
     for y in 0..height as usize {
         let start = y * unpadded as usize;
         let end = start + unpadded as usize;
@@ -1234,7 +1296,6 @@ fn pad_rows(data: &[u8], width: u32, height: u32, padded: u32) -> Vec<u8> {
         // 行尾补到 256 对齐
         out.resize(y * padded as usize + padded as usize, 0);
     }
-    out
 }
 
 /// 传输失败 → 错误类别文本。

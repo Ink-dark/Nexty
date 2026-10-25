@@ -578,6 +578,105 @@ fn to_color(rgba: Rgba) -> Color {
 /// 视口尺寸别名（paint 的 `Size`）。
 pub type Viewport = Size;
 
+/// resize 合帧器（M6）：连发的 `Resized` 事件合并到下一次重绘。
+///
+/// winit 拖动窗口边缘时 `Resized` 连发，逐事件全管线重排会把管线跑成
+/// 每事件一次；合帧后事件只置脏标志，重排在下一次 `RedrawRequested`
+/// 里至多执行一次（app 与基准共用本状态机，保证「每帧一次」语义同源）。
+#[derive(Debug, Default)]
+pub struct ResizeCoalescer {
+    dirty: bool,
+}
+
+impl ResizeCoalescer {
+    /// 一个 `Resized` 事件到达（只置脏，不做任何重排工作）。
+    pub fn on_resized(&mut self) {
+        self.dirty = true;
+    }
+
+    /// 取走脏标志：返回真时调用方执行一次重排（每帧至多一次）。
+    pub fn take(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
+}
+
+/// 页面坐标系显示列表缓存（M6）。
+///
+/// 场景按（页面代次、视口宽、高亮集合）缓存为 **页面坐标系**版本
+/// （origin 全零）：滚动、滚动条拖拽只是光栅前的一次
+/// [`Scene::translated`] origin 平移，不再重建显示列表。导航与 resize
+/// 推进页面代次（布局结果变化）、选区变化改变高亮集合——两者都使缓存
+/// 失效重建。
+#[derive(Default)]
+pub struct SceneCache {
+    cached: Option<CachedScene>,
+    /// 累计 emit（全片段树重建）次数；基准与测试用它断言滚动路径零 emit。
+    emits: usize,
+    /// 上一次 [`SceneCache::scene_for`] 是否命中。
+    last_hit: bool,
+}
+
+struct CachedScene {
+    generation: u64,
+    viewport_width: f32,
+    highlights: Vec<LayoutRect>,
+    scene: Scene,
+}
+
+impl SceneCache {
+    /// 空缓存。
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 取页面坐标系场景：键（代次、视口宽、高亮）命中直接复用，未命中
+    /// 走一次全片段树 emit 并入库。
+    pub fn scene_for(
+        &mut self,
+        generation: u64,
+        page: &Page,
+        root: &Fragment,
+        viewport_width: f32,
+        highlights: &[LayoutRect],
+    ) -> &Scene {
+        let hit = self.cached.as_ref().is_some_and(|cached| {
+            cached.generation == generation
+                && cached.viewport_width == viewport_width
+                && cached.highlights == highlights
+        });
+        self.last_hit = hit;
+        if !hit {
+            self.emits += 1;
+            let scene = build_scene_at_with_highlights(page, root, 0.0, 0.0, highlights);
+            self.cached = Some(CachedScene {
+                generation,
+                viewport_width,
+                highlights: highlights.to_vec(),
+                scene,
+            });
+        }
+        &self.cached.as_ref().expect("cache populated on miss").scene
+    }
+
+    /// 上一次 [`SceneCache::scene_for`] 是否命中缓存（未走 emit）。
+    #[must_use]
+    pub fn last_was_hit(&self) -> bool {
+        self.last_hit
+    }
+
+    /// 累计 emit 次数。
+    #[must_use]
+    pub fn emits(&self) -> usize {
+        self.emits
+    }
+
+    /// emit 计数清零（基准分场景统计）。
+    pub fn reset_emits(&mut self) {
+        self.emits = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,5 +712,80 @@ mod tests {
         );
         assert_eq!(page.styles[&div].width, SizeValue::Length(400.0), "50vw");
         assert_eq!(page.styles[&div].height, SizeValue::Length(60.0), "10vh");
+    }
+
+    /// 布局一段文本页供缓存测试用。
+    fn text_page() -> (Page, Fragment) {
+        let page = load_page(
+            "<body><p>hello 缓存 scene</p><p>second line of text</p></body>",
+            "",
+        );
+        let shaper = nexty_text::ParleyTextShaper::new();
+        let root = layout_page(&page, &shaper, 400.0).expect("root");
+        (page, root)
+    }
+
+    /// 同键重复请求复用缓存（零 emit），键变化（代次/视口宽/高亮）失效重建。
+    #[test]
+    fn scene_cache_reuses_on_same_key_and_invalidates_on_key_change() {
+        let (page, root) = text_page();
+        let mut cache = SceneCache::new();
+
+        let _ = cache.scene_for(7, &page, &root, 400.0, &[]);
+        assert!(!cache.last_was_hit(), "首次构建必 miss");
+        assert_eq!(cache.emits(), 1);
+
+        let _ = cache.scene_for(7, &page, &root, 400.0, &[]);
+        assert!(cache.last_was_hit(), "同键命中");
+        assert_eq!(cache.emits(), 1, "命中不 emit");
+
+        // 页面代次推进（导航 / resize 重排）→ 失效
+        let _ = cache.scene_for(8, &page, &root, 400.0, &[]);
+        assert!(!cache.last_was_hit());
+        assert_eq!(cache.emits(), 2);
+
+        // 视口宽变化 → 失效
+        let _ = cache.scene_for(8, &page, &root, 500.0, &[]);
+        assert!(!cache.last_was_hit());
+
+        // 高亮集合变化（选区）→ 失效
+        let highlights = [LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 20.0,
+        }];
+        let _ = cache.scene_for(8, &page, &root, 500.0, &highlights);
+        assert!(!cache.last_was_hit());
+        let _ = cache.scene_for(8, &page, &root, 500.0, &highlights);
+        assert!(cache.last_was_hit(), "相同高亮集合命中");
+        assert_eq!(cache.emits(), 4);
+    }
+
+    /// 缓存场景是页面坐标系（origin 全零）：平移到视口后几何与直接以
+    /// 该 origin 构建的场景逐字节一致（M6 的正确性判据）。
+    #[test]
+    fn cached_page_scene_translated_matches_direct_build() {
+        let (page, root) = text_page();
+        let mut cache = SceneCache::new();
+        let page_scene = cache.scene_for(1, &page, &root, 400.0, &[]);
+        let origin_y = 48.0 - 120.0; // BAR_HEIGHT - scroll 的样例
+        let translated = page_scene.translated(0.0, origin_y);
+        let direct = build_scene_at_with_highlights(&page, &root, 0.0, origin_y, &[]);
+        assert_eq!(format!("{translated:?}"), format!("{direct:?}"));
+    }
+
+    /// 合帧器：连发事件折叠为一次 take。
+    #[test]
+    fn resize_coalescer_collapses_bursts() {
+        let mut coalescer = ResizeCoalescer::default();
+        assert!(!coalescer.take(), "初始无脏标志");
+        coalescer.on_resized();
+        coalescer.on_resized();
+        coalescer.on_resized();
+        assert!(coalescer.take(), "三次事件折叠为一次");
+        assert!(!coalescer.take(), "take 后标志复位");
+        coalescer.on_resized();
+        assert!(coalescer.take());
     }
 }
