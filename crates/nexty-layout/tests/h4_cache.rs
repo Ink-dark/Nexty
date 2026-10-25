@@ -203,3 +203,51 @@ fn repeated_layouts_are_stable() {
         }
     }
 }
+
+/// M12：字形字体下标越界（trait 契约破坏）不 panic——remap 路径跳过该
+/// 字形，布局正常产出片段树。
+///
+/// 构造：整形器把字形 font 下标改成 9 而字体表为空；同一文本 chunk 被
+/// 紧急断点切成多段同行放置时走 run 合并（remap_glyph）路径。
+#[test]
+fn out_of_range_font_index_skips_glyph_without_panic() {
+    use nexty_css::{Stylesheet, compute_document_styles, html_ua_stylesheet};
+    use nexty_text::{FontMetrics, ShapedText, TextError, TextStyle};
+
+    /// 畸形整形器：产出 font 下标越界的字形（fonts 表被清空）。
+    struct BadFontShaper {
+        inner: nexty_text::ParleyTextShaper,
+    }
+    impl nexty_text::TextShaper for BadFontShaper {
+        fn shape(&self, text: &str, style: &TextStyle) -> Result<ShapedText, TextError> {
+            let mut shaped = self.inner.shape(text, style)?;
+            for glyph in &mut shaped.glyphs {
+                glyph.font = 9;
+            }
+            shaped.fonts.clear();
+            Ok(shaped)
+        }
+        fn metrics(&self, style: &TextStyle) -> Result<FontMetrics, TextError> {
+            self.inner.metrics(style)
+        }
+    }
+
+    let html = "<body><p style=\"width:60px;overflow-wrap:break-word\">superlongtext with words here</p></body>";
+    let document = nexty_html::parse_document(html, ParseOptions::default());
+    let sheet = Stylesheet::parse("body { margin: 0 }");
+    let styles = compute_document_styles(&document, &[&sheet], Some(html_ua_stylesheet()));
+    let shaper = BadFontShaper {
+        inner: nexty_text::ParleyTextShaper::new(),
+    };
+    // 布局完成即不 panic；紧急断点把同一 chunk 切成多段同行放置（run 合并
+    // 路径），越界字形被跳过
+    let root = layout_document(
+        &document,
+        &shaper,
+        &styles,
+        &HashMap::<NodeId, (f32, f32)>::new(),
+        80.0,
+    )
+    .expect("layout completes");
+    assert!(root.border_box.width > 0.0);
+}

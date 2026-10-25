@@ -136,14 +136,21 @@ impl InlineRunNode<'_> {
     /// `min_content` 为真时按 min-content 语义断行（`overflow-wrap:
     /// break-word` 的紧急断点不参与，CSS Text 3 §5.4）。原子盒项先按同一
     /// 可用宽布局（其片段宽高参与断行与基线对齐）。
+    ///
+    /// 缓存命中**取走**行盒（M10：本方法是其唯一消费者，take 语义免去
+    /// 整树行盒深拷贝）；同一宽度重复查询会重算并重新入库（结果确定性
+    /// 不变，仅多一次构建）。
     pub(crate) fn lines_at(&self, available_width: f32, min_content: bool) -> Vec<LineFragment> {
-        if let Some((_, _, lines)) = self
+        // position 先取出并结束不可变借用，再可变借用移除（RefCell 借用
+        // 不能跨 if-let 语句体重叠）
+        let cached = self
             .lines_cache
             .borrow()
             .iter()
-            .find(|(width, mode, _)| *width == available_width && *mode == min_content)
-        {
-            return lines.clone();
+            .position(|(width, mode, _)| *width == available_width && *mode == min_content);
+        if let Some(position) = cached {
+            let (_, _, lines) = self.lines_cache.borrow_mut().remove(position);
+            return lines;
         }
         for item in self.items.borrow_mut().iter_mut() {
             if let InlineItem::Block(atomic) = item {
@@ -382,11 +389,13 @@ pub(crate) fn build_box_tree<'a>(ctx: &'a Context<'a>, root: NodeId) -> BoxTree<
     boxes
 }
 
-fn root_style(ctx: &Context<'_>, root: NodeId) -> ComputedStyle {
-    ctx.styles
-        .get(&root)
-        .cloned()
-        .unwrap_or_else(ComputedStyle::initial)
+/// 元素 computed style 的借用视图（M10：`ctx.styles` 已有则借用，零克隆；
+/// 仅缺失时构造 initial——每次盒树构建对每元素少一次深拷贝）。
+fn root_style<'a>(ctx: &'a Context<'_>, root: NodeId) -> std::borrow::Cow<'a, ComputedStyle> {
+    ctx.styles.get(&root).map_or_else(
+        || std::borrow::Cow::Owned(ComputedStyle::initial()),
+        std::borrow::Cow::Borrowed,
+    )
 }
 
 /// 为确定产盒的元素建 taffy 节点（含子内容收集）。

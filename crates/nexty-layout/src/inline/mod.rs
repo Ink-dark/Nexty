@@ -266,11 +266,11 @@ struct Collector<'a> {
 
 impl Collector<'_> {
     /// 若当前缓冲区属于别的文本节点/样式，先刷出（一个文本块只带一种样式）。
+    ///
+    /// 样式按 NodeId 查表（`ctx.styles`），同一来源节点的 computed style
+    /// 必然相同（M10：免去逐字段 `PartialEq` 全量比较）。
     fn ensure_style(&mut self, text_node: NodeId, style_node: NodeId, style: &ComputedStyle) {
-        if self.text_node == Some(text_node)
-            && self.text_style_node == Some(style_node)
-            && self.text_style.as_ref() == Some(style)
-        {
+        if self.text_node == Some(text_node) && self.text_style_node == Some(style_node) {
             return;
         }
         self.flush_text();
@@ -1441,13 +1441,15 @@ impl LineBuilder<'_> {
         // 同源文本合并进同一 run，但不得跨越中间的图片（绘制顺序会被打乱）
         let mut mergeable = false;
         // 把字形（font 指向源 ShapedText 的字体表）并入 run：按实例 id
-        // 重映射到 run 自己的字体表（跨 run 合并时避免字节比较）
+        // 重映射到 run 自己的字体表（跨 run 合并时避免字节比较）。
+        // 字体下标越界是 trait 契约破坏（畸形输入）：返回 `None`，字形跳过
+        // 而非 panic（M12，与「畸形输入不 panic」基准对齐）。
         fn remap_glyph(
             mut glyph: Glyph,
             source_fonts: &[ResolvedFont],
             run_fonts: &mut Vec<ResolvedFont>,
-        ) -> Glyph {
-            let source = &source_fonts[glyph.font as usize];
+        ) -> Option<Glyph> {
+            let source = source_fonts.get(glyph.font as usize)?;
             let index = run_fonts
                 .iter()
                 .position(|font| font.id() == source.id())
@@ -1456,7 +1458,7 @@ impl LineBuilder<'_> {
                     run_fonts.len() - 1
                 });
             glyph.font = index as u32;
-            glyph
+            Some(glyph)
         }
         let last_index = self.placed.len().saturating_sub(1);
         // 行末字距扣减：最后一个放置项是文本且实际产字形时，从其 run 的
@@ -1548,8 +1550,11 @@ impl LineBuilder<'_> {
                                 && run.text_node == chunk.text_node =>
                         {
                             for glyph in glyphs {
-                                run.glyphs
-                                    .push(remap_glyph(glyph, &shaped.fonts, &mut run.fonts));
+                                if let Some(remapped) =
+                                    remap_glyph(glyph, &shaped.fonts, &mut run.fonts)
+                                {
+                                    run.glyphs.push(remapped);
+                                }
                             }
                             run.text_end = visible_end as u32;
                         }
