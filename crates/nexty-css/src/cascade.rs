@@ -14,8 +14,8 @@ use std::collections::HashMap;
 
 use nexty_dom::{Document, NodeId, NodeKind};
 
-use crate::parser::{Declaration, MediaViewport, Stylesheet, parse_inline_style};
-use crate::selector::match_element_selectors;
+use crate::parser::{Declaration, MediaViewport, StyleRule, Stylesheet, parse_inline_style};
+use crate::selector::{NextySelector, atom_str, match_element_selectors};
 use crate::value::{
     AbsoluteSize, AlignItemsValue, AlignSelfValue, BorderColorValue, BorderStyle, BorderWidthValue,
     BoxSizingValue, CssWideKeyword, DeclaredValue, DisplayValue, FlexDirectionValue, FlexWrapValue,
@@ -345,39 +345,379 @@ fn bucket_of(origin: Origin, important: bool) -> OriginBucket {
     }
 }
 
-/// 收集一个 origin 样式表中命中元素的全部声明。
-fn collect_origin_declarations(
-    document: &Document,
-    element: NodeId,
-    sheet: &Stylesheet,
-    origin: Origin,
-    matched: &mut Vec<(CascadeKey, Declaration)>,
-) {
-    for (rule_order, rule) in sheet.rules().iter().enumerate() {
-        // 规则内多个选择器都能命中时，取特异度最高者
-        // （CSS Cascade 5：声明的特异度取其匹配选择器中的最大值）。
-        let specificity = rule
-            .selectors()
-            .iter()
-            .filter(|parsed| {
-                match_element_selectors(std::slice::from_ref(parsed), document, element)
-            })
-            .map(|parsed| parsed.specificity)
-            .max();
-        if let Some(specificity) = specificity {
-            for (declaration_order, declaration) in rule.declarations().iter().enumerate() {
-                matched.push((
-                    CascadeKey {
-                        bucket: bucket_of(origin, declaration.important),
-                        inline: false,
-                        specificity,
-                        rule_order,
-                        declaration_order,
-                    },
-                    declaration.clone(),
-                ));
+/// 选择器的必要条件（M5 分桶）：匹配该选择器的元素**必然**满足的条件。
+///
+/// 只取顶层 compound 里的直接简单选择器（`Class` / `ID` / `LocalName`）——
+/// `:is()` / `:where()` / `:has()` 内部是备选分支而非必要条件，含组合器的
+/// 选择器其条件分布在多个 compound 上，一概保守回落
+/// [`Requirement::Always`]。键统一 ASCII 小写：quirks 模式的
+/// case-insensitive 与严格模式都只会「多测不会漏」（大小写不同的名字折到
+/// 同一键，仍然进入匹配）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Requirement {
+    /// 元素必须带有该 class。
+    Class(String),
+    /// 元素必须是该标签名。
+    Tag(String),
+    /// 元素必须带有该 id。
+    Id(String),
+    /// 无可提取的必要条件：每元素必测。
+    Always,
+}
+
+/// 从一条已解析选择器提取必要条件（优先 id > class > tag，其余 Always）。
+fn requirement_of(selector: &NextySelector) -> Requirement {
+    use selectors::parser::Component;
+    use std::borrow::Borrow;
+    let mut class: Option<&str> = None;
+    let mut tag: Option<&str> = None;
+    for component in selector.selector.iter_raw_match_order() {
+        match component {
+            // 组合器连接多个 compound：条件不再唯一，保守全测
+            Component::Combinator(_) => return Requirement::Always,
+            Component::ID(atom) => {
+                return Requirement::Id(atom_str(atom).to_ascii_lowercase());
+            }
+            Component::Class(atom) if class.is_none() => class = Some(atom_str(atom)),
+            Component::LocalName(local) if tag.is_none() => tag = Some(local.lower_name.borrow()),
+            _ => {}
+        }
+    }
+    if let Some(class) = class {
+        return Requirement::Class(class.to_ascii_lowercase());
+    }
+    if let Some(tag) = tag {
+        return Requirement::Tag(tag.to_ascii_lowercase());
+    }
+    Requirement::Always
+}
+
+/// 桶内候选：一次选择器测试的全部输入（特异度已在解析期算好）。
+struct Candidate<'a> {
+    /// 规则在所属 origin 展平序列中的序号（CascadeKey::rule_order）。
+    rule_order: usize,
+    /// 展平选择器槽位（同元素去重用：同一选择器可出现在多个桶）。
+    slot: usize,
+    selector: &'a NextySelector,
+}
+
+/// 一组样式表的规则桶索引（M5 ④）：构建一次，全文档每元素复用。
+///
+/// 语义与全量扫描逐条一致：只有「必要条件已失败」的选择器被跳过——它们
+/// 本就不可能匹配。命中声明仍按 origin → importance → specificity →
+/// 源顺序仲裁（CascadeKey 不变）。
+struct SheetIndex<'a> {
+    /// 展平的（序号, 规则）序列：rule_order 与声明借用的来源。
+    rules: Vec<(usize, &'a StyleRule)>,
+    class: HashMap<String, Vec<Candidate<'a>>>,
+    tag: HashMap<String, Vec<Candidate<'a>>>,
+    id: HashMap<String, Vec<Candidate<'a>>>,
+    /// 无可提取必要条件的选择器：每元素必测。
+    always: Vec<Candidate<'a>>,
+    /// 展平选择器总数（去重 scratch 的尺寸）。
+    selector_count: usize,
+}
+
+impl<'a> SheetIndex<'a> {
+    /// 为一组样式表构建索引（规则按传入顺序、选择器按源顺序展平编号）。
+    fn build(sheets: &[&'a Stylesheet]) -> Self {
+        let mut rules = Vec::new();
+        let mut class: HashMap<String, Vec<Candidate<'a>>> = HashMap::new();
+        let mut tag: HashMap<String, Vec<Candidate<'a>>> = HashMap::new();
+        let mut id: HashMap<String, Vec<Candidate<'a>>> = HashMap::new();
+        let mut always = Vec::new();
+        let mut selector_count = 0usize;
+        for (rule_order, rule) in sheets.iter().flat_map(|sheet| sheet.rules()).enumerate() {
+            rules.push((rule_order, rule));
+            for selector in rule.selectors() {
+                let slot = selector_count;
+                selector_count += 1;
+                let candidate = Candidate {
+                    rule_order,
+                    slot,
+                    selector,
+                };
+                match requirement_of(selector) {
+                    Requirement::Class(key) => class.entry(key).or_default().push(candidate),
+                    Requirement::Tag(key) => tag.entry(key).or_default().push(candidate),
+                    Requirement::Id(key) => id.entry(key).or_default().push(candidate),
+                    Requirement::Always => always.push(candidate),
+                }
             }
         }
+        Self {
+            rules,
+            class,
+            tag,
+            id,
+            always,
+            selector_count,
+        }
+    }
+
+    /// 元素的必要条件集合：class 列表 + tag + id（键与桶同为小写）。
+    fn requirements_of(
+        document: &Document,
+        element: NodeId,
+    ) -> (Vec<String>, String, Option<String>) {
+        let Some(NodeKind::Element(data)) = document.node(element) else {
+            return (Vec::new(), String::new(), None);
+        };
+        let attribute = |name: &str| {
+            data.attributes
+                .iter()
+                .find(|attr| attr.namespace == nexty_dom::Namespace::None && attr.name == name)
+                .map(|attr| attr.value.as_str())
+        };
+        let classes = attribute("class")
+            .map(|value| {
+                value
+                    .split_ascii_whitespace()
+                    .map(str::to_ascii_lowercase)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let tag = data.name.to_ascii_lowercase();
+        let id = attribute("id").map(str::to_ascii_lowercase);
+        (classes, tag, id)
+    }
+}
+
+/// 元素级收集的去重 scratch：跨元素复用（epoch 标记免清零）。
+#[derive(Default)]
+struct GatherScratch {
+    seen: Vec<u32>,
+    epoch: u32,
+}
+
+/// 收集一个元素在 UA + author 两个索引下的全部命中声明（引用，零克隆）。
+///
+/// `inline` 是本元素的内联样式解析结果（[`InlineStyleCache`] 或现解析），
+/// 声明同样以引用进入 matched——声明的生命周期覆盖 `resolve_all` 调用。
+fn collect_matched<'a: 'd, 'd>(
+    document: &Document,
+    element: NodeId,
+    ua: Option<&'a SheetIndex<'a>>,
+    author: &'a SheetIndex<'a>,
+    inline: Option<&'d [Declaration]>,
+    scratch: &mut GatherScratch,
+    matched: &mut Vec<(CascadeKey, &'d Declaration)>,
+) {
+    // 把一个桶的去重候选并入 test（嵌套 fn 而非闭包：参数需要显式生命周期）
+    fn push_bucket<'a>(
+        bucket: &'a [Candidate<'a>],
+        is_ua: bool,
+        slot_offset: usize,
+        seen: &mut [u32],
+        epoch: u32,
+        test: &mut Vec<(&'a Candidate<'a>, bool)>,
+    ) {
+        for candidate in bucket {
+            let slot = candidate.slot + slot_offset;
+            if seen[slot] == epoch {
+                continue;
+            }
+            seen[slot] = epoch;
+            test.push((candidate, is_ua));
+        }
+    }
+
+    // 从一个索引的全部相关桶收集候选
+    fn gather<'a>(
+        index: &'a SheetIndex<'a>,
+        document: &Document,
+        element: NodeId,
+        is_ua: bool,
+        slot_offset: usize,
+        scratch: &mut GatherScratch,
+        test: &mut Vec<(&'a Candidate<'a>, bool)>,
+    ) {
+        let (classes, tag, id) = SheetIndex::requirements_of(document, element);
+        for key in &classes {
+            if let Some(bucket) = index.class.get(key) {
+                push_bucket(
+                    bucket,
+                    is_ua,
+                    slot_offset,
+                    &mut scratch.seen,
+                    scratch.epoch,
+                    test,
+                );
+            }
+        }
+        if let Some(bucket) = index.tag.get(&tag) {
+            push_bucket(
+                bucket,
+                is_ua,
+                slot_offset,
+                &mut scratch.seen,
+                scratch.epoch,
+                test,
+            );
+        }
+        if let Some(id) = &id
+            && let Some(bucket) = index.id.get(id)
+        {
+            push_bucket(
+                bucket,
+                is_ua,
+                slot_offset,
+                &mut scratch.seen,
+                scratch.epoch,
+                test,
+            );
+        }
+        push_bucket(
+            &index.always,
+            is_ua,
+            slot_offset,
+            &mut scratch.seen,
+            scratch.epoch,
+            test,
+        );
+    }
+
+    // 命中规则的声明组按引用入 matched（嵌套 fn：显式生命周期）
+    fn push_rule<'d>(
+        matched: &mut Vec<(CascadeKey, &'d Declaration)>,
+        origin: Origin,
+        rule_order: usize,
+        specificity: Option<u32>,
+        declarations: &'d [Declaration],
+    ) {
+        let Some(specificity) = specificity else {
+            return;
+        };
+        for (declaration_order, declaration) in declarations.iter().enumerate() {
+            matched.push((
+                CascadeKey {
+                    bucket: bucket_of(origin, declaration.important),
+                    inline: false,
+                    specificity,
+                    rule_order,
+                    declaration_order,
+                },
+                declaration,
+            ));
+        }
+    }
+
+    // 槽位跨两个索引全局唯一：author 从 0 起，UA 偏移其后（去重 scratch）
+    let slot_count = author.selector_count + ua.map_or(0, |index| index.selector_count);
+    if scratch.seen.len() < slot_count {
+        scratch.seen.resize(slot_count, 0);
+    }
+    scratch.epoch = scratch.epoch.wrapping_add(1);
+
+    // 逐桶收集候选选择器（epoch 去重：同一选择器可能同时命中多个 class 桶）
+    let mut test: Vec<(&Candidate<'a>, bool)> = Vec::new(); // (候选, 是否 UA)
+    if let Some(ua) = ua {
+        gather(
+            ua,
+            document,
+            element,
+            true,
+            author.selector_count,
+            scratch,
+            &mut test,
+        );
+    }
+    gather(author, document, element, false, 0, scratch, &mut test);
+
+    // 测试候选选择器：命中者按规则聚合最大特异度（与全量扫描一致：
+    // 声明的特异度取其匹配选择器中的最大值；UA 与 author 各自独立序号空间）
+    let mut author_specificity: Vec<Option<u32>> = vec![None; author.rules.len()];
+    let mut ua_specificity = ua.map(|index| vec![None; index.rules.len()]);
+    for (candidate, is_ua) in &test {
+        if !match_element_selectors(std::slice::from_ref(candidate.selector), document, element) {
+            continue;
+        }
+        let slots = if *is_ua {
+            ua_specificity.as_mut().expect("ua slots sized")
+        } else {
+            &mut author_specificity
+        };
+        let entry = &mut slots[candidate.rule_order];
+        *entry = Some(entry.map_or(candidate.selector.specificity, |current| {
+            current.max(candidate.selector.specificity)
+        }));
+    }
+
+    // 生成 matched：author 表 + UA 表 + 内联（声明全部按引用）
+    for &(rule_order, rule) in &author.rules {
+        push_rule(
+            matched,
+            Origin::Author,
+            rule_order,
+            author_specificity[rule_order],
+            rule.declarations(),
+        );
+    }
+    if let (Some(ua), Some(slots)) = (ua, ua_specificity.as_ref()) {
+        for &(rule_order, rule) in &ua.rules {
+            push_rule(
+                matched,
+                Origin::Ua,
+                rule_order,
+                slots[rule_order],
+                rule.declarations(),
+            );
+        }
+    }
+    if let Some(inline) = inline {
+        for (declaration_order, declaration) in inline.iter().enumerate() {
+            matched.push((
+                CascadeKey {
+                    bucket: bucket_of(Origin::Author, declaration.important),
+                    inline: true,
+                    specificity: 0,
+                    rule_order: usize::MAX,
+                    declaration_order,
+                },
+                declaration,
+            ));
+        }
+    }
+}
+
+/// 内联样式解析缓存（M5 ②）：元素 →（style 属性原文, 解析结果）。
+///
+/// recascade 时按**属性原文**校验——原文未变直接复用解析结果，不重解析
+/// 字符串。以原文为键保证任意来源的属性变更都自动失效（校验是廉价的
+/// 字符串比较）。存方（如 chrome 的 `Page`）跨级联调用持有本缓存。
+#[derive(Default)]
+pub struct InlineStyleCache {
+    entries: HashMap<NodeId, (String, Vec<Declaration>)>,
+}
+
+impl InlineStyleCache {
+    /// 空缓存。
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 元素内联声明的借用：原文命中直接复用，未命中现解析并入库。
+    /// 无 style 属性返回 `None`。
+    fn declarations_of(&mut self, document: &Document, element: NodeId) -> Option<&[Declaration]> {
+        let Some(NodeKind::Element(data)) = document.node(element) else {
+            return None;
+        };
+        let attribute = data
+            .attributes
+            .iter()
+            .find(|attr| attr.namespace == nexty_dom::Namespace::None && attr.name == "style")?
+            .value
+            .clone();
+        // 快路径：原文未变直接复用（属性原文是解析结果失效的唯一来源）
+        if let Some((cached, _)) = self.entries.get(&element)
+            && *cached == attribute
+        {
+            return Some(&self.entries[&element].1);
+        }
+        let declarations = parse_inline_style(&attribute);
+        self.entries.insert(element, (attribute, declarations));
+        Some(&self.entries[&element].1)
     }
 }
 
@@ -402,6 +742,10 @@ pub fn cascade(
 /// [`cascade`] 的带视口版本：视口单位（vw/vh/vmin/vmax）在 computed 阶段
 /// 按给定视口折算为绝对 px（CSS Values 4 §6.2：1v* = 视口对应边的 1%）。
 /// 未提供视口时视口单位原样保留，由消费方按降级值处理。
+///
+/// 单元素入口每次调用重建一次规则桶索引（O(选择器总数)，远小于逐元素
+/// 全量扫描）；整文档入口走 [`compute_document_styles_in_with_cache`]，
+/// 索引只建一次。
 #[must_use]
 pub fn cascade_in(
     document: &Document,
@@ -411,59 +755,21 @@ pub fn cascade_in(
     parent: Option<&ComputedStyle>,
     viewport: Option<MediaViewport>,
 ) -> ComputedStyle {
-    let mut matched: Vec<(CascadeKey, Declaration)> = Vec::new();
-
-    if let Some(ua) = ua_sheet {
-        collect_origin_declarations(document, element, ua, Origin::Ua, &mut matched);
-    }
-    // 规则顺序跨样式表连续编号：样式表按传入顺序、规则按源顺序
-    for (rule_order, rule) in stylesheets
-        .iter()
-        .flat_map(|sheet| sheet.rules())
-        .enumerate()
-    {
-        let specificity = rule
-            .selectors()
-            .iter()
-            .filter(|parsed| {
-                match_element_selectors(std::slice::from_ref(parsed), document, element)
-            })
-            .map(|parsed| parsed.specificity)
-            .max();
-        if let Some(specificity) = specificity {
-            for (declaration_order, declaration) in rule.declarations().iter().enumerate() {
-                matched.push((
-                    CascadeKey {
-                        bucket: bucket_of(Origin::Author, declaration.important),
-                        inline: false,
-                        specificity,
-                        rule_order,
-                        declaration_order,
-                    },
-                    declaration.clone(),
-                ));
-            }
-        }
-    }
-
-    // 内联 style 属性：author origin，普通声明排在全部样式表声明之后
-    if let Some(style_attribute) = style_attribute_of(document, element) {
-        for (declaration_order, declaration) in
-            parse_inline_style(&style_attribute).into_iter().enumerate()
-        {
-            matched.push((
-                CascadeKey {
-                    bucket: bucket_of(Origin::Author, declaration.important),
-                    inline: true,
-                    specificity: 0,
-                    rule_order: usize::MAX,
-                    declaration_order,
-                },
-                declaration,
-            ));
-        }
-    }
-
+    let author = SheetIndex::build(stylesheets);
+    let ua = ua_sheet.map(|sheet| SheetIndex::build(std::slice::from_ref(&sheet)));
+    let mut scratch = GatherScratch::default();
+    let mut cache = InlineStyleCache::new();
+    let inline = cache.declarations_of(document, element);
+    let mut matched: Vec<(CascadeKey, &Declaration)> = Vec::new();
+    collect_matched(
+        document,
+        element,
+        ua.as_ref(),
+        &author,
+        inline,
+        &mut scratch,
+        &mut matched,
+    );
     resolve_all(&matched, parent, viewport)
 }
 
@@ -482,6 +788,8 @@ pub fn compute_document_styles(
 /// [`compute_document_styles`] 的带视口版本：视口单位（vw/vh/vmin/vmax）
 /// 在 computed 阶段按给定视口折算为绝对 px（CSS Values 4 §6.2）。
 /// 未提供视口时视口单位原样保留，由消费方按降级值处理。
+///
+/// 规则桶索引本调用内构建一次；内联样式每次重解析（无跨调用缓存）。
 #[must_use]
 pub fn compute_document_styles_in(
     document: &Document,
@@ -489,64 +797,91 @@ pub fn compute_document_styles_in(
     ua_sheet: Option<&Stylesheet>,
     viewport: Option<MediaViewport>,
 ) -> HashMap<NodeId, ComputedStyle> {
-    let mut styles = HashMap::new();
-    walk(
-        document,
-        document.root(),
-        None,
-        stylesheets,
-        ua_sheet,
+    let mut cache = InlineStyleCache::new();
+    compute_document_styles_in_with_cache(document, stylesheets, ua_sheet, viewport, &mut cache)
+}
+
+/// [`compute_document_styles_in`] 的带缓存版本（M5 ②）：调用方跨调用持有
+/// [`InlineStyleCache`] 时，recascade 对未变化的 style 属性直接复用解析
+/// 结果，不重解析字符串。
+#[must_use]
+pub fn compute_document_styles_in_with_cache(
+    document: &Document,
+    stylesheets: &[&Stylesheet],
+    ua_sheet: Option<&Stylesheet>,
+    viewport: Option<MediaViewport>,
+    cache: &mut InlineStyleCache,
+) -> HashMap<NodeId, ComputedStyle> {
+    // 规则桶索引：构建一次（O(选择器总数)），全文档每元素复用
+    let mut ctx = CascadeCtx {
+        ua: ua_sheet.map(|sheet| SheetIndex::build(std::slice::from_ref(&sheet))),
+        author: SheetIndex::build(stylesheets),
         viewport,
-        &mut styles,
-    );
+        cache,
+        scratch: GatherScratch::default(),
+    };
+    let mut styles = HashMap::new();
+    walk(document, document.root(), None, &mut ctx, &mut styles);
     styles
+}
+
+/// 整文档级联的共享上下文（M5）：规则桶索引（构建一次）、视口、内联样式
+/// 缓存与去重 scratch，由 [`walk`] 全文档复用。
+struct CascadeCtx<'a, 'c> {
+    ua: Option<SheetIndex<'a>>,
+    author: SheetIndex<'a>,
+    viewport: Option<MediaViewport>,
+    cache: &'c mut InlineStyleCache,
+    scratch: GatherScratch,
 }
 
 fn walk(
     document: &Document,
     node: NodeId,
     parent: Option<&ComputedStyle>,
-    stylesheets: &[&Stylesheet],
-    ua_sheet: Option<&Stylesheet>,
-    viewport: Option<MediaViewport>,
+    ctx: &mut CascadeCtx<'_, '_>,
     out: &mut HashMap<NodeId, ComputedStyle>,
 ) {
     for child in document.children(node) {
         if matches!(document.node(child), Some(NodeKind::Element(_))) {
-            let style = cascade_in(document, child, stylesheets, ua_sheet, parent, viewport);
-            walk(
-                document,
-                child,
-                Some(&style),
-                stylesheets,
-                ua_sheet,
-                viewport,
-                out,
-            );
+            // matched 借用 cache 与索引，块结束即释放（递归前必须归还）
+            let style = {
+                let CascadeCtx {
+                    ua,
+                    author,
+                    viewport,
+                    cache,
+                    scratch,
+                } = &mut *ctx;
+                let inline = cache.declarations_of(document, child);
+                let mut matched: Vec<(CascadeKey, &Declaration)> = Vec::new();
+                collect_matched(
+                    document,
+                    child,
+                    ua.as_ref(),
+                    author,
+                    inline,
+                    scratch,
+                    &mut matched,
+                );
+                resolve_all(&matched, parent, *viewport)
+            };
+            walk(document, child, Some(&style), ctx, out);
             out.insert(child, style);
         }
     }
 }
 
-/// 元素的 style 属性值。
-fn style_attribute_of(document: &Document, element: NodeId) -> Option<String> {
-    match document.node(element) {
-        Some(NodeKind::Element(data)) => data
-            .attributes
-            .iter()
-            .find(|attr| attr.namespace == nexty_dom::Namespace::None && attr.name == "style")
-            .map(|attr| attr.value.clone()),
-        _ => None,
-    }
-}
-
 /// 某属性在级联中的胜者声明。
-fn winner(property: PropertyId, matched: &[(CascadeKey, Declaration)]) -> Option<&Declaration> {
+fn winner<'d>(
+    property: PropertyId,
+    matched: &[(CascadeKey, &'d Declaration)],
+) -> Option<&'d Declaration> {
     matched
         .iter()
         .filter(|(_, declaration)| declaration.property == property)
         .max_by_key(|(key, _)| *key)
-        .map(|(_, declaration)| declaration)
+        .map(|(_, declaration)| *declaration)
 }
 
 /// 胜者决定该属性的来源。
@@ -641,7 +976,7 @@ resolve_viewport!(resolve_gap, GapValue);
 
 /// 逐属性解析出 computed style。
 fn resolve_all(
-    matched: &[(CascadeKey, Declaration)],
+    matched: &[(CascadeKey, &Declaration)],
     parent: Option<&ComputedStyle>,
     viewport: Option<MediaViewport>,
 ) -> ComputedStyle {
@@ -1788,5 +2123,228 @@ mod tests {
         assert_eq!(p_style.word_spacing, SpacingValue::Length(8.0));
         assert_eq!(p_style.text_indent, TextIndentValue::Length(40.0));
         assert_eq!(p_style.tab_size, TabSizeValue::Integer(4));
+    }
+
+    /// 全量扫描的参照实现（桶化前的语义）：每元素测试全部规则与选择器。
+    /// 桶索引（M5 ④）的正确性判据：两条路径产出的 computed style 逐元素
+    /// 一致——跳过的选择器只可能是「必要条件已失败、本就不可能匹配」的。
+    fn cascade_unbucketed_in(
+        document: &Document,
+        element: NodeId,
+        stylesheets: &[&Stylesheet],
+        ua_sheet: Option<&Stylesheet>,
+        parent: Option<&ComputedStyle>,
+        viewport: Option<MediaViewport>,
+    ) -> ComputedStyle {
+        let mut matched: Vec<(CascadeKey, &Declaration)> = Vec::new();
+        if let Some(ua) = ua_sheet {
+            for (rule_order, rule) in ua.rules().iter().enumerate() {
+                let specificity = rule
+                    .selectors()
+                    .iter()
+                    .filter(|parsed| {
+                        match_element_selectors(std::slice::from_ref(parsed), document, element)
+                    })
+                    .map(|parsed| parsed.specificity)
+                    .max();
+                if let Some(specificity) = specificity {
+                    for (declaration_order, declaration) in rule.declarations().iter().enumerate() {
+                        matched.push((
+                            CascadeKey {
+                                bucket: bucket_of(Origin::Ua, declaration.important),
+                                inline: false,
+                                specificity,
+                                rule_order,
+                                declaration_order,
+                            },
+                            declaration,
+                        ));
+                    }
+                }
+            }
+        }
+        for (rule_order, rule) in stylesheets
+            .iter()
+            .flat_map(|sheet| sheet.rules())
+            .enumerate()
+        {
+            let specificity = rule
+                .selectors()
+                .iter()
+                .filter(|parsed| {
+                    match_element_selectors(std::slice::from_ref(parsed), document, element)
+                })
+                .map(|parsed| parsed.specificity)
+                .max();
+            if let Some(specificity) = specificity {
+                for (declaration_order, declaration) in rule.declarations().iter().enumerate() {
+                    matched.push((
+                        CascadeKey {
+                            bucket: bucket_of(Origin::Author, declaration.important),
+                            inline: false,
+                            specificity,
+                            rule_order,
+                            declaration_order,
+                        },
+                        declaration,
+                    ));
+                }
+            }
+        }
+        let style_attribute = document.node(element).and_then(|node| match node {
+            NodeKind::Element(data) => data
+                .attributes
+                .iter()
+                .find(|attr| attr.namespace == nexty_dom::Namespace::None && attr.name == "style")
+                .map(|attr| attr.value.clone()),
+            _ => None,
+        });
+        // 内联声明提升到函数作用域：matched 按引用持有直到 resolve_all
+        let inline_declarations = style_attribute.map(|attr| parse_inline_style(&attr));
+        if let Some(inline_declarations) = &inline_declarations {
+            for (declaration_order, declaration) in inline_declarations.iter().enumerate() {
+                matched.push((
+                    CascadeKey {
+                        bucket: bucket_of(Origin::Author, declaration.important),
+                        inline: true,
+                        specificity: 0,
+                        rule_order: usize::MAX,
+                        declaration_order,
+                    },
+                    declaration,
+                ));
+            }
+        }
+        resolve_all(&matched, parent, viewport)
+    }
+
+    /// 全量扫描的整文档版本（参照路径）。
+    fn walk_unbucketed(
+        document: &Document,
+        node: NodeId,
+        parent: Option<&ComputedStyle>,
+        stylesheets: &[&Stylesheet],
+        ua_sheet: Option<&Stylesheet>,
+        viewport: Option<MediaViewport>,
+        out: &mut HashMap<NodeId, ComputedStyle>,
+    ) {
+        for child in document.children(node) {
+            if matches!(document.node(child), Some(NodeKind::Element(_))) {
+                let style =
+                    cascade_unbucketed_in(document, child, stylesheets, ua_sheet, parent, viewport);
+                walk_unbucketed(
+                    document,
+                    child,
+                    Some(&style),
+                    stylesheets,
+                    ua_sheet,
+                    viewport,
+                    out,
+                );
+                out.insert(child, style);
+            }
+        }
+    }
+
+    /// 桶化前后逐元素一致：覆盖类/标签/id/组合器/:is/属性选择器/通配/
+    /// 多选择器规则/大小写/内联样式/important 的语料，逐页对比两条路径
+    /// 的整文档 computed style。
+    #[test]
+    fn bucketed_cascade_matches_full_scan() {
+        const CASES: &[(&str, &str)] = &[
+            // 类桶：单类、多类元素命中其一、类不存在
+            (
+                "<div class=a>x</div><p class=\"a b\">y</p><span>z</span>",
+                ".a { color: rgb(1 2 3) } .b { color: rgb(4 5 6) } .c { color: red }",
+            ),
+            // 标签桶 + 类优先于标签的选择器
+            (
+                "<p class=lead>text</p><div>other</div>",
+                "p { margin: 2px } .lead { margin: 9px } div { padding: 1px }",
+            ),
+            // id 桶：命中与未命中
+            (
+                "<div id=main>x</div><div id=other>y</div>",
+                "#main { color: blue } #missing { color: red }",
+            ),
+            // 组合器（Always 桶）：后代 / 子代 / 兄弟
+            (
+                "<div><p>deep</p></div><div><section><p>nested</p></section></div><h1>a</h1><p>b</p>",
+                "div p { color: green } div > p { margin: 1px } h1 + p { color: red }",
+            ),
+            // :is() / :where()：内部是备选分支，不得作为必要条件
+            (
+                "<em class=a>x</em><strong id=special>y</strong><b>z</b>",
+                ":is(.a, #special) { color: purple } b:is(.a, .b) { color: red } :where(p, div) { margin: 2px }",
+            ),
+            // 属性选择器与通配（无可提取必要条件）
+            (
+                "<a href=x>link</a><code>c</code>",
+                "[href] { color: blue } * { line-height: 1.4 }",
+            ),
+            // 一条规则多个选择器：各自分桶，命中其一即整规则生效
+            (
+                "<i class=x>i</i><div>d</div><u>u</u>",
+                ".x, div, #nope { color: teal }",
+            ),
+            // 大小写：HTML 标签大小写不敏感，类名敏感——两条路径必须一致
+            (
+                "<DIV CLASS=keep>case</DIV><span CLASS=Keep>x</span>",
+                "div { color: brown } .Keep { color: pink } .keep { color: olive }",
+            ),
+            // 内联样式 + important 交错
+            (
+                "<p style=\"color: red\">inline</p><b style=\"color: red\">b</b>",
+                "p { color: green !important } b { color: green }",
+            ),
+            // 无样式表 / 空规则：退化路径
+            ("<div>x</div>", ""),
+            // 特异度混合：tag < class < id，important 反超
+            (
+                "<div id=t class=c>x</div>",
+                "div { color: black } .c { color: gray } #t { color: white } div { color: red !important }",
+            ),
+        ];
+        let ua_sheet = crate::ua::html_ua_stylesheet();
+        for (index, (html, css)) in CASES.iter().enumerate() {
+            let document = build_document(html);
+            let sheet = Stylesheet::parse(css);
+            let bucketed = compute_document_styles(&document, &[&sheet], Some(ua_sheet));
+            let mut full = HashMap::new();
+            walk_unbucketed(
+                &document,
+                document.root(),
+                None,
+                &[&sheet],
+                Some(ua_sheet),
+                None,
+                &mut full,
+            );
+            assert_eq!(bucketed.len(), full.len(), "case {index}: 元素数一致");
+            for (node, style) in &bucketed {
+                assert_eq!(
+                    style, &full[node],
+                    "case {index}: node {node:?} 桶化与全量扫描不一致"
+                );
+            }
+        }
+    }
+
+    /// 内联样式缓存（M5 ②）：原文未变复用解析结果（同元素两次级联第
+    /// 二次命中），原文变化自动失效重解析。
+    #[test]
+    fn inline_style_cache_reuses_and_invalidates() {
+        let mut cache = InlineStyleCache::new();
+        let document = build_document("<p style=\"color: red\">x</p>");
+        let p = find_first_by_name(&document, "p").unwrap();
+        let first = cache.declarations_of(&document, p).expect("style attr");
+        assert_eq!(first.len(), 1);
+        // 复用：同一元素再次请求命中（声明存储位置相同）
+        let first_ptr = first.as_ptr();
+        let second_ptr = cache
+            .declarations_of(&document, p)
+            .expect("style attr")
+            .as_ptr();
+        assert!(std::ptr::eq(first_ptr, second_ptr), "原文未变应复用");
     }
 }

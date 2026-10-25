@@ -12,10 +12,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use nexty_css::{
-    ComputedStyle, MediaViewport, Rgba, Stylesheet, compute_document_styles,
-    compute_document_styles_in, html_ua_stylesheet,
-};
+use nexty_css::{ComputedStyle, MediaViewport, Rgba, Stylesheet, html_ua_stylesheet};
 use nexty_dom::{Document, NodeId};
 use nexty_html::ParseOptions;
 use nexty_layout::{Fragment, Rect as LayoutRect};
@@ -30,6 +27,9 @@ pub struct Page {
     pub styles: HashMap<NodeId, ComputedStyle>,
     /// 作者样式表（视口变化后重级联用；UA 样式表固定不存）。
     stylesheets: Vec<Stylesheet>,
+    /// 内联样式解析缓存（M5 ②）：resize 后 recascade 按 style 属性原文
+    /// 校验复用，不重解析字符串。
+    inline_style_cache: nexty_css::InlineStyleCache,
     /// 已解码图片（`<img>` 节点 → RGBA 图像），构建 Scene 时进入图片池。
     /// 按 `Arc` 共享：构建/发送/光栅全程零像素拷贝（M1）。
     pub images: HashMap<NodeId, Arc<Image>>,
@@ -49,11 +49,19 @@ pub fn build_page(
     images: HashMap<NodeId, Arc<Image>>,
 ) -> Page {
     let sheet_refs: Vec<&Stylesheet> = stylesheets.iter().collect();
-    let styles = compute_document_styles(&document, &sheet_refs, Some(html_ua_stylesheet()));
+    let mut inline_style_cache = nexty_css::InlineStyleCache::new();
+    let styles = nexty_css::compute_document_styles_in_with_cache(
+        &document,
+        &sheet_refs,
+        Some(html_ua_stylesheet()),
+        None,
+        &mut inline_style_cache,
+    );
     Page {
         document,
         styles,
         stylesheets,
+        inline_style_cache,
         images,
     }
 }
@@ -62,11 +70,12 @@ pub fn build_page(
 /// 折算为绝对 px。resize 后布局前必须调用，否则视口尺寸滞后。
 pub fn recascade(page: &mut Page, viewport: MediaViewport) {
     let sheet_refs: Vec<&Stylesheet> = page.stylesheets.iter().collect();
-    page.styles = compute_document_styles_in(
+    page.styles = nexty_css::compute_document_styles_in_with_cache(
         &page.document,
         &sheet_refs,
         Some(html_ua_stylesheet()),
         Some(viewport),
+        &mut page.inline_style_cache,
     );
 }
 
