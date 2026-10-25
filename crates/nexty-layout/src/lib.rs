@@ -35,13 +35,14 @@
 
 #![forbid(unsafe_code)]
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use nexty_css::ComputedStyle;
 #[cfg(feature = "block")]
 use nexty_dom::NodeKind;
 use nexty_dom::{Document, NodeId};
-use nexty_text::TextShaper;
+use nexty_text::{FontMetrics, TextShaper, TextStyle};
 
 #[cfg(feature = "block")]
 mod block;
@@ -66,6 +67,80 @@ pub use inline::{
     min_content_width, split_spans,
 };
 
+/// `MetricsCache` 的键：`TextStyle` 含 f32 字号（无 `Eq`/`Hash`），按位
+/// 转换作键。同值 f32 位型相同；字号在 computed 阶段已数值卫生，位型
+/// 稳定。
+/// 以下三者仅被 block 管线（⇒ inline）消费，裁剪配置整体抑制 dead_code。
+#[cfg_attr(not(feature = "block"), allow(dead_code))]
+#[derive(PartialEq, Eq, Hash)]
+struct MetricsKey {
+    families: Vec<String>,
+    size_bits: u32,
+}
+
+#[cfg_attr(not(feature = "block"), allow(dead_code))]
+impl MetricsKey {
+    fn of(style: &TextStyle) -> Self {
+        Self {
+            families: style.families.clone(),
+            size_bits: style.size.to_bits(),
+        }
+    }
+}
+
+/// 布局级字体度量缓存：`TextStyle → FontMetrics`（H4）。
+///
+/// `metrics` 的探针文本固定（NBSP），同一 `TextStyle` 的结果必然相同，
+/// 故整棵树共享一份表：每个不同样式整次布局只整形一次探针。没有它，
+/// `build_lines` 的 strut 与每行盒组装按 run 节点 × measure 档位重复
+/// 调用（同一页 2,000 个同样式段落 = 2,000+ 次探针整形）。
+#[cfg_attr(not(feature = "block"), allow(dead_code))]
+#[derive(Default)]
+pub(crate) struct MetricsCache {
+    map: RefCell<HashMap<MetricsKey, FontMetrics>>,
+}
+
+#[cfg_attr(not(feature = "block"), allow(dead_code))]
+impl MetricsCache {
+    /// 取字体度量：命中缓存直接返回，未命中整形一次探针并入库。
+    ///
+    /// 整形失败按零度量入库（与原先每次失败时的降级一致：探针文本固定，
+    /// 同样式失败结果也必然相同）。
+    pub(crate) fn metrics(&self, shaper: &dyn TextShaper, style: &TextStyle) -> FontMetrics {
+        let key = MetricsKey::of(style);
+        let mut map = self.map.borrow_mut();
+        if let Some(metrics) = map.get(&key) {
+            return *metrics;
+        }
+        let metrics = shaper.metrics(style).unwrap_or(FontMetrics {
+            ascent: 0.0,
+            descent: 0.0,
+            line_height: 0.0,
+        });
+        map.insert(key, metrics);
+        metrics
+    }
+}
+
+/// 整形上下文：shaper 与布局级度量缓存的成对引用（H4）。
+///
+/// 度量缓存 miss 时需要 shaper 补测一次探针，二者总是成对出现；合并后
+/// `build_lines` 少一个参数，行盒组装侧经 [`ShapingContext::metrics`]
+/// 查表。
+#[cfg_attr(not(feature = "block"), allow(dead_code))]
+pub(crate) struct ShapingContext<'a> {
+    pub shaper: &'a dyn TextShaper,
+    pub metrics: &'a MetricsCache,
+}
+
+#[cfg_attr(not(feature = "block"), allow(dead_code))]
+impl ShapingContext<'_> {
+    /// 一个 TextStyle 下的字体度量（布局级缓存，同一样式只整形一次探针）。
+    pub(crate) fn metrics(&self, style: &TextStyle) -> FontMetrics {
+        self.metrics.metrics(self.shaper, style)
+    }
+}
+
 /// 布局上下文：整棵树共享的输入引用。
 ///
 /// 由 `layout_document` 构造，`block` / `inline` / `tree_build` 共用；feature
@@ -77,6 +152,8 @@ pub(crate) struct Context<'a> {
     pub styles: &'a HashMap<NodeId, ComputedStyle>,
     /// 已解码图片的自然尺寸（node → 像素宽高，CSS px）。
     pub image_sizes: &'a HashMap<NodeId, (f32, f32)>,
+    /// 布局级字体度量缓存（H4：metrics 调用数 ≤ 不同 TextStyle 数）。
+    pub metrics: MetricsCache,
 }
 
 /// 布局整份文档，返回根元素（`<html>`）的片段树。
@@ -105,6 +182,7 @@ pub fn layout_document(
         shaper,
         styles,
         image_sizes,
+        metrics: MetricsCache::default(),
     };
     Some(block::layout_root(&ctx, root, viewport_width))
 }

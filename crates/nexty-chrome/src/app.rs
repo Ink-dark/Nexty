@@ -22,7 +22,7 @@ use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::history::History;
 use crate::pipeline::{self, HoverKind, Page};
-use crate::render::RenderThread;
+use crate::render::{RenderError, RenderThread};
 use crate::scrollbar::{self, ScrollGeometry, Scrollbar, ScrollbarHit};
 use crate::selection::{self, Selection};
 use crate::ui::{self, AddressBar, BAR_HEIGHT, BarCommand, CaretDirection, UiEvent};
@@ -55,12 +55,20 @@ impl std::error::Error for AppError {}
 
 /// 后台抓取完成后经事件代理送回的载荷。
 enum BackgroundEvent {
-    /// 页面（含子资源：外链 CSS + 解码图片）就绪。
-    PageLoaded {
-        url: String,
-        /// 页面构建结果；错误携带用户可读信息。
-        result: Result<Page, String>,
-    },
+    /// 页面（含子资源：外链 CSS + 解码图片）就绪。载荷装箱（Page 较大，
+    /// 与单元变体并列时避免枚举整体膨胀）。
+    PageLoaded(Box<PageLoadedPayload>),
+    /// 渲染线程完成一份光栅作业（异步呈现：主线程发请求即返回，不阻塞
+    /// 等待——巨页帧可达数十秒，阻塞会让窗口进入系统「无响应」状态并
+    /// 触发 WM_PAINT/WM_SIZE 重绘风暴）。
+    FrameReady,
+}
+
+/// [`BackgroundEvent::PageLoaded`] 的载荷。
+struct PageLoadedPayload {
+    url: String,
+    /// 页面构建结果；错误携带用户可读信息。
+    result: Result<Page, String>,
 }
 
 /// 启动浏览器窗口。阻塞直至窗口关闭。
@@ -89,6 +97,9 @@ struct Gpu {
     pipeline_rgba: wgpu::RenderPipeline,
     pipeline_bgra: wgpu::RenderPipeline,
     texture: Option<(wgpu::Texture, [u32; 2])>,
+    /// 行对齐 staging 缓冲（M6）：键 (宽, 高, padded 步幅) 命中时复用
+    /// 分配，不每帧重建。
+    staging_cache: Option<((u32, u32, u32), Vec<u8>)>,
 }
 
 /// 页面左键按下手势（链接目标在按下时解析，释放且未拖动才导航）。
@@ -135,6 +146,24 @@ struct BrowserApp {
     cursor: (f32, f32),
     /// 当前系统光标种类（仅在变化时调用 `set_cursor`）。
     hover: HoverKind,
+    /// 页面坐标系显示列表缓存（M6）：滚动复用，导航/重排/选区失效。
+    scene_cache: pipeline::SceneCache,
+    /// 页面代次：每次重排（导航 / resize 后 relayout）+1，作缓存键。
+    page_generation: u64,
+    /// resize 合帧器（M6）：连发 Resized 折叠到下一次重绘。
+    resize_coalescer: pipeline::ResizeCoalescer,
+    /// 最近一次 Resized 的物理尺寸（去重：Windows 对无响应窗口的 ghost
+    /// 恢复会重发同尺寸 WM_SIZE，逐事件全管线会把长帧变成重排循环）。
+    last_resize: Option<(u32, u32)>,
+    /// 渲染结果通道（异步呈现）：渲染线程完成后经 [`BackgroundEvent::FrameReady`]
+    /// 唤醒主线程收取。
+    render_results: Option<std::sync::mpsc::Receiver<Result<Pixmap, RenderError>>>,
+    /// 渲染结果的发送端（每次请求随作业发一份克隆给渲染线程）。
+    render_reply: Option<std::sync::mpsc::Sender<Result<Pixmap, RenderError>>>,
+    /// 是否有一份渲染作业在途（期间到来的重绘请求只置脏，出结果后补一帧）。
+    render_in_flight: bool,
+    /// 在途期间有交互请求了新帧：出结果并上屏后再排一帧取最新状态。
+    frame_dirty: bool,
 }
 
 impl BrowserApp {
@@ -162,6 +191,14 @@ impl BrowserApp {
             scroll_y: 0.0,
             cursor: (0.0, 0.0),
             hover: HoverKind::Default,
+            scene_cache: pipeline::SceneCache::new(),
+            page_generation: 0,
+            resize_coalescer: pipeline::ResizeCoalescer::default(),
+            last_resize: None,
+            render_results: None,
+            render_reply: None,
+            render_in_flight: false,
+            frame_dirty: false,
         }
     }
 
@@ -178,9 +215,18 @@ impl BrowserApp {
             }
         };
         self.gpu = Some(gpu);
-        self.renderer = Some(RenderThread::spawn(Arc::new(
-            nexty_paint::VelloCpuRasterizer::new(),
-        )));
+        // 渲染结果经通道回主线程，线程完成时以事件代理唤醒事件循环
+        //（异步呈现，巨页帧不阻塞主线程）
+        let (render_reply, render_receiver) = std::sync::mpsc::channel();
+        self.render_results = Some(render_receiver);
+        self.render_reply = Some(render_reply);
+        let proxy = self.proxy.clone();
+        self.renderer = Some(RenderThread::spawn(
+            Arc::new(nexty_paint::VelloCpuRasterizer::new()),
+            Arc::new(move || {
+                let _ = proxy.send_event(BackgroundEvent::FrameReady);
+            }),
+        ));
         // 启动路径用 fail-fast：TLS 后端不可用时浏览器本就无法工作，
         // 带着半初始化的状态继续跑不如立刻退出（渲染路径才需要降级）。
         // 整请求超时 30s：真实站点挂起时不无限占住加载状态。
@@ -223,6 +269,25 @@ impl BrowserApp {
     /// 必须取新视口。`reset_scroll` 为 false 时保留滚动量（resize 重排
     /// 场景），但按新视口与内容高重新 clamp。
     fn set_page(&mut self, page: Page, reset_scroll: bool) {
+        self.root = None;
+        self.text_map = None;
+        self.page = Some(page);
+        // 导航后的第一帧是全新布局：缓存作废由代次推进表达
+        self.relayout();
+        if reset_scroll {
+            self.scroll_y = 0.0;
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// 按当前视口重级联 + 重排当前页面（M6：resize 合帧后每帧至多一次）。
+    ///
+    /// 由 [`Self::set_page`]（导航）与 `RedrawRequested`（resize 合帧）共用：
+    /// 视口单位折算、文本地图重建、选区端点重解析、滚动 clamp、代次推进
+    /// （使场景缓存失效）都在这里。
+    fn relayout(&mut self) {
         let (viewport_width, viewport_height) = self
             .window
             .as_ref()
@@ -231,7 +296,9 @@ impl BrowserApp {
                 (size.width as f32, size.height as f32)
             })
             .unwrap_or((800.0, 600.0));
-        let mut page = page;
+        let Some(mut page) = self.page.take() else {
+            return;
+        };
         pipeline::recascade(
             &mut page,
             nexty_css::MediaViewport {
@@ -256,13 +323,10 @@ impl BrowserApp {
                 None => self.selection.clear(),
             }
         }
-        if reset_scroll {
-            self.scroll_y = 0.0;
-        } else if let Some(geometry) = self.geometry() {
+        // 新布局结果：页面坐标系场景整体重建（缓存失效）
+        self.page_generation = self.page_generation.wrapping_add(1);
+        if let Some(geometry) = self.geometry() {
             self.scroll_y = scrollbar::clamp_scroll(self.scroll_y, geometry.max_scroll());
-        }
-        if let Some(window) = &self.window {
-            window.request_redraw();
         }
     }
 
@@ -486,7 +550,11 @@ impl BrowserApp {
                     Ok(response) => Err(format!("HTTP {}", response.status)),
                     Err(error) => Err(load_error_text(&error).to_owned()),
                 };
-                let _ = proxy.send_event(BackgroundEvent::PageLoaded { url, result });
+                let _ =
+                    proxy.send_event(BackgroundEvent::PageLoaded(Box::new(PageLoadedPayload {
+                        url,
+                        result,
+                    })));
             })
             .expect("spawn fetch thread");
     }
@@ -519,11 +587,27 @@ impl BrowserApp {
         }
     }
 
-    /// 一帧：合成显示列表并渲染上屏。
+    /// 一帧：合成显示列表并发给渲染线程（异步，不等待）。
+    ///
+    /// 巨页帧的光栅可达数十秒：主线程若阻塞等待会进入系统「无响应」状态，
+    /// winit 0.30 把 WM_PAINT 直接映射为 RedrawRequested，配合系统的区域
+    /// 失效就形成重绘风暴——因此光栅在渲染线程执行，完成后经
+    /// [`BackgroundEvent::FrameReady`] 唤醒上屏。在途期间的请求只置
+    /// `frame_dirty`，出结果补一帧取最新状态（帧合流）。
     fn redraw(&mut self) {
-        let Some(window) = &self.window else {
+        if self.window.is_none() {
             return;
-        };
+        }
+        // 在途合流：不叠加作业，出结果后补一帧
+        if self.render_in_flight {
+            self.frame_dirty = true;
+            return;
+        }
+        // M6 合帧：折叠的 resize 在这里执行一次重排（每帧至多一次）
+        if self.resize_coalescer.take() && self.page.is_some() {
+            self.relayout();
+        }
+        let window = self.window.as_ref().expect("window checked");
         let size = window.inner_size();
         let viewport = Size {
             width: size.width,
@@ -546,35 +630,42 @@ impl BrowserApp {
         let thumb = geometry.thumb(self.scroll_y);
         let track = geometry.track();
 
-        // 页面按滚动偏移重建显示列表（内容从工具带下方开始）
+        // 页面坐标系场景缓存（M6）：滚动只平移 origin，不重建显示列表；
+        // 高亮集合变化（选区）由键失配自然失效重建
         let highlights = match &self.text_map {
             Some(map) if !self.selection.is_empty() => self.selection.rects(map),
             _ => Vec::new(),
         };
-        let mut scene = match (&self.page, &self.root) {
-            (Some(page), Some(root)) => pipeline::build_scene_at_with_highlights(
-                page,
-                root,
-                0.0,
-                BAR_HEIGHT - self.scroll_y,
-                &highlights,
-            ),
-            _ => Scene::default(),
-        };
         // 画布底色：pipeline 的画布保持透明，直接 blit 会把透明像素交给
         // surface（alpha_mode Auto），在部分后端表现为黑屏/花屏。先铺不透明白底。
-        scene.commands.insert(
-            0,
-            nexty_paint::Command::FillRect {
-                rect: nexty_paint::Rect {
-                    x: 0.0,
-                    y: 0.0,
-                    width,
-                    height,
-                },
-                color: nexty_paint::Color::opaque(0xff, 0xff, 0xff),
+        let white_background = nexty_paint::Command::FillRect {
+            rect: nexty_paint::Rect {
+                x: 0.0,
+                y: 0.0,
+                width,
+                height,
             },
-        );
+            color: nexty_paint::Color::opaque(0xff, 0xff, 0xff),
+        };
+        let mut scene = match (&self.page, &self.root) {
+            (Some(page), Some(root)) => {
+                let page_scene = self.scene_cache.scene_for(
+                    self.page_generation,
+                    page,
+                    root,
+                    width,
+                    &highlights,
+                );
+                let mut scene = page_scene.translated(0.0, BAR_HEIGHT - self.scroll_y);
+                scene.commands.insert(0, white_background);
+                scene
+            }
+            _ => {
+                let mut scene = Scene::default();
+                scene.commands.push(white_background);
+                scene
+            }
+        };
         // 滚动条：轨道 + thumb，可拖拽（悬停/拖拽时加深）
         if let (Some(track), Some(thumb)) = (track, thumb) {
             scene.commands.push(nexty_paint::Command::FillRect {
@@ -601,13 +692,52 @@ impl BrowserApp {
         let Some(renderer) = &self.renderer else {
             return;
         };
-        match renderer.render(&scene, viewport) {
+        let Some(reply) = self.render_reply.as_ref() else {
+            return;
+        };
+        self.render_in_flight = true;
+        if let Err(scene) = renderer.request(scene, viewport, reply.clone()) {
+            // 渲染线程已终止：就地降级为灰屏，不留在途状态
+            self.render_in_flight = false;
+            eprintln!("render thread terminated");
+            gpu.clear(window, [0.6, 0.6, 0.6, 1.0]);
+            drop(scene);
+        }
+    }
+
+    /// 收取渲染线程完成的光栅结果并上屏（[`BackgroundEvent::FrameReady`]）。
+    ///
+    /// 通道内可能积压多份结果（快速交互连发）：逐份排空、只上屏最后一份
+    /// ——中间帧的画面立即被更新的覆盖，present 只发生一次。
+    fn present_finished_frames(&mut self) {
+        let Some(results) = &self.render_results else {
+            return;
+        };
+        let mut latest: Option<Result<Pixmap, RenderError>> = None;
+        while let Ok(result) = results.try_recv() {
+            latest = Some(result);
+        }
+        self.render_in_flight = false;
+        let Some(result) = latest else {
+            return;
+        };
+        let Some(window) = &self.window else {
+            return;
+        };
+        let Some(gpu) = &mut self.gpu else {
+            return;
+        };
+        match result {
             Ok(pixmap) => gpu.present(&pixmap, window),
             Err(error) => {
                 // 渲染失败不拖垮主进程：清屏为灰色并上报
                 eprintln!("render failed: {error}");
                 gpu.clear(window, [0.6, 0.6, 0.6, 1.0]);
             }
+        }
+        if self.frame_dirty {
+            self.frame_dirty = false;
+            window.request_redraw();
         }
     }
 }
@@ -632,8 +762,11 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: BackgroundEvent) {
-        let BackgroundEvent::PageLoaded { url, result } = event;
-        self.page_loaded(url, result);
+        match event {
+            BackgroundEvent::PageLoaded(payload) => self.page_loaded(payload.url, payload.result),
+            // 渲染线程完成：上屏最新一帧，按需补排帧
+            BackgroundEvent::FrameReady => self.present_finished_frames(),
+        }
     }
 
     fn window_event(
@@ -644,13 +777,19 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
     ) {
         match event {
             WindowEvent::Resized(size) => {
+                // 同尺寸去重：长帧阻塞后 Windows 的 ghost 恢复会重发同尺寸
+                // WM_SIZE；不滤掉就变成「帧 → 重排 → 帧」的无限循环
+                if self.last_resize == Some((size.width, size.height)) {
+                    return;
+                }
+                self.last_resize = Some((size.width, size.height));
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(size.width, size.height);
                 }
-                // 按新视口宽重排（保留滚动量，set_page 内重新 clamp）
-                if let Some(page) = self.page.take() {
-                    self.set_page(page, false);
-                }
+                // M6 合帧：只置脏 + 请求重绘，重级联/重排合并到下一次
+                // RedrawRequested 执行一次（拖动边缘连发事件时管线每帧
+                // 至多跑一遍）
+                self.resize_coalescer.on_resized();
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -1005,6 +1144,7 @@ impl Gpu {
             pipeline_rgba,
             pipeline_bgra,
             texture: None,
+            staging_cache: None,
         })
     }
 
@@ -1065,8 +1205,16 @@ impl Gpu {
         if padded == unpadded {
             self.upload_aligned(&texture, &pixmap.data, unpadded, width, height);
         } else {
-            let staging = pad_rows(&pixmap.data, width, height, padded);
+            // staging 缓冲按 (宽, 高, 步幅) 复用（M6）：take → 填充 → 上传
+            // → 还回，避免每帧重新分配整屏对齐缓冲
+            let key = (width, height, padded);
+            let mut staging = match self.staging_cache.take() {
+                Some((cached_key, buffer)) if cached_key == key => buffer,
+                _ => Vec::new(),
+            };
+            pad_rows_into(&mut staging, &pixmap.data, width, height, padded);
             self.upload_aligned(&texture, &staging, padded, width, height);
+            self.staging_cache = Some((key, staging));
         }
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1211,15 +1359,26 @@ impl Gpu {
     }
 }
 
-/// 把紧凑行优先的像素数据按行padding 到 256 字节对齐。
+/// 把紧凑行优先的像素数据按行padding 到 256 字节对齐（M6 起仅测试用，
+/// 生产路径走 [`pad_rows_into`] + staging 缓冲复用）。
 ///
 /// WebGPU 的 `write_texture` 要求 `bytes_per_row` 为 256 的倍数，而 Pixmap
 /// 的行跨度是 `4 * width`。本函数为每行尾部补零，使行跨度变为
 /// `padded`。padding 字节的内容无关紧要（着色器只读实际宽度内的像素），
 /// 但必须是**每行独立补齐**而非只在末尾补一次。
+#[cfg(test)]
 fn pad_rows(data: &[u8], width: u32, height: u32, padded: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    pad_rows_into(&mut out, data, width, height, padded);
+    out
+}
+
+/// [`pad_rows`] 的写入变体（M6）：复用调用方缓冲的容量——staging 缓冲
+/// 按 (宽, 高, 步幅) 缓存后每帧只重填内容，不再整屏重新分配。
+fn pad_rows_into(out: &mut Vec<u8>, data: &[u8], width: u32, height: u32, padded: u32) {
     let unpadded = 4 * width;
-    let mut out = Vec::with_capacity(padded as usize * height as usize);
+    out.clear();
+    out.reserve(padded as usize * height as usize);
     for y in 0..height as usize {
         let start = y * unpadded as usize;
         let end = start + unpadded as usize;
@@ -1234,7 +1393,6 @@ fn pad_rows(data: &[u8], width: u32, height: u32, padded: u32) -> Vec<u8> {
         // 行尾补到 256 对齐
         out.resize(y * padded as usize + padded as usize, 0);
     }
-    out
 }
 
 /// 传输失败 → 错误类别文本。

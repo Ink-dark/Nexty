@@ -1130,3 +1130,549 @@ fn huge_css_values_still_layout_finite() {
     );
     assert!(approx(div.border_box.y, 0.0), "margin-top 无效回落 0");
 }
+
+// ---- CSS Text 间距：letter-spacing / word-spacing（CSS Text 3 §8） ----
+
+#[test]
+fn letter_spacing_widens_line_by_internal_boundaries() {
+    // N 个字形簇的文本加字距 s：行净宽差 = (N−1)×s（行末簇的字距不计）
+    let (document, root) = layout("<body>abcd</body>", "", 400.0);
+    let plain = line_extent(&body(&document, &root).lines[0]).1;
+
+    let (document, root) = layout("<body>abcd</body>", "body { letter-spacing: 4px }", 400.0);
+    let spaced = line_extent(&body(&document, &root).lines[0]).1;
+    assert!(
+        approx(spaced - plain, 3.0 * 4.0),
+        "4 簇文本行净宽差 = 3×4px：{spaced} - {plain}"
+    );
+
+    // 负字距收窄且不 panic（字形可重叠）
+    let (document, root) = layout("<body>abcd</body>", "body { letter-spacing: -2px }", 400.0);
+    let narrow = line_extent(&body(&document, &root).lines[0]).1;
+    assert!(
+        approx(narrow - plain, -3.0 * 2.0),
+        "负字距按 (N−1)×|s| 收窄：{narrow} - {plain}"
+    );
+}
+
+#[test]
+fn letter_spacing_trailing_excluded_from_right_alignment() {
+    // 右对齐用净宽：行末字距不占位，行尾贴内容盒右缘
+    let (document, root) = layout(
+        "<body>abcd</body>",
+        "body { text-align: right; letter-spacing: 4px }",
+        400.0,
+    );
+    let (first, end) = line_extent(&body(&document, &root).lines[0]);
+    assert!(approx(end, 400.0), "行尾贴右缘（end={end}）");
+    let plain_width = {
+        let (document, root) = layout("<body>abcd</body>", "", 400.0);
+        line_extent(&body(&document, &root).lines[0]).1
+    };
+    assert!(
+        approx(first, 400.0 - plain_width - 3.0 * 4.0),
+        "行首 x = 可用宽 − 净宽（first={first}）"
+    );
+}
+
+#[test]
+fn word_spacing_widens_single_line_by_separator_count() {
+    let (document, root) = layout("<body>a b c</body>", "", 400.0);
+    let plain = line_extent(&body(&document, &root).lines[0]).1;
+
+    let (document, root) = layout("<body>a b c</body>", "body { word-spacing: 8px }", 400.0);
+    let spaced = line_extent(&body(&document, &root).lines[0]).1;
+    assert!(
+        approx(spaced - plain, 2.0 * 8.0),
+        "两个分隔符各 +8px：{spaced} - {plain}"
+    );
+}
+
+#[test]
+fn word_spacing_separators_count_into_narrow_measurement() {
+    // width: 0 逐 span 成行 = 最窄测量路径：每个分隔符落在行尾仍占宽
+    //（break-spaces 行尾空白不裁剪）→ 行净宽差合计 = 8px × 分隔符数
+    let (document, root) = layout(
+        "<div style=\"width: 0; white-space: break-spaces\">a b c</div>",
+        "",
+        400.0,
+    );
+    let div = find(&document, &root, "div").expect("div fragment");
+    let plain: Vec<f32> = div.lines.iter().map(|line| line_extent(line).1).collect();
+    assert_eq!(plain.len(), 3, "逐词成行");
+
+    let (document, root) = layout(
+        "<div style=\"width: 0; white-space: break-spaces; word-spacing: 8px\">a b c</div>",
+        "",
+        400.0,
+    );
+    let div = find(&document, &root, "div").expect("div fragment");
+    let spaced: Vec<f32> = div.lines.iter().map(|line| line_extent(line).1).collect();
+    assert_eq!(spaced.len(), 3);
+    let diff: f32 = spaced.iter().zip(&plain).map(|(s, p)| s - p).sum();
+    assert!(approx(diff, 2.0 * 8.0), "行尾分隔符各 +8px：差合计 {diff}");
+}
+
+// ---- text-align: justify（CSS Text 3 §7，auto 方法的可执行近似） ----
+
+#[test]
+fn justify_flushes_non_last_lines_to_container_width() {
+    // 非末行右缘贴满容器（机会点均匀分配自由空间），末行左 ragged。
+    // 断言不依赖具体断行位置：任何非末 justify 行的行宽都 = 可用宽。
+    let (document, root) = layout(
+        "<body><p style=\"width: 100px; text-align: justify\">\
+         aaa bbb ccc ddd eee fff ggg hhh</p></body>",
+        "",
+        400.0,
+    );
+    let p = find(&document, &root, "p").expect("p fragment");
+    assert!(p.lines.len() >= 2, "文本折成多行");
+    for (index, line) in p.lines[..p.lines.len() - 1].iter().enumerate() {
+        let (_, end) = line_extent(line);
+        assert!(
+            approx(end, 100.0),
+            "第 {index} 行 justify 后右缘贴容器：{end}"
+        );
+    }
+    let (_, last_end) = line_extent(p.lines.last().expect("last line"));
+    assert!(last_end < 100.0, "末行不分配，左 ragged：{last_end}");
+}
+
+#[test]
+fn justify_line_without_opportunities_stays_left_and_finite() {
+    // 断点恰在唯一空格处：首行只剩 "aaaaaa"——无空格字形、无同块簇边界
+    //（单 span），机会点为 0 → 退化左对齐，与 left 布局逐字形相同
+    let lines_of = |align: &str| {
+        let (document, root) = layout(
+            &format!("<body><p style=\"width: 60px; {align}\">aaaaaa bbbbbb</p></body>"),
+            "",
+            400.0,
+        );
+        let p = find(&document, &root, "p").expect("p fragment");
+        p.lines
+            .iter()
+            .map(|line| {
+                line.runs
+                    .iter()
+                    .flat_map(|run| {
+                        run.glyphs
+                            .iter()
+                            .map(|glyph| (glyph.x, glyph.advance))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+    let justified = lines_of("text-align: justify;");
+    let left = lines_of("");
+    assert_eq!(justified.len(), 2, "两词各自成行");
+    assert_eq!(justified, left, "无机会行退化左对齐（逐字形同构）");
+}
+
+#[test]
+fn justify_does_not_apply_to_pre_lines() {
+    // pre 无折叠空格无软折行：各行以硬断行结尾或为末行，不分配间距
+    let (document, root) = layout(
+        "<body><pre style=\"width: 400px; text-align: justify\">aaaa bbbb cccc\
+         \ndddd</pre></body>",
+        "",
+        400.0,
+    );
+    let pre = find(&document, &root, "pre").expect("pre fragment");
+    assert_eq!(pre.lines.len(), 2);
+    let (first, end) = line_extent(&pre.lines[0]);
+    assert!(approx(first, 0.0));
+    assert!(end < 300.0, "pre 行保持自然宽度，不拉伸：{end}");
+}
+
+#[test]
+fn justify_with_zero_free_space_matches_left_exactly() {
+    // 自由空间为 0（溢出行）：justify 与 left 的字形坐标逐个相同
+    let (document, root) = layout(
+        "<body><p style=\"width: 60px; text-align: justify\">aaaaaaaaaa bbbbbbbbbb</p></body>",
+        "",
+        400.0,
+    );
+    let justified: Vec<Vec<f32>> = find(&document, &root, "p")
+        .expect("p")
+        .lines
+        .iter()
+        .map(|line| {
+            line.runs
+                .iter()
+                .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.x).collect::<Vec<_>>())
+                .collect()
+        })
+        .collect();
+    let (document, root) = layout(
+        "<body><p style=\"width: 60px\">aaaaaaaaaa bbbbbbbbbb</p></body>",
+        "",
+        400.0,
+    );
+    let left: Vec<Vec<f32>> = find(&document, &root, "p")
+        .expect("p")
+        .lines
+        .iter()
+        .map(|line| {
+            line.runs
+                .iter()
+                .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.x).collect::<Vec<_>>())
+                .collect()
+        })
+        .collect();
+    assert_eq!(justified, left, "自由空间为 0 时与 left 逐字形同构");
+}
+
+#[test]
+fn justify_keeps_intrinsic_measurements() {
+    // measure 路径不分配间距：justify 与 left 的 min/max-content 相等
+    //（max-content 经 shrink-to-fit inline-block 宽度观察）
+    let widths = |align: &str| {
+        let (document, root) = layout(
+            &format!(
+                "<body><i style=\"display: inline-block; {align}\">\
+                 aaa bbb ccc ddd eee fff ggg hhh iii jjj</i></body>"
+            ),
+            "",
+            400.0,
+        );
+        let atomic = &body(&document, &root).lines[0].boxes[0];
+        atomic.border_box.width
+    };
+    let max_content_left = widths("");
+    let max_content_justify = widths("text-align: justify;");
+    assert!(
+        approx(max_content_left, max_content_justify),
+        "max-content 不受 justify 影响：{max_content_left} vs {max_content_justify}"
+    );
+
+    // min-content（width: 0 逐 span 成行）同样不受影响
+    let min_widths = |align: &str| {
+        let (document, root) = layout(
+            &format!("<body><div style=\"width: 0; {align}\">aaa bbb ccc</div></body>"),
+            "",
+            400.0,
+        );
+        find(&document, &root, "div")
+            .expect("div")
+            .lines
+            .iter()
+            .map(|line| line_extent(line).1)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(min_widths(""), min_widths("text-align: justify;"));
+}
+
+// ---- text-indent（CSS Text 3 §4） ----
+
+#[test]
+fn text_indent_shifts_first_line_only() {
+    let (document, root) = layout(
+        "<body><p style=\"width: 80px; text-indent: 40px\">aaa bbb ccc ddd</p></body>",
+        "",
+        400.0,
+    );
+    let p = find(&document, &root, "p").expect("p fragment");
+    assert!(p.lines.len() >= 2, "折成多行");
+    let first_x = p.lines[0].runs[0].glyphs[0].x;
+    let second_x = p.lines[1].runs[0].glyphs[0].x;
+    assert!(approx(first_x, 40.0), "首行缩进 40px：{first_x}");
+    assert!(approx(second_x, 0.0), "第二行不缩进：{second_x}");
+}
+
+#[test]
+fn text_indent_percentage_resolves_against_containing_block() {
+    // auto 宽 p 填满 body（内容宽 400）→ 10% = 40px
+    let (document, root) = layout(
+        "<body><p style=\"text-indent: 10%\">abc</p></body>",
+        "",
+        400.0,
+    );
+    let p = find(&document, &root, "p").expect("p fragment");
+    let first_x = p.lines[0].runs[0].glyphs[0].x;
+    assert!(approx(first_x, 40.0), "10% 按可用宽折算：{first_x}");
+
+    // 行盒的包含块 = 块容器自身内容盒：显式宽度元素按自身内容宽折算
+    //（与 Chromium 一致，Edge 实机对照 420px 宽 × 10% ≈ 42px）——200 × 10% = 20
+    let (document, root) = layout(
+        "<body><p style=\"width: 200px; text-indent: 10%\">abc</p></body>",
+        "",
+        400.0,
+    );
+    let p = find(&document, &root, "p").expect("p fragment");
+    let first_x = p.lines[0].runs[0].glyphs[0].x;
+    assert!(
+        approx(first_x, 20.0),
+        "显式宽度下按自身内容宽折算：{first_x}"
+    );
+}
+
+#[test]
+fn text_indent_applies_before_alignment() {
+    // center：先缩进后居中——文本在剩余空间 [40, 200] 内居中
+    let (document, root) = layout(
+        "<body><p style=\"width: 200px; text-indent: 40px; text-align: center\">abc</p></body>",
+        "",
+        400.0,
+    );
+    let p = find(&document, &root, "p").expect("p fragment");
+    let (first, end) = line_extent(&p.lines[0]);
+    let content = end - first;
+    assert!(
+        approx(first, 40.0 + (160.0 - content) / 2.0),
+        "缩进后在剩余空间居中：{first}"
+    );
+}
+
+#[test]
+fn text_indent_participates_in_justified_first_line() {
+    // justify：首行带缩进且右缘仍贴满容器（首行须有 2+ 个放置项才有机会点）
+    let (document, root) = layout(
+        "<body><p style=\"width: 100px; text-indent: 40px; text-align: justify\">\
+         aaa bbb ccc ddd</p></body>",
+        "",
+        400.0,
+    );
+    let p = find(&document, &root, "p").expect("p fragment");
+    assert!(p.lines.len() >= 2);
+    let first_x = p.lines[0].runs[0].glyphs[0].x;
+    let (_, end) = line_extent(&p.lines[0]);
+    assert!(approx(first_x, 40.0), "缩进保留：{first_x}");
+    assert!(approx(end, 100.0), "首行 justify 右缘贴满：{end}");
+}
+
+#[test]
+fn text_indent_excluded_from_intrinsic_sizes() {
+    // css-sizing：min/max-content 测量不含缩进（与 Chromium 一致）
+    let width_of = |indent: &str| {
+        let (document, root) = layout(
+            &format!(
+                "<body><i style=\"display: inline-block; {indent}\">\
+                 aaa bbb ccc ddd eee fff ggg hhh</i></body>"
+            ),
+            "",
+            400.0,
+        );
+        body(&document, &root).lines[0].boxes[0].border_box.width
+    };
+    let plain = width_of("");
+    let indented = width_of("text-indent: 40px;");
+    assert!(
+        approx(plain, indented),
+        "max-content 不含缩进：{plain} vs {indented}"
+    );
+
+    // min-content：容器压到 1px，inline-block 宽被 min-content 托底
+    //（AvailableSpace::MinContent 测量路径不含缩进）
+    let min_content_of = |indent: &str| {
+        let (document, root) = layout(
+            &format!(
+                "<body><div style=\"width: 1px\">\
+                 <i style=\"display: inline-block; {indent}\">aaa bbb ccc</i></div></body>"
+            ),
+            "",
+            400.0,
+        );
+        let div = find(&document, &root, "div").expect("div");
+        div.lines[0].boxes[0].border_box.width
+    };
+    let plain_min = min_content_of("");
+    let indented_min = min_content_of("text-indent: 40px;");
+    assert!(
+        approx(plain_min, indented_min),
+        "min-content 不含缩进：{plain_min} vs {indented_min}"
+    );
+}
+
+// ---- tab-size 与 pre-wrap 行尾悬挂（CSS Text 3 §5） ----
+
+/// pre 单行内全部字形的 (x, advance)。
+fn pre_glyphs(document: &Document, root: &Fragment) -> Vec<(f32, f32)> {
+    let pre = find(document, root, "pre").expect("pre fragment");
+    pre.lines[0]
+        .runs
+        .iter()
+        .flat_map(|run| {
+            run.glyphs
+                .iter()
+                .map(|glyph| (glyph.x, glyph.advance))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[test]
+fn tab_size_advances_to_next_stop() {
+    // a\tb（tab-size 4）：制表推进到 4 × 空格宽的下一整数倍 → b 在第 4 列
+    let (document, root) = layout("<pre>a\tb</pre>", "pre { tab-size: 4 }", 400.0);
+    let glyphs = pre_glyphs(&document, &root);
+    assert_eq!(glyphs.len(), 3, "a、制表、b 三个字形");
+
+    let (document, root) = layout("<pre>a b</pre>", "", 400.0);
+    let reference = pre_glyphs(&document, &root);
+    let space_advance = reference[1].1;
+    let (a_x, a_advance) = glyphs[0];
+    assert!(approx(a_x, 0.0));
+    assert!(
+        approx(glyphs[2].0, 4.0 * space_advance),
+        "b 推进到第 4 列：{} vs 4×{space_advance}",
+        glyphs[2].0
+    );
+    assert!(approx(a_advance, reference[0].1), "a 宽不受影响");
+}
+
+#[test]
+fn tab_size_zero_collapses_tab() {
+    let (document, root) = layout("<pre>a\tb</pre>", "pre { tab-size: 0 }", 400.0);
+    let glyphs = pre_glyphs(&document, &root);
+    assert_eq!(glyphs.len(), 3);
+    let (a_x, a_advance) = glyphs[0];
+    assert!(approx(glyphs[2].0, a_x + a_advance), "tab-size 0：制表零宽");
+}
+
+#[test]
+fn tab_size_length_form_uses_pixel_stops() {
+    // tab-size: 40px：制表推进到 40px 的下一整数倍
+    let (document, root) = layout("<pre>a\tb</pre>", "pre { tab-size: 40px }", 400.0);
+    let glyphs = pre_glyphs(&document, &root);
+    let (a_x, _) = glyphs[0];
+    assert!(
+        approx(glyphs[2].0, 40.0),
+        "b 推进到 40px 整数倍：{}",
+        glyphs[2].0
+    );
+    assert!(approx(a_x, 0.0));
+}
+
+#[test]
+fn tab_stops_accumulate_across_multiple_tabs() {
+    // a\t\tb：第一个制表到第 4 列，第二个从第 4 列到第 8 列
+    let (document, root) = layout("<pre>a\t\tb</pre>", "pre { tab-size: 4 }", 400.0);
+    let glyphs = pre_glyphs(&document, &root);
+    let (document, root) = layout("<pre>a b</pre>", "", 400.0);
+    let space_advance = pre_glyphs(&document, &root)[1].1;
+    let b_x = glyphs.last().expect("b glyph").0;
+    assert!(approx(b_x, 8.0 * space_advance), "b 推进到第 8 列：{b_x}");
+}
+
+#[test]
+fn pre_wrap_trailing_spaces_hang_at_line_end() {
+    // pre-wrap 行尾保留空格悬挂：不占对齐宽度（右对齐时可见文本贴右缘），
+    // break-spaces 不悬挂（空格把可见文本往左推）
+    let visible_end = |white_space: &str| {
+        let (document, root) = layout(
+            &format!(
+                "<body><div style=\"width: 300px; text-align: right;\
+                 white-space: {white_space}\">abc   </div></body>"
+            ),
+            "",
+            400.0,
+        );
+        let div = find(&document, &root, "div").expect("div");
+        // 第三个字形（c）的右缘 = 可见文本末尾
+        let glyph = &div.lines[0].runs[0].glyphs[2];
+        glyph.x + glyph.advance
+    };
+    let pre_wrap_end = visible_end("pre-wrap");
+    assert!(
+        approx(pre_wrap_end, 300.0),
+        "pre-wrap 悬挂：可见文本贴右缘 {pre_wrap_end}"
+    );
+    let break_spaces_end = visible_end("break-spaces");
+    assert!(
+        break_spaces_end < 300.0,
+        "break-spaces 不悬挂，行尾空格占宽：{break_spaces_end}"
+    );
+}
+
+#[test]
+fn pre_wrap_hanging_spaces_do_not_force_wrap() {
+    // 行尾空格不触发折行：可用宽恰容纳可见文本时，空格悬挂不产生第二行
+    let (document, root) = layout(
+        "<body><p style=\"width: 60px; white-space: pre-wrap\">aaaa   </p></body>",
+        "",
+        400.0,
+    );
+    let p = find(&document, &root, "p").expect("p fragment");
+    assert_eq!(p.lines.len(), 1, "悬挂空格不触发折行");
+}
+
+// ---- M9：行内子树中的块级子元素不再丢弃（CSS 2.2 §9.2.1.1） ----
+
+#[test]
+fn block_in_inline_subtree_splits_into_anonymous_blocks() {
+    // <div>a <span><div>X</div></span> b</div>：span 内的块级 X 终止当前
+    // 行内流——「a 」与「 b」各成匿名块，X 按普通块盒布局，三者垂直堆叠
+    let (document, root) = layout(
+        "<body><div>a <span><div>X</div></span> b</div></body>",
+        "",
+        400.0,
+    );
+    let outer = find(&document, &root, "div").expect("outer div");
+    assert!(outer.lines.is_empty(), "混排容器：行盒由匿名块承接");
+    assert_eq!(outer.children.len(), 3, "匿名块(a) + X + 匿名块(b)");
+    let before = &outer.children[0];
+    let x = &outer.children[1];
+    let after = &outer.children[2];
+    assert!(before.anonymous && after.anonymous, "两段行内流为匿名块");
+    assert!(!x.anonymous, "X 是真实元素盒");
+    assert_eq!(before.lines.len(), 1, "前半 run 成行");
+    assert_eq!(after.lines.len(), 1, "后半 run 成行");
+    // 垂直堆叠不重叠
+    assert!(
+        before.border_box.y + before.border_box.height <= x.border_box.y + 0.01,
+        "X 接在前半行内流下方"
+    );
+    assert!(
+        x.border_box.y + x.border_box.height <= after.border_box.y + 0.01,
+        "后半行内流接在 X 下方"
+    );
+
+    // X 的文本可被 TextMap 命中并复制；块边界插换行
+    let map = nexty_layout::TextMap::new(&root);
+    let (start, end) = map.all().expect("document has text");
+    let text = map.text(start, end);
+    assert_eq!(text, "a\nX\nb", "复制文本含 X（块边界换行）");
+    // X 的行盒有内容（「X」字形存在）
+    assert_eq!(x.lines.len(), 1);
+    assert_eq!(x.lines[0].runs.len(), 1);
+}
+
+#[test]
+fn deeply_nested_block_in_inline_subtree_survives() {
+    // 两层行内元素包一层块级：块级子盒仍提升为容器的参与盒
+    let (document, root) = layout("<body><span><em><div>Y</div></em></span></body>", "", 400.0);
+    let body_fragment = body(&document, &root);
+    assert_eq!(body_fragment.children.len(), 1, "Y 是 body 的参与盒");
+    let y = &body_fragment.children[0];
+    assert!(!y.anonymous);
+    assert_eq!(y.lines.len(), 1, "Y 的内容成行");
+    assert!(
+        !y.lines[0].runs.is_empty(),
+        "Y 的文本不丢（M9 缺陷下整棵子树消失）"
+    );
+}
+
+#[test]
+fn display_none_and_contents_in_inline_subtree_unchanged() {
+    // none 子树不产内容；contents 透传文本；混合后行内流连续
+    let (document, root) = layout(
+        "<body><div>a<span>\
+         <div style=\"display: none\">gone</div>\
+         <section style=\"display: contents\">C</section>\
+         b</span></div></body>",
+        "",
+        400.0,
+    );
+    let outer = find(&document, &root, "div").expect("outer div");
+    assert_eq!(
+        outer.children.len(),
+        0,
+        "无块级子盒（none 跳过、contents 穿透）"
+    );
+    assert_eq!(outer.lines.len(), 1, "全部行内内容在一个 run 叶");
+    let line = &outer.lines[0];
+    let text: String = line.runs.iter().map(|run| run.text.as_ref()).collect();
+    assert_eq!(text, "aCb", "none 丢弃、contents 穿透、其余连续");
+}

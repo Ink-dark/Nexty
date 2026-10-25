@@ -17,6 +17,18 @@
 //!   `acb`；多行原子盒的后续行照常按行排列。
 //! - 软折行处被裁掉的折叠空格在复制时补回一个空格；被裁掉的行尾空白不参与
 //!   选区矩形。
+//! - `pre-wrap` 行尾悬挂空格的字形不进 TextMap（占位字形被剔除），命中吸附
+//!   到相邻可见簇，选区矩形不含悬挂区。
+//!
+//! # 命中行选择（M8）
+//!
+//! 行内原子盒的内部行嵌在外层行的 y 区间内，命中/吸附不能只取**第一个**
+//! y 命中行。实现取「候选行集合内比较 (纵向距离, 横向距离, 深度)」：先取
+//! y 命中的行（无则 `nearest` 按纵向最近），再在候选内按横向距离、深度
+//! 取最贴切者；若所选行内部还嵌着更深的行（原子盒行间空隙），继续向深处
+//! 吸附。落选方案：「先深后浅」重排行入列——`rects` / `text` 按行下标区间
+//! 遍历并依赖「绘制顺序 = 复制顺序」的既有语义，重排会把原子盒内容排到
+//! 父行之前，破坏复制顺序，故不采用。
 
 use std::sync::Arc;
 
@@ -42,6 +54,9 @@ struct Line {
     height: f32,
     start: LineStart,
     block: usize,
+    /// 嵌套深度：块容器行为 0，行内原子盒内部行逐层 +1（命中行选择的
+    /// 深度优先依据）。
+    depth: usize,
     segments: Vec<usize>,
 }
 
@@ -130,7 +145,7 @@ impl TextMap {
             segment_line: Vec::new(),
             next_block: 0,
         };
-        builder.collect(root, 0.0, 0.0, None);
+        builder.collect(root, 0.0, 0.0, None, 0);
         Self {
             lines: builder.lines,
             segments: builder.segments,
@@ -142,34 +157,122 @@ impl TextMap {
     ///
     /// 位置吸附到字形簇边界：字形左半取前边界、右半取后边界；行内没有文本
     /// （空行）时取相邻行的首/尾位置。点不在任何行内返回 `None`。
+    ///
+    /// 命中行选择见模块文档「命中行选择」：y 命中行中按横向距离与深度取
+    /// 最贴切者（行内原子盒的内部行不被外层行遮蔽）。
     #[must_use]
     pub fn hit(&self, x: f32, y: f32) -> Option<TextPosition> {
-        let line = self
-            .lines
-            .iter()
-            .position(|line| y >= line.top && y <= line.top + line.height)?;
+        let line = self.pick_line(x, y, true)?;
         self.position_in_line(line, x)
     }
 
     /// 最近文本位置：点不在行内时按纵向最近行、横向最近边界吸附。
     #[must_use]
     pub fn nearest(&self, x: f32, y: f32) -> Option<TextPosition> {
-        let mut best: Option<(f32, usize)> = None;
-        for (index, line) in self.lines.iter().enumerate() {
-            let distance = if y < line.top {
-                line.top - y
-            } else if y > line.top + line.height {
-                y - line.top - line.height
-            } else {
-                0.0
-            };
-            if best.is_none_or(|(current, _)| distance < current) {
-                best = Some((distance, index));
+        let line = self.pick_line(x, y, false)?;
+        self.position_in_line(line, x)
+            .or_else(|| self.fallback_position(line))
+    }
+
+    /// 选出命中的行（见模块文档「命中行选择」）。
+    ///
+    /// `must_contain` 为真时只考虑 y 区间包含该点的行（`hit` 契约）；为假
+    /// 时无包含行则退到纵向最近行（`nearest`）。
+    fn pick_line(&self, x: f32, y: f32, must_contain: bool) -> Option<usize> {
+        let mut pool: Vec<usize> = self
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| y >= line.top && y <= line.top + line.height)
+            .map(|(index, _)| index)
+            .collect();
+        if pool.is_empty() {
+            if must_contain {
+                return None;
+            }
+            let nearest = self
+                .lines
+                .iter()
+                .map(|line| Self::vertical_distance(line, y))
+                .fold(f32::INFINITY, f32::min);
+            if !nearest.is_finite() {
+                return None;
+            }
+            pool = self
+                .lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| Self::vertical_distance(line, y) == nearest)
+                .map(|(index, _)| index)
+                .collect();
+        }
+        let mut chosen = self.best_line(&pool, x, y)?;
+        // 所选行内部还嵌着更深的行（行内原子盒）：继续向深处吸附
+        //（点在原子盒行间空隙 / padding 区时不跳到外层）
+        loop {
+            let outer = &self.lines[chosen];
+            let nested: Vec<usize> = self
+                .lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| {
+                    line.depth > outer.depth
+                        && line.top >= outer.top
+                        && line.top + line.height <= outer.top + outer.height
+                })
+                .map(|(index, _)| index)
+                .collect();
+            if nested.is_empty() {
+                return Some(chosen);
+            }
+            chosen = self.best_line(&nested, x, y)?;
+        }
+    }
+
+    /// 候选行中按 (纵向距离, 横向距离, 深度) 取最贴切者。
+    fn best_line(&self, pool: &[usize], x: f32, y: f32) -> Option<usize> {
+        let mut best: Option<((f32, f32, usize, usize), usize)> = None;
+        for &index in pool {
+            let line = &self.lines[index];
+            let key = (
+                Self::vertical_distance(line, y),
+                self.horizontal_distance(line, x),
+                usize::MAX - line.depth,
+                index,
+            );
+            if best.is_none_or(|(current, _)| key < current) {
+                best = Some((key, index));
             }
         }
-        let (_, index) = best?;
-        self.position_in_line(index, x)
-            .or_else(|| self.fallback_position(index))
+        best.map(|(_, index)| index)
+    }
+
+    fn vertical_distance(line: &Line, y: f32) -> f32 {
+        if y < line.top {
+            line.top - y
+        } else if y > line.top + line.height {
+            y - line.top - line.height
+        } else {
+            0.0
+        }
+    }
+
+    /// 点到一行各字形簇的横向最小距离（落在簇内为 0；无文本行为无穷）。
+    fn horizontal_distance(&self, line: &Line, x: f32) -> f32 {
+        let mut best = f32::INFINITY;
+        for &segment_index in &line.segments {
+            for cluster in &self.segments[segment_index].clusters {
+                let distance = if x < cluster.x {
+                    cluster.x - x
+                } else if x > cluster.end_x {
+                    x - cluster.end_x
+                } else {
+                    0.0
+                };
+                best = best.min(distance);
+            }
+        }
+        best
     }
 
     /// 把源位置夹到当前布局中该文本节点的有效范围（重排后端点复用）。
@@ -505,8 +608,16 @@ struct Builder {
 }
 
 impl Builder {
-    /// `block` 为 `Some` 表示本片段是行内原子盒，沿用包含块的 id。
-    fn collect(&mut self, fragment: &Fragment, ox: f32, oy: f32, block: Option<usize>) {
+    /// `block` 为 `Some` 表示本片段是行内原子盒，沿用包含块的 id；
+    /// `depth` 是行嵌套深度（原子盒内部行逐层加深，命中行选择用）。
+    fn collect(
+        &mut self,
+        fragment: &Fragment,
+        ox: f32,
+        oy: f32,
+        block: Option<usize>,
+        depth: usize,
+    ) {
         let border_x = ox + fragment.border_box.x;
         let border_y = oy + fragment.border_box.y;
         let content_x = border_x + fragment.border.left + fragment.padding.left;
@@ -535,16 +646,18 @@ impl Builder {
                 height: line.height,
                 start: line.start,
                 block,
+                depth,
                 segments,
             });
-            // 行内原子盒：沿用包含块的 block id（视觉上仍在同一行内）
+            // 行内原子盒：沿用包含块的 block id（视觉上仍在同一行内），
+            // 内部行加深一层
             for atomic in &line.boxes {
-                self.collect(atomic, content_x, top, Some(block));
+                self.collect(atomic, content_x, top, Some(block), depth + 1);
             }
             line_offset += line.height;
         }
         for child in &fragment.children {
-            self.collect(child, content_x, content_y, None);
+            self.collect(child, content_x, content_y, None, 0);
         }
     }
 }

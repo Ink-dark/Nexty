@@ -202,3 +202,38 @@ M9 依据 CSS 2.2 §9.2.1.1；M8 无规范条款（是我们自己的命中顺�
 钉住当前错误行为再修。每层：`cargo check` 零 warning → `cargo test` 全绿 →
 `fmt` / `clippy` → commit；WPT 基线 1854/1959 与既有测试（含 UAX#14
 conformance 全量）不改仍绿是硬前提。退出条件全部满足后 push。
+
+---
+
+## 完成记录（2026-10-24）
+
+T1–T8 全部退出条件满足：workspace 419 测试全绿、clippy/fmt/deny 通过、
+feature 组合（layout `inline` / `selection`、chrome `selection`）零 warning、
+WPT 基线 1854/1959 无回归、UAX#14 conformance 全量绿。版本落地：
+css 0.1.13 / layout 0.1.24（每逻辑提交 +1）。
+
+与计划的三处偏差（均为实证修正）：
+
+1. **layout 版本号按提交逐次 +1**（0.1.19 → 0.1.24，T2–T7 各一次），高于
+   goal 预估的 0.1.19——AGENTS.md 的 Versioning Discipline（每次改逻辑
+   随手 +1）优先于 goal 的单轮目标版本。
+2. **顺带修正加固轮引入的 max-content 退化**（T3）：29dcdc0 的
+   「非有限 max_width 按 0 降级」把 MaxContent 测量的合法 +inf 也降级了，
+   shrink-to-fit 被压到最宽 span。justify 需要区分「合法的无穷」与污染，
+   改为仅 NaN 按 0 降级、+inf 保留（游标累加的都是有限宽度，坐标不扩散
+   非有限值）。
+3. **text-indent 百分比折算基线的认知修正**：实现按 run 叶可用宽（块容器
+   自身内容盒宽）折算；最初按「元素包含块（父级）宽」的理解记为偏差，
+   T9 实机对照 Edge 后确认**实现才是正确语义**——规范的 containing block
+   指行盒的包含块（块容器自身内容盒），Edge 在 420px 宽元素上对 `10%`
+   同样折算 ~42px（若按父级宽应为 ~121px）。已更正模块文档与测试注释。
+
+M9 修法说明：`Collector` 把行内流产出为 `InlineSegment` 流（Inline 段 +
+块级子元素标记），`flush_run` 把 Inline 段各自包装成匿名 run 叶、Block 段
+走 `build_box`——「行内盒拆分到匿名块两侧」的既有语义自然扩展到嵌套层。
+M8 修法说明：`Line` 携带嵌套深度，`hit`/`nearest` 按「y 距离 → x 距离 →
+深度」选行并向嵌套原子盒内部行下钻（含行间空隙 / padding 区的吸附）；
+落选方案（先深后浅重排行入列）与理由见 `selection.rs` 模块文档——会破坏
+「绘制顺序 = 复制顺序」的既有语义。
+
+实机验收（T9）：见 `.workbuddy` 冒烟记录与截图。

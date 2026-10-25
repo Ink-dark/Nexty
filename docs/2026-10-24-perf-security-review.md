@@ -6,6 +6,8 @@
 - 范围：全部 8 个 facade crate（约 24,900 行 `.rs`）+ 根配置（Cargo.toml / deny.toml）
 - 重点：**性能与安全**（区别于 2026-10-02 以 Hard Rules 合规为主的[上一轮审计](2026-10-02-code-audit.md)）
 
+> **状态更新（2026-10-25，性能轮落地后）**：H4（layout 0.1.25，逐 chunk 宽度无关缓存 + 布局级 MetricsCache）、M1（paint 0.1.6 / chrome 0.1.22，`Arc<Image>` 零拷贝 + 渲染线程收所有权）、M5（css 0.1.14，规则桶索引 + 引用化 matched + `InlineStyleCache` + `has_namespace` 零分配）、M6（paint 0.1.7 / chrome 0.1.23，`SceneCache` 页面坐标系缓存 + `ResizeCoalescer` 合帧 + staging 缓冲复用）、M7（chrome 0.1.24，工具带整形缓存）、M10/M12（layout 0.1.26，克隆链 + `remap_glyph` 不 panic）全部落地，基线与实测数字见 [2026-10-25-perf-baseline.md](2026-10-25-perf-baseline.md)。基准另发现并修复了一个计划外阻塞缺陷：`ParleyTextShaper` 每次整形复制整个字体文件（nexty-text 0.1.8 修复）。M3（加载竞态）、M4（wgpu error handler）按计划留独立小轮；滚动光栅化的视口裁剪/增量光栅列为后续大项。
+
 ## 1. 审查方法
 
 1. **机械检查**：生产代码（排除 `#[cfg(test)]` 模块）panic 位点统计、数值 `as` 转换位点统计、递归遍历函数排查；根配置与依赖门禁审读。

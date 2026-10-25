@@ -93,7 +93,7 @@ impl AsRef<str> for Atom {
 }
 
 /// 显式取原子内的字符串（绕开 `Borrow` 多重候选的歧义）。
-fn atom_str(atom: &Atom) -> &str {
+pub(crate) fn atom_str(atom: &Atom) -> &str {
     atom.borrow()
 }
 
@@ -287,20 +287,6 @@ impl<'a> DomElement<'a> {
             .is_some_and(|data| data.namespace == Namespace::Html)
     }
 
-    /// 命名空间 → 命名空间 URL 字符串。
-    fn namespace_url(&self) -> Option<String> {
-        self.element_data().map(|data| {
-            match &data.namespace {
-                Namespace::None => "",
-                Namespace::Html => HTML_NAMESPACE_URL,
-                Namespace::Svg => SVG_NAMESPACE_URL,
-                Namespace::MathMl => MATHML_NAMESPACE_URL,
-                Namespace::Other(uri) => uri.as_str(),
-            }
-            .to_owned()
-        })
-    }
-
     /// 属性命名空间 → 命名空间 URL 字符串。
     fn attr_namespace_url(namespace: &Namespace) -> String {
         match namespace {
@@ -428,7 +414,18 @@ impl SelectorsElement for DomElement<'_> {
     }
 
     fn has_namespace(&self, ns: &str) -> bool {
-        self.namespace_url().is_some_and(|url| url == ns)
+        // 标准命名空间是常量串，直接借用比较，零分配（M5 ③）
+        let Some(data) = self.element_data() else {
+            return false;
+        };
+        let url: &str = match &data.namespace {
+            Namespace::None => "",
+            Namespace::Html => HTML_NAMESPACE_URL,
+            Namespace::Svg => SVG_NAMESPACE_URL,
+            Namespace::MathMl => MATHML_NAMESPACE_URL,
+            Namespace::Other(uri) => uri.as_str(),
+        };
+        url == ns
     }
 
     fn is_same_type(&self, other: &Self) -> bool {

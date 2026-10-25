@@ -25,6 +25,8 @@
 
 #[cfg(feature = "shaping")]
 use std::cell::RefCell;
+#[cfg(feature = "shaping")]
+use std::collections::HashMap;
 #[cfg(feature = "font-resolution")]
 use std::sync::Mutex;
 
@@ -272,6 +274,13 @@ impl FontResolver {
 pub struct ParleyTextShaper {
     font_context: RefCell<parley::FontContext>,
     layout_context: RefCell<parley::LayoutContext>,
+    /// 已解析字体实例缓存：`(blob id, face index) → ResolvedFont`。
+    ///
+    /// 同一字体的每次命中共享一份字节快照（`Arc` 引用计数）。没有它，
+    /// 每次整形都会为触到的每个字体 run 复制整个字体文件——CJK 回退
+    /// 字体（msyh.ttc）约 20 MB，按文本 chunk 数放大后布局期内存以 GB
+    /// 计（T1 基准实测：2,000 段页面冲到 9 GB 提交内存后分配失败 abort）。
+    font_cache: RefCell<HashMap<(u64, u32), ResolvedFont>>,
 }
 
 #[cfg(feature = "shaping")]
@@ -287,6 +296,7 @@ impl Default for ParleyTextShaper {
         Self {
             font_context: RefCell::new(parley::FontContext::new()),
             layout_context: RefCell::new(parley::LayoutContext::new()),
+            font_cache: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -359,14 +369,27 @@ impl TextShaper for ParleyTextShaper {
                     continue;
                 };
                 let run_font = glyph_run.run().font();
-                let resolved = ResolvedFont {
-                    data: std::sync::Arc::from(run_font.data.as_ref()),
-                    index: run_font.index,
-                    id: run_font.data.id(),
+                let font_key = (run_font.data.id(), run_font.index);
+                let resolved = {
+                    let mut cache = self.font_cache.borrow_mut();
+                    match cache.get(&font_key) {
+                        Some(resolved) => resolved.clone(),
+                        None => {
+                            let resolved = ResolvedFont {
+                                data: std::sync::Arc::from(run_font.data.as_ref()),
+                                index: run_font.index,
+                                id: font_key.0,
+                            };
+                            cache.insert(font_key, resolved.clone());
+                            resolved
+                        }
+                    }
                 };
+                // 同一实例来自缓存（(blob id, face index) 唯一），按下标判等
+                // 免去字节比较
                 let font_index = fonts
                     .iter()
-                    .position(|font| *font == resolved)
+                    .position(|font| font.id == resolved.id && font.index == resolved.index)
                     .unwrap_or_else(|| {
                         fonts.push(resolved);
                         fonts.len() - 1
@@ -640,6 +663,31 @@ mod tests {
     #[test]
     fn resolve_font_empty_family_list_is_none() {
         assert!(shaper().resolve_font(&[]).is_none());
+    }
+
+    /// 字体实例缓存：同一字体的多次整形共享同一份字节快照（`Arc` 引用
+    /// 计数）。回归钉住——此前每次整形都复制整个字体文件，CJK 回退字体
+    /// （约 20 MB）按文本 chunk 数放大后布局期内存以 GB 计。
+    #[test]
+    fn repeated_shapes_share_font_data() {
+        let shaper = shaper();
+        let mixed = style(&["serif", "sans-serif"], 14.0);
+        let first = shaper.shape("中英混排 mixed text", &mixed).expect("shape");
+        let second = shaper
+            .shape("另一段 other text 混排", &mixed)
+            .expect("shape");
+        assert!(!first.fonts.is_empty(), "混排触发至少一个字体");
+        for font in &first.fonts {
+            let shared = second
+                .fonts
+                .iter()
+                .find(|other| other.id == font.id)
+                .expect("同一字体实例再次出现");
+            assert!(
+                std::sync::Arc::ptr_eq(font.data(), shared.data()),
+                "同一字体实例的字节必须共享而非复制"
+            );
+        }
     }
 
     #[test]

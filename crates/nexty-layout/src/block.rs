@@ -284,8 +284,10 @@ fn offset_line_in_place(line: &mut LineFragment, dx: f32, dy: f32) {
 /// `text-align` 的行内水平偏移（CSS Text 4 §5.1）。
 ///
 /// 偏移 = 自由空间 ×（center: 1/2、right/end: 1、其余: 0——`start` 为
-/// initial（LTR 即左对齐），`justify`/`justify-all`/`match-parent` 按偏差
-/// 降级为左对齐）；行宽超出可用宽（不可拆溢出行）时自由空间为 0。
+/// initial（LTR 即左对齐））；行宽超出可用宽（不可拆溢出行）时自由空间
+/// 为 0。`justify` 的间距分配在 `build_lines` 放置期完成（机会点均匀分配，
+/// justify 行右缘已贴满可用宽，此处自由空间为 0，不产生额外偏移）；
+/// `justify-all` / `match-parent` 按偏差降级为 start。
 fn alignment_shift(align: TextAlignValue, line_width: f32, available: f32) -> f32 {
     let free = (available - line_width).max(0.0);
     match align {

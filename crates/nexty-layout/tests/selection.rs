@@ -33,6 +33,27 @@ fn find<'a>(document: &Document, fragment: &'a Fragment, name: &str) -> Option<&
         .find_map(|child| find(document, child, name))
 }
 
+/// [`find`] 的盒感知版：同时搜索行内原子盒片段（`line.boxes`）。
+fn find_box<'a>(document: &Document, fragment: &'a Fragment, name: &str) -> Option<&'a Fragment> {
+    if matches!(
+        document.node(fragment.node),
+        Some(NodeKind::Element(data)) if data.name == name
+    ) {
+        return Some(fragment);
+    }
+    for line in &fragment.lines {
+        for atomic in &line.boxes {
+            if let Some(found) = find_box(document, atomic, name) {
+                return Some(found);
+            }
+        }
+    }
+    fragment
+        .children
+        .iter()
+        .find_map(|child| find_box(document, child, name))
+}
+
 fn direct_text_node(document: &Document, node: NodeId) -> NodeId {
     document
         .children(node)
@@ -231,7 +252,7 @@ fn point_on_glyph(
     right_half: bool,
 ) -> (f32, f32) {
     let (content_x, content_y) = content_origin(document, root, name).expect("element origin");
-    let fragment = find(document, root, name).expect("element fragment");
+    let fragment = find_box(document, root, name).expect("element fragment");
     let top: f32 = content_y
         + fragment.lines[..line_index]
             .iter()
@@ -430,4 +451,198 @@ fn all_is_none_without_text() {
     let (_document, root) = layout("<p></p>", "", 400.0);
     let map = TextMap::new(&root);
     assert!(map.all().is_none());
+}
+
+#[test]
+fn spacing_keeps_hit_and_rect_geometry_per_glyph() {
+    // letter-spacing 下的命中与矩形：cluster → 源偏移映射不受间距影响
+    let (document, root) = layout("<p style=\"letter-spacing: 4px\">abcd</p>", "", 400.0);
+    let map = TextMap::new(&root);
+    let node = direct_text_node(&document, find(&document, &root, "p").unwrap().node);
+
+    // 逐簇命中：每簇左半 → 本簇起点，右半 → 下一簇起点
+    for index in 0..4 {
+        let (x, y) = point_on_glyph(&document, &root, "p", 0, index, false);
+        assert_eq!(
+            map.hit(x, y),
+            Some(text_position(node, index)),
+            "簇 {index} 左半"
+        );
+        let (x, y) = point_on_glyph(&document, &root, "p", 0, index, true);
+        let expected = if index == 3 { 4 } else { index + 1 };
+        assert_eq!(
+            map.hit(x, y),
+            Some(text_position(node, expected)),
+            "簇 {index} 右半"
+        );
+    }
+
+    // 全选矩形宽：3 个簇间隙各 +4px
+    let spaced = map.rects(text_position(node, 0), text_position(node, 4));
+    assert_eq!(spaced.len(), 1);
+    let plain = {
+        let (document, root) = layout("<p>abcd</p>", "", 400.0);
+        let map = TextMap::new(&root);
+        let node = direct_text_node(&document, find(&document, &root, "p").unwrap().node);
+        map.rects(text_position(node, 0), text_position(node, 4))
+    };
+    assert_eq!(plain.len(), 1);
+    assert!(
+        (spaced[0].width - plain[0].width - 3.0 * 4.0).abs() < 0.01,
+        "选区矩形宽差 = 3×4px：{} - {}",
+        spaced[0].width,
+        plain[0].width
+    );
+
+    // 复制文本完整（间距不改源映射）
+    let (from, to) = map.all().unwrap();
+    assert_eq!(map.text(from, to), "abcd");
+}
+
+#[test]
+fn selection_works_across_justified_lines() {
+    // justify 分配发生在放置期，glyph 坐标即最终坐标：TextMap 命中与
+    // 逐行矩形照常工作
+    let (document, root) = layout(
+        "<body><p style=\"width: 100px; text-align: justify\">\
+         aaa bbb ccc ddd eee fff ggg hhh</p></body>",
+        "",
+        400.0,
+    );
+    let p = find(&document, &root, "p").expect("p fragment");
+    let map = TextMap::new(&root);
+    assert!(p.lines.len() >= 2, "折成多行");
+
+    // 跨行选区：每行一个矩形；矩形 y 逐行排布
+    let (from, to) = map.all().unwrap();
+    let rects = map.rects(from, to);
+    assert_eq!(rects.len(), p.lines.len(), "逐行矩形");
+    for (index, rect) in rects.iter().enumerate() {
+        assert!(rect.width.is_finite() && rect.width > 0.0);
+        if index + 1 < rects.len() {
+            assert!(rect.y < rects[index + 1].y, "矩形按行下移");
+        }
+    }
+    // 末行之前的矩形右缘贴容器（justify 行右缘 = 可用宽）
+    for rect in &rects[..rects.len() - 1] {
+        assert!(
+            (rect.x + rect.width - 100.0).abs() < 0.5,
+            "justify 行选区矩形右缘 = 容器宽：{}",
+            rect.x + rect.width
+        );
+    }
+    // 命中落在行内文本上
+    let mid_x = rects[0].x + rects[0].width / 2.0;
+    let mid_y = rects[0].y + rects[0].height / 2.0;
+    assert!(map.hit(mid_x, mid_y).is_some(), "justify 行内命中");
+    // 复制文本完整（软折行补空格）
+    assert_eq!(map.text(from, to), "aaa bbb ccc ddd eee fff ggg hhh");
+}
+
+#[test]
+fn copy_keeps_hanging_spaces_across_pre_wrap_lines() {
+    // pre-wrap 软折行处行尾空格悬挂（不占行宽）但源映射保留：跨行复制
+    // 文本完整、不额外补空格
+    let (_document, root) = layout(
+        "<body><p style=\"width: 40px; white-space: pre-wrap\">abc   def</p></body>",
+        "",
+        400.0,
+    );
+    let map = TextMap::new(&root);
+    assert!(map_all_lines(&root) >= 2, "折成两行");
+    let (from, to) = map.all().unwrap();
+    assert_eq!(map.text(from, to), "abc   def", "悬挂空格保留在复制文本中");
+}
+
+/// 片段树的行数（辅助断言）。
+fn map_all_lines(root: &nexty_layout::Fragment) -> usize {
+    fn walk(fragment: &nexty_layout::Fragment) -> usize {
+        fragment.lines.len() + fragment.children.iter().map(walk).sum::<usize>()
+    }
+    walk(root)
+}
+
+/// 元素的全部直接文本子节点（按 DOM 序）。
+fn element_text_nodes(document: &Document, node: NodeId) -> Vec<NodeId> {
+    document
+        .children(node)
+        .filter(|child| matches!(document.node(*child), Some(NodeKind::Text(_))))
+        .collect()
+}
+
+#[test]
+fn hit_prefers_inner_lines_of_inline_box() {
+    // M8：外层行的 y 区间完全覆盖行内原子盒的内部行——命中须取最深行
+    let (document, root) = layout(
+        "<p>ab<span style=\"display:inline-block\">xy<br>zw</span>cd</p>",
+        "",
+        400.0,
+    );
+    let map = TextMap::new(&root);
+    let span = find_box(&document, &root, "span").expect("span fragment");
+    let text_nodes = element_text_nodes(&document, span.node);
+    assert_eq!(text_nodes.len(), 2, "xy 与 zw 两个文本节点");
+    let (xy_node, zw_node) = (text_nodes[0], text_nodes[1]);
+    let p = find(&document, &root, "p").expect("p fragment");
+    let ab_node = element_text_nodes(&document, p.node)[0];
+
+    // 点击原子盒内部两行的文本：命中内部文本（缺陷下第二行命中外层 cd）
+    let (x, y) = point_on_glyph(&document, &root, "span", 0, 0, false);
+    assert_eq!(map.hit(x, y), Some(text_position(xy_node, 0)), "内部首行 x");
+    let (x, y) = point_on_glyph(&document, &root, "span", 1, 0, false);
+    assert_eq!(
+        map.hit(x, y),
+        Some(text_position(zw_node, 0)),
+        "内部次行 z（父行 y 区间覆盖它，仍取最深处）"
+    );
+
+    // 点击外层行文本：不回归
+    let (x, y) = point_on_glyph(&document, &root, "p", 0, 0, false);
+    assert_eq!(map.hit(x, y), Some(text_position(ab_node, 0)), "外层 a");
+
+    // 双击选词（原子盒内部）
+    let (from, to) = map.word_range(text_position(xy_node, 1)).expect("word");
+    assert_eq!(map.text(from, to), "xy");
+
+    // 内部行的选区矩形与内部行盒几何一致（非外层行）
+    let rects = map.rects(text_position(xy_node, 0), text_position(zw_node, 2));
+    assert_eq!(rects.len(), 2, "内部两行各一个矩形");
+    let span_top = content_origin(&document, &root, "span")
+        .expect("span origin")
+        .1;
+    assert!(
+        (rects[0].y - span_top).abs() < 0.5,
+        "矩形 y 与内部行盒一致：{} vs {span_top}",
+        rects[0].y
+    );
+
+    // 内部两行的复制文本完整（`<br>` 硬断行插换行）
+    assert_eq!(
+        map.text(text_position(xy_node, 0), text_position(zw_node, 2)),
+        "xy\nzw"
+    );
+}
+
+#[test]
+fn nearest_in_inline_box_gap_snaps_inward() {
+    // 原子盒带 padding：点落在盒内 padding 空隙（无内部行的 y 区间覆盖）
+    // 时，吸附到盒子内部行而非外层行
+    let (document, root) = layout(
+        "<p>ab<span style=\"display:inline-block; padding: 8px 4px\">xy<br>zw</span>cd</p>",
+        "",
+        400.0,
+    );
+    let map = TextMap::new(&root);
+    let span = find_box(&document, &root, "span").expect("span fragment");
+    let text_nodes = element_text_nodes(&document, span.node);
+    let (xy_node, zw_node) = (text_nodes[0], text_nodes[1]);
+    let (content_x, content_y) = content_origin(&document, &root, "span").expect("span origin");
+
+    // padding 顶隙（在盒内、内部首行上方 4px）
+    let (x, y) = (content_x + 2.0, content_y - 4.0);
+    let position = map.nearest(x, y).expect("position");
+    assert!(
+        position.node == xy_node || position.node == zw_node,
+        "padding 空隙吸附到盒内文本（缺陷下跳到外层 ab/cd）"
+    );
 }

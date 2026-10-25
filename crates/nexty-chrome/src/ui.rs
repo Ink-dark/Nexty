@@ -13,8 +13,11 @@
 //! 按钮无悬停态（未跟踪光标）；点击输入框不按 x 落光标（事件层拿不到整形度量，
 //! 故只做聚焦 + 全选）；加载进度条为静态指示，无动画。
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use nexty_paint::{Color, Command, Rect, Scene, TextGlyph};
-use nexty_text::{TextShaper, TextStyle};
+use nexty_text::{ShapedText, TextShaper, TextStyle};
 
 /// 工具带高度，px。
 pub const BAR_HEIGHT: f32 = 36.0;
@@ -206,6 +209,37 @@ pub struct AddressBar {
     caret: usize,
     /// 选区锚点（字节偏移）；`None` 表示无选区。
     anchor: Option<usize>,
+    /// 工具带固定样式（M7：构造一次，不再每帧新建 `families` String）。
+    style: TextStyle,
+    /// 按钮字形缓存（M7）：按钮字符是常量（×3），一次整形终身复用。
+    button_cache: RefCell<HashMap<&'static str, ShapedText>>,
+    /// URL 整形缓存（M7）：键为 URL 文本 + 字号（样式固定），URL 未变
+    /// 不 reshape；光标/选区前缀宽度从缓存字形按 cluster 前缀累加。
+    url_cache: RefCell<Option<UrlShapeCache>>,
+}
+
+/// URL 整形缓存的条目。
+#[derive(Debug, Clone)]
+struct UrlShapeCache {
+    url: String,
+    size: f32,
+    shaped: ShapedText,
+}
+
+/// 前缀宽度（M7）：对已整形字形按 cluster 前缀累加 advance——光标与选区
+/// 端点的定位不再整形前缀文本（原先每次 draw 至多 3 次前缀 reshape）。
+///
+/// `byte` 是 URL 中的字节偏移（char 边界）。字形按绘制序排列、cluster
+/// 升序（单行 LTR；bidi 是记录在案的偏差），累加 cluster 起点 `< byte`
+/// 的字形 advance 与整形前缀文本的宽度一致（含前缀内 kerning，不含跨界
+/// kerning——后者原先也不存在）。
+fn prefix_width(shaped: &ShapedText, byte: usize) -> f32 {
+    shaped
+        .glyphs
+        .iter()
+        .take_while(|glyph| (glyph.cluster as usize) < byte)
+        .map(|glyph| glyph.advance)
+        .sum()
 }
 
 /// UI 输入事件（由窗口事件转译而来）。
@@ -261,6 +295,12 @@ impl AddressBar {
             can_back: false,
             can_forward: false,
             anchor: None,
+            style: TextStyle {
+                families: vec!["sans-serif".to_owned()],
+                size: FONT_SIZE,
+            },
+            button_cache: RefCell::new(HashMap::new()),
+            url_cache: RefCell::new(None),
         }
     }
 
@@ -447,13 +487,10 @@ impl AddressBar {
             });
         }
 
-        let families = vec!["sans-serif".to_owned()];
-        let style = TextStyle {
-            families: families.clone(),
-            size: FONT_SIZE,
-        };
+        let style = &self.style;
 
-        // 导航按钮：底色 + 字形（整形失败降级为只画底色）
+        // 导航按钮：底色 + 字形（整形失败降级为只画底色；字形按 M7 缓存，
+        // 按钮字符是常量，只有首帧整形）
         for button in BarButton::all() {
             let rect = button_rect(button);
             let enabled = match button {
@@ -470,7 +507,7 @@ impl AddressBar {
             if !enabled {
                 continue;
             }
-            let Ok(shaped) = shaper.shape(button.glyph(), &style) else {
+            let Some(shaped) = self.cached_button_glyph(shaper, button.glyph()) else {
                 continue;
             };
             if shaped.glyphs.is_empty() {
@@ -517,12 +554,30 @@ impl AddressBar {
             width: 1.5,
         });
 
-        self.draw_text(shaper, scene, &style, input);
+        self.draw_text(shaper, scene, style, input);
+    }
+
+    /// 按钮字形的缓存读取（M7）：常量字符一次整形，后续帧直接复用。
+    /// 整形失败不入缓存（下一帧重试，与降级语义一致）。
+    fn cached_button_glyph(
+        &self,
+        shaper: &dyn TextShaper,
+        glyph: &'static str,
+    ) -> Option<ShapedText> {
+        let mut cache = self.button_cache.borrow_mut();
+        if let Some(shaped) = cache.get(glyph) {
+            return Some(shaped.clone());
+        }
+        let shaped = shaper.shape(glyph, &self.style).ok()?;
+        cache.insert(glyph, shaped.clone());
+        Some(shaped)
     }
 
     /// 输入框内的文本、选区高亮与光标。
     ///
     /// 文本超出输入框宽度时按光标位置横向滚动（光标移出右缘则整体左移）。
+    /// URL 整形按（文本, 字号）缓存（M7）：URL 未变不 reshape；光标与选区
+    /// 端点宽度从缓存字形按 cluster 前缀累加（O(前缀) 字形步进，零整形）。
     /// 整形失败（系统字体缺失等）降级为不画文本：`draw` 在主线程执行，
     /// 渲染线程的 `catch_unwind` 兜底覆盖不到这里。
     fn draw_text(
@@ -532,11 +587,11 @@ impl AddressBar {
         style: &TextStyle,
         input: Rect,
     ) {
-        let Ok(shaped) = shaper.shape(&self.url, style) else {
+        let Some(shaped) = self.cached_url_glyph(shaper, style) else {
             return;
         };
         let max_width = (input.width - 2.0 * TEXT_PADDING).max(0.0);
-        let caret_x = self.prefix_width(&self.url[..self.caret], shaper, style);
+        let caret_x = prefix_width(&shaped, self.caret);
         // 横向滚动：把光标保持在输入框内
         let offset = if shaped.width > max_width {
             let mut offset = 0.0_f32;
@@ -555,8 +610,8 @@ impl AddressBar {
 
         // 选区高亮（画在文本之下），夹取到输入框内
         if let Some((start, end)) = self.selection() {
-            let start_x = origin_x + self.prefix_width(&self.url[..start], shaper, style);
-            let end_x = origin_x + self.prefix_width(&self.url[..end], shaper, style);
+            let start_x = origin_x + prefix_width(&shaped, start);
+            let end_x = origin_x + prefix_width(&shaped, end);
             let left = start_x.max(input.x);
             let right = end_x.min(input.x + input.width);
             if right > left {
@@ -612,12 +667,26 @@ impl AddressBar {
         }
     }
 
-    /// 前缀整形宽度（光标与选区端点的定位依据）。
-    fn prefix_width(&self, text: &str, shaper: &dyn TextShaper, style: &TextStyle) -> f32 {
-        if text.is_empty() {
-            return 0.0;
+    /// URL 整形的缓存读取（M7）：键（文本, 字号）命中直接复用，未命中
+    /// 整形一次并入库。整形失败不入缓存（下一帧重试，与降级语义一致）。
+    fn cached_url_glyph(&self, shaper: &dyn TextShaper, style: &TextStyle) -> Option<ShapedText> {
+        let hit = self
+            .url_cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|entry| entry.url == self.url && entry.size == style.size);
+        if !hit {
+            let shaped = shaper.shape(&self.url, style).ok()?;
+            *self.url_cache.borrow_mut() = Some(UrlShapeCache {
+                url: self.url.clone(),
+                size: style.size,
+                shaped,
+            });
         }
-        shaper.shape(text, style).map_or(0.0, |shaped| shaped.width)
+        self.url_cache
+            .borrow()
+            .as_ref()
+            .map(|entry| entry.shaped.clone())
     }
 
     /// 光标左侧的 char 边界。
@@ -686,6 +755,48 @@ fn normalize(url: &str) -> Option<String> {
 mod tests {
     use super::*;
     use nexty_text::ParleyTextShaper;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 计数整形器（M7 测试用）：包装真实整形器，统计 shape 调用次数。
+    struct CountingShaper {
+        inner: ParleyTextShaper,
+        shapes: AtomicUsize,
+    }
+
+    impl CountingShaper {
+        fn new() -> Self {
+            Self {
+                inner: ParleyTextShaper::new(),
+                shapes: AtomicUsize::new(0),
+            }
+        }
+
+        fn shapes(&self) -> usize {
+            self.shapes.load(Ordering::Relaxed)
+        }
+
+        fn reset(&self) {
+            self.shapes.store(0, Ordering::Relaxed);
+        }
+    }
+
+    impl TextShaper for CountingShaper {
+        fn shape(
+            &self,
+            text: &str,
+            style: &TextStyle,
+        ) -> Result<nexty_text::ShapedText, nexty_text::TextError> {
+            self.shapes.fetch_add(1, Ordering::Relaxed);
+            self.inner.shape(text, style)
+        }
+
+        fn metrics(
+            &self,
+            style: &TextStyle,
+        ) -> Result<nexty_text::FontMetrics, nexty_text::TextError> {
+            self.inner.metrics(style)
+        }
+    }
 
     fn click_input(bar: &mut AddressBar) {
         let _ = bar.handle(UiEvent::Click { x: 100.0, y: 10.0 });
@@ -693,6 +804,72 @@ mod tests {
 
     fn move_caret(bar: &mut AddressBar, direction: CaretDirection, extend: bool) {
         let _ = bar.handle(UiEvent::MoveCaret { direction, extend });
+    }
+
+    /// M7：URL 不变的连续 redraw 触发 0 次整形（按钮与 URL 均走缓存）。
+    #[test]
+    fn unchanged_url_redraws_shape_nothing() {
+        let shaper = CountingShaper::new();
+        let bar = AddressBar::new("https://example.test/very/long/path");
+        let mut scene = Scene::default();
+        bar.draw(&shaper, &mut scene, 400.0);
+        let first = shaper.shapes();
+        assert!(first > 0, "首帧必须整形（按钮 ×3 + URL ×1）");
+
+        shaper.reset();
+        for _ in 0..10 {
+            let mut scene = Scene::default();
+            bar.draw(&shaper, &mut scene, 400.0);
+        }
+        assert_eq!(shaper.shapes(), 0, "URL 未变的 10 次 redraw 零整形");
+    }
+
+    /// M7：长 URL 逐键输入，整形调用量有上界——每次按键至多 1 次 URL
+    /// 整形（缓存失效重建），前缀宽度不整形；按钮只在首帧整形一次。
+    #[test]
+    fn per_keystroke_shaping_is_bounded() {
+        let shaper = CountingShaper::new();
+        let mut bar = AddressBar::new("");
+        let mut scene = Scene::default();
+        bar.draw(&shaper, &mut scene, 400.0);
+        let baseline = shaper.shapes(); // 按钮 ×3 + URL("")
+
+        const KEYSTROKES: usize = 30;
+        for index in 0..KEYSTROKES {
+            let _ = bar.handle(UiEvent::Character(if index % 2 == 0 { 'a' } else { '/' }));
+            let mut scene = Scene::default();
+            bar.draw(&shaper, &mut scene, 400.0);
+        }
+        let shaped_total = shaper.shapes() - baseline;
+        assert!(
+            shaped_total <= KEYSTROKES,
+            "每次按键至多 1 次 URL 整形：{KEYSTROKES} 键产生 {shaped_total} 次"
+        );
+    }
+
+    /// M7：光标/选区端点几何与「整形前缀」的结果一致（前缀累加不改变
+    /// 光标位置——cluster 前缀累加与直接整形前缀的宽度差在亚像素内）。
+    #[test]
+    fn caret_prefix_width_matches_prefix_shaping() {
+        let shaper = ParleyTextShaper::new();
+        let style = TextStyle {
+            families: vec!["sans-serif".to_owned()],
+            size: FONT_SIZE,
+        };
+        let url = "https://example.test/中文/path";
+        let shaped = shaper.shape(url, &style).expect("shape");
+        for byte in [0, 8, "https://".len(), url.len()] {
+            assert!(url.is_char_boundary(byte), "测试偏移须在 char 边界上");
+            let accumulated = prefix_width(&shaped, byte);
+            let direct = shaper
+                .shape(&url[..byte], &style)
+                .map(|prefix| prefix.width)
+                .unwrap_or(0.0);
+            assert!(
+                (accumulated - direct).abs() < 0.05,
+                "byte {byte}: 累加 {accumulated} vs 整形 {direct}"
+            );
+        }
     }
 
     #[test]

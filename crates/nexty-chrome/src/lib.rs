@@ -25,6 +25,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "pipeline")]
+pub mod bench;
 #[cfg(feature = "history")]
 pub mod history;
 #[cfg(feature = "pipeline")]

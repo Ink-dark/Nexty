@@ -94,6 +94,14 @@ pub enum PropertyId {
     OverflowWrap,
     /// `word-break`。
     WordBreak,
+    /// `letter-spacing`。
+    LetterSpacing,
+    /// `word-spacing`。
+    WordSpacing,
+    /// `text-indent`。
+    TextIndent,
+    /// `tab-size`。
+    TabSize,
     /// `width`。
     Width,
     /// `height`。
@@ -205,6 +213,10 @@ impl PropertyId {
             PropertyId::WhiteSpace => "white-space",
             PropertyId::OverflowWrap => "overflow-wrap",
             PropertyId::WordBreak => "word-break",
+            PropertyId::LetterSpacing => "letter-spacing",
+            PropertyId::WordSpacing => "word-spacing",
+            PropertyId::TextIndent => "text-indent",
+            PropertyId::TabSize => "tab-size",
             PropertyId::Width => "width",
             PropertyId::Height => "height",
             PropertyId::MinWidth => "min-width",
@@ -258,7 +270,7 @@ impl PropertyId {
     /// （CSS Syntax：声明名匹配大小写不敏感）。
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
-        const ALL: [PropertyId; 58] = [
+        const ALL: [PropertyId; 62] = [
             PropertyId::Display,
             PropertyId::Color,
             PropertyId::BackgroundColor,
@@ -271,6 +283,10 @@ impl PropertyId {
             PropertyId::WhiteSpace,
             PropertyId::OverflowWrap,
             PropertyId::WordBreak,
+            PropertyId::LetterSpacing,
+            PropertyId::WordSpacing,
+            PropertyId::TextIndent,
+            PropertyId::TabSize,
             PropertyId::Width,
             PropertyId::Height,
             PropertyId::MinWidth,
@@ -376,6 +392,14 @@ pub enum PropertyValue {
     OverflowWrap(OverflowWrapValue),
     /// `word-break` 关键字。
     WordBreak(WordBreakValue),
+    /// `letter-spacing` 值。
+    LetterSpacing(SpacingValue),
+    /// `word-spacing` 值。
+    WordSpacing(SpacingValue),
+    /// `text-indent` 值。
+    TextIndent(TextIndentValue),
+    /// `tab-size` 值。
+    TabSize(TabSizeValue),
     /// `width` / `height` 值（min-width / max-width / min-height / max-height
     /// 复用同一语法）。
     Size(SizeValue),
@@ -555,6 +579,52 @@ pub enum WordBreakValue {
     BreakAll,
     /// `keep-all`：禁止 CJK 等词内部断行。
     KeepAll,
+}
+
+/// `letter-spacing` / `word-spacing` 值
+/// （[CSS Text 3 §8](https://drafts.csswg.org/css-text-3/#spacing-props)）。
+///
+/// `normal` 的语义两属性不同：letter-spacing 折算为 0（无附加字距），
+/// word-spacing 的 normal 保留给 layout 层判读。视口单位不接受（与
+/// `font-size` / `border-width` / `line-height` 的既有口径一致，见模块偏差）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SpacingValue {
+    /// `normal`（initial）。
+    Normal,
+    /// 绝对长度（CSS px；负值合法）。
+    Length(f32),
+    /// em（computed 阶段按本元素 font-size 折算为绝对 px）。
+    Em(f32),
+}
+
+/// `text-indent` 值
+/// （[CSS Text 3 §4](https://drafts.csswg.org/css-text-3/#text-indent-property)）。
+///
+/// 百分比按包含块宽度解析，保留原值给 layout；`each-line` / `hanging`
+/// 关键字未实现（记为偏差）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TextIndentValue {
+    /// 绝对长度（CSS px；负值合法）。
+    Length(f32),
+    /// em（computed 阶段按本元素 font-size 折算为绝对 px）。
+    Em(f32),
+    /// 百分比（小数存储；相对包含块宽度，layout 解析）。
+    Percent(f32),
+}
+
+/// `tab-size` 值
+/// （[CSS Text 3 §5](https://drafts.csswg.org/css-text-3/#tab-size-property)）。
+///
+/// 整数形态表示按 U+0020 advance 的 N 倍推进，依赖字体度量，由 layout
+/// 在放置期解析；长度形态的 em 在 computed 阶段按本元素 font-size 折算。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TabSizeValue {
+    /// 整数：制表位按空格 advance 的 N 倍（initial 8）。
+    Integer(u32),
+    /// 绝对长度（CSS px）。
+    Length(f32),
+    /// em（computed 阶段按本元素 font-size 折算为绝对 px）。
+    Em(f32),
 }
 
 /// `font-style` 值
@@ -1053,6 +1123,10 @@ fn parse_property_value(property: PropertyId, input: &mut Parser<'_>) -> Result<
         PropertyId::WhiteSpace => parse_white_space(input).map(PropertyValue::WhiteSpace),
         PropertyId::OverflowWrap => parse_overflow_wrap(input).map(PropertyValue::OverflowWrap),
         PropertyId::WordBreak => parse_word_break(input).map(PropertyValue::WordBreak),
+        PropertyId::LetterSpacing => parse_spacing(input).map(PropertyValue::LetterSpacing),
+        PropertyId::WordSpacing => parse_spacing(input).map(PropertyValue::WordSpacing),
+        PropertyId::TextIndent => parse_text_indent(input).map(PropertyValue::TextIndent),
+        PropertyId::TabSize => parse_tab_size(input).map(PropertyValue::TabSize),
         PropertyId::Width
         | PropertyId::Height
         | PropertyId::MinWidth
@@ -1121,6 +1195,70 @@ fn parse_line_height(input: &mut Parser<'_>) -> Result<LineHeightValue, ()> {
             } else {
                 length_to_px(*value, unit)
                     .map(LineHeightValue::Length)
+                    .ok_or(())
+            }
+        }
+        _ => Err(()),
+    }
+}
+
+/// `letter-spacing` / `word-spacing`：normal | <length>（CSS Text 3 §8）。
+/// 负值合法；`0` 无单位合法（CSS Values 4）；视口单位与百分比不接受。
+fn parse_spacing(input: &mut Parser<'_>) -> Result<SpacingValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("normal") => Ok(SpacingValue::Normal),
+        Token::Number { value: 0.0, .. } => Ok(SpacingValue::Length(0.0)),
+        Token::Dimension { value, unit, .. } => {
+            if unit.eq_ignore_ascii_case("em") {
+                sanitize_number(*value).map(SpacingValue::Em).ok_or(())
+            } else {
+                length_to_px(*value, unit)
+                    .map(SpacingValue::Length)
+                    .ok_or(())
+            }
+        }
+        _ => Err(()),
+    }
+}
+
+/// `text-indent`：<length-percentage>（CSS Text 3 §4）。负值合法。
+fn parse_text_indent(input: &mut Parser<'_>) -> Result<TextIndentValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Number { value: 0.0, .. } => Ok(TextIndentValue::Length(0.0)),
+        Token::Percentage { unit_value, .. } => sanitize_number(*unit_value)
+            .map(TextIndentValue::Percent)
+            .ok_or(()),
+        Token::Dimension { value, unit, .. } => {
+            if unit.eq_ignore_ascii_case("em") {
+                sanitize_number(*value).map(TextIndentValue::Em).ok_or(())
+            } else {
+                length_to_px(*value, unit)
+                    .map(TextIndentValue::Length)
+                    .ok_or(())
+            }
+        }
+        _ => Err(()),
+    }
+}
+
+/// `tab-size`：<integer [0,∞]> | <length [0,∞]>（CSS Text 3 §5）。
+/// 整数 token 之外的 Number（小数 / 负数）按无效处理。
+fn parse_tab_size(input: &mut Parser<'_>) -> Result<TabSizeValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Number {
+            int_value: Some(int),
+            ..
+        } if *int >= 0 => Ok(TabSizeValue::Integer(*int as u32)),
+        Token::Number { .. } => Err(()),
+        Token::Dimension { value, unit, .. } => {
+            if *value < 0.0 {
+                return Err(());
+            }
+            if unit.eq_ignore_ascii_case("em") {
+                sanitize_number(*value).map(TabSizeValue::Em).ok_or(())
+            } else {
+                length_to_px(*value, unit)
+                    .map(TabSizeValue::Length)
                     .ok_or(())
             }
         }
@@ -3136,6 +3274,96 @@ mod tests {
         );
         parse_err(PropertyId::WordBreak, "break-word");
         parse_err(PropertyId::WordBreak, "keep");
+    }
+
+    /// CSS Text 3 的四个新属性：letter-spacing / word-spacing（§8）、
+    /// text-indent（§4）、tab-size（§5）。
+    #[test]
+    fn css_text_spacing_forms() {
+        // letter-spacing / word-spacing：normal | <length>（负值合法）
+        assert_eq!(
+            parse_one(PropertyId::LetterSpacing, "normal"),
+            PropertyValue::LetterSpacing(SpacingValue::Normal)
+        );
+        assert_eq!(
+            parse_one(PropertyId::LetterSpacing, "4px"),
+            PropertyValue::LetterSpacing(SpacingValue::Length(4.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::LetterSpacing, "-2PX"),
+            PropertyValue::LetterSpacing(SpacingValue::Length(-2.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::LetterSpacing, "0.5em"),
+            PropertyValue::LetterSpacing(SpacingValue::Em(0.5))
+        );
+        assert_eq!(
+            parse_one(PropertyId::LetterSpacing, "0"),
+            PropertyValue::LetterSpacing(SpacingValue::Length(0.0))
+        );
+        parse_err(PropertyId::LetterSpacing, "10%");
+        parse_err(PropertyId::LetterSpacing, "1vw");
+        parse_err(PropertyId::LetterSpacing, "normal 4px");
+
+        assert_eq!(
+            parse_one(PropertyId::WordSpacing, "normal"),
+            PropertyValue::WordSpacing(SpacingValue::Normal)
+        );
+        assert_eq!(
+            parse_one(PropertyId::WordSpacing, "-3px"),
+            PropertyValue::WordSpacing(SpacingValue::Length(-3.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::WordSpacing, "2em"),
+            PropertyValue::WordSpacing(SpacingValue::Em(2.0))
+        );
+        parse_err(PropertyId::WordSpacing, "20%");
+
+        // text-indent：<length-percentage>（负值合法）
+        assert_eq!(
+            parse_one(PropertyId::TextIndent, "40px"),
+            PropertyValue::TextIndent(TextIndentValue::Length(40.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::TextIndent, "10%"),
+            PropertyValue::TextIndent(TextIndentValue::Percent(0.1))
+        );
+        assert_eq!(
+            parse_one(PropertyId::TextIndent, "2em"),
+            PropertyValue::TextIndent(TextIndentValue::Em(2.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::TextIndent, "-10px"),
+            PropertyValue::TextIndent(TextIndentValue::Length(-10.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::TextIndent, "0"),
+            PropertyValue::TextIndent(TextIndentValue::Length(0.0))
+        );
+        parse_err(PropertyId::TextIndent, "auto");
+        parse_err(PropertyId::TextIndent, "1vw");
+
+        // tab-size：<integer [0,∞]> | <length [0,∞]>
+        assert_eq!(
+            parse_one(PropertyId::TabSize, "4"),
+            PropertyValue::TabSize(TabSizeValue::Integer(4))
+        );
+        assert_eq!(
+            parse_one(PropertyId::TabSize, "0"),
+            PropertyValue::TabSize(TabSizeValue::Integer(0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::TabSize, "32px"),
+            PropertyValue::TabSize(TabSizeValue::Length(32.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::TabSize, "2em"),
+            PropertyValue::TabSize(TabSizeValue::Em(2.0))
+        );
+        parse_err(PropertyId::TabSize, "-1");
+        parse_err(PropertyId::TabSize, "8.5");
+        parse_err(PropertyId::TabSize, "-4px");
+        parse_err(PropertyId::TabSize, "10%");
     }
 
     #[test]

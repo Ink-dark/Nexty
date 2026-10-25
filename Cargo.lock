@@ -1688,7 +1688,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nexty-chrome"
-version = "0.1.20"
+version = "0.1.25"
 dependencies = [
  "arboard",
  "image",
@@ -1706,7 +1706,7 @@ dependencies = [
 
 [[package]]
 name = "nexty-css"
-version = "0.1.12"
+version = "0.1.14"
 dependencies = [
  "cssparser",
  "nexty-dom",
@@ -1729,7 +1729,7 @@ dependencies = [
 
 [[package]]
 name = "nexty-layout"
-version = "0.1.18"
+version = "0.1.26"
 dependencies = [
  "harfrust",
  "nexty-css",
@@ -1749,7 +1749,7 @@ dependencies = [
 
 [[package]]
 name = "nexty-paint"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "image",
  "nexty-text",
@@ -1758,7 +1758,7 @@ dependencies = [
 
 [[package]]
 name = "nexty-text"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "parley",
  "skrifa",

@@ -53,11 +53,19 @@ impl std::fmt::Debug for RenderThread {
 impl RenderThread {
     /// 启动渲染线程。
     ///
+    /// `waker` 在每份作业完成后调用一次——异步呈现路径用它唤醒事件循环
+    /// 取结果：渲染完成时主线程不得阻塞等待，否则巨页帧（可达数十秒）
+    /// 会让窗口进入「无响应」状态，系统随之重发 WM_PAINT / WM_SIZE 形成
+    /// 重绘风暴（winit 0.30 把 WM_PAINT 直接映射为 RedrawRequested）。
+    ///
     /// # Panics
     ///
     /// 线程启动失败时 panic（主进程随后的渲染请求会得到通道错误）。
     #[must_use]
-    pub fn spawn(rasterizer: Arc<dyn Rasterizer + Send + Sync>) -> Self {
+    pub fn spawn(
+        rasterizer: Arc<dyn Rasterizer + Send + Sync>,
+        waker: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
         let (sender, receiver) = std::sync::mpsc::channel::<Job>();
         let handle = std::thread::Builder::new()
             .name("nexty-render".to_owned())
@@ -69,6 +77,7 @@ impl RenderThread {
                     .map_err(panic_message)
                     .and_then(|result| result.map_err(RenderError::Raster));
                     let _ = reply.send(result);
+                    waker();
                 }
             })
             .expect("spawn render thread");
@@ -78,18 +87,33 @@ impl RenderThread {
         }
     }
 
-    /// 请求一帧光栅化，阻塞等待结果。
+    /// 请求一帧光栅化（异步）：结果经 `reply` 通道交回，调用方不等待。
+    ///
+    /// 接收 `Scene` **所有权**（M1 零拷贝）。返回 `Err(scene)` 表示渲染
+    /// 线程已终止，场景原样还给调用方以便降级处理。
+    pub fn request(
+        &self,
+        scene: Scene,
+        size: Size,
+        reply: std::sync::mpsc::Sender<Result<Pixmap, RenderError>>,
+    ) -> Result<(), Scene> {
+        self.sender
+            .as_ref()
+            .expect("render thread sender")
+            .send((scene, size, reply))
+            .map_err(|std::sync::mpsc::SendError((scene, _, _))| scene)
+    }
+
+    /// 请求一帧光栅化，阻塞等待结果（测试与工具路径用；窗口主循环走
+    /// [`RenderThread::request`] 异步呈现）。
     ///
     /// # Errors
     ///
     /// 光栅失败或渲染线程 panic 时返回 [`RenderError`]；通道断裂
     /// （线程意外退出）也归入 [`RenderError::Panicked`]。
-    pub fn render(&self, scene: &Scene, size: Size) -> Result<Pixmap, RenderError> {
+    pub fn render(&self, scene: Scene, size: Size) -> Result<Pixmap, RenderError> {
         let (reply_sender, reply_receiver) = std::sync::mpsc::channel();
-        self.sender
-            .as_ref()
-            .expect("render thread sender")
-            .send((scene.clone(), size, reply_sender))
+        self.request(scene, size, reply_sender)
             .map_err(|_| RenderError::Panicked("render thread terminated".to_owned()))?;
         reply_receiver
             .recv()

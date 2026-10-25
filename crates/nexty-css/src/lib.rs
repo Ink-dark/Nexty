@@ -31,7 +31,8 @@ mod value;
 
 #[cfg(feature = "cascade")]
 pub use cascade::{
-    ComputedStyle, Edges, cascade, cascade_in, compute_document_styles, compute_document_styles_in,
+    ComputedStyle, Edges, InlineStyleCache, cascade, cascade_in, compute_document_styles,
+    compute_document_styles_in, compute_document_styles_in_with_cache,
 };
 #[cfg(feature = "stylesheets")]
 pub use parser::{Declaration, MediaViewport, StyleRule, Stylesheet, parse_inline_style};
@@ -46,5 +47,6 @@ pub use value::{
     FontFamilyValue, FontSizeValue, FontStyleValue, FontWeightValue, GapValue, GridAutoFlowValue,
     GridTrack, GridTrackList, InsetValue, JustifyContentValue, LineHeightValue, MAX_CSS_LENGTH,
     MarginValue, OverflowValue, OverflowWrapValue, PaddingValue, PositionValue, PropertyId,
-    PropertyValue, Rgba, SizeValue, TextAlignValue, ViewportUnit, WhiteSpaceValue, WordBreakValue,
+    PropertyValue, Rgba, SizeValue, SpacingValue, TabSizeValue, TextAlignValue, TextIndentValue,
+    ViewportUnit, WhiteSpaceValue, WordBreakValue,
 };
