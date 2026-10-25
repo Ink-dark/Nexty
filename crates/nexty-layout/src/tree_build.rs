@@ -43,7 +43,7 @@ use taffy::tree::{LayoutInput, LayoutOutput, NodeId as TaffyNode, RunMode, Taffy
 
 use crate::Context;
 use crate::fragment::LineFragment;
-use crate::inline::{InlineItem, InlineRun, InlineSegment};
+use crate::inline::{ChunkAnalysis, InlineItem, InlineRun, InlineSegment};
 use crate::style_map::map_style;
 
 /// 构建产物：taffy 盒树 + 映射表。
@@ -124,6 +124,10 @@ pub(crate) struct InlineRunNode<'a> {
     /// 定宽与 min-content 等多个约束下各调一次；同一宽度下 break-word 的
     /// 紧急断点在 min-content 与非 min-content 两种语义下结果不同。
     lines_cache: RefCell<Vec<(f32, bool, Vec<LineFragment>)>>,
+    /// 逐 chunk 宽度无关分析（H4，与 `items` 平行、懒填充）：shaping /
+    /// 簇映射 / 断点切分与可用宽无关，跨 measure 宽度档位复用——只有
+    /// 贪心放置按宽度重跑。items 在树构建期定型，长度即缓存长度。
+    analysis: RefCell<Vec<Option<ChunkAnalysis>>>,
 }
 
 impl InlineRunNode<'_> {
@@ -160,14 +164,29 @@ impl InlineRunNode<'_> {
                 }
             }
         }
-        let lines = crate::inline::build_lines(
-            self.ctx.shaper,
-            &self.items.borrow(),
-            available_width,
-            &self.strut_style,
-            min_content,
-            self.first_line_indent(available_width, min_content),
-        );
+        let items = self.items.borrow();
+        let lines = {
+            let mut analysis = self.analysis.borrow_mut();
+            if analysis.len() != items.len() {
+                analysis.resize_with(items.len(), || None);
+            }
+            // 宽度无关部分（shaping / 簇映射 / 断点切分）按档位懒填充，
+            // 跨 measure 宽度档位复用；贪心放置在 build_lines 内按宽重跑
+            crate::inline::ensure_analysis(self.ctx.shaper, &items, &mut analysis, min_content);
+            let shaping = crate::ShapingContext {
+                shaper: self.ctx.shaper,
+                metrics: &self.ctx.metrics,
+            };
+            crate::inline::build_lines(
+                &shaping,
+                &items,
+                &analysis,
+                available_width,
+                &self.strut_style,
+                min_content,
+                self.first_line_indent(available_width, min_content),
+            )
+        };
         self.lines_cache
             .borrow_mut()
             .push((available_width, min_content, lines.clone()));
@@ -521,6 +540,7 @@ fn flush_run<'a>(
                             indent_first_line,
                             strut_style: strut_style.clone(),
                             lines_cache: RefCell::new(Vec::new()),
+                            analysis: RefCell::new(Vec::new()),
                         },
                     );
                     state.participants.push(taffy);
@@ -686,6 +706,7 @@ mod tests {
                 shaper: &self.shaper,
                 styles: &self.styles,
                 image_sizes: &self.image_sizes,
+                metrics: crate::MetricsCache::default(),
             }
         }
     }

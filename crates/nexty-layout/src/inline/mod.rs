@@ -821,16 +821,129 @@ struct PlacedItem {
     x: f32,
 }
 
+/// 一个文本 chunk 的宽度无关分析（H4）。
+///
+/// 整形、簇映射与断点切分只依赖 `(text, style)` 与 min-content 模式，
+/// 与可用宽无关——measure 在 max-content / min-content / 定宽多个档位间
+/// 重复调用 `build_lines`，这些结果按 chunk 缓存（归属 run 节点，一次
+/// 布局内复用），只有贪心放置按宽度重跑。CSS Text 的放置期修正
+/// （justify / 字距 / 制表 / 悬挂）全部在放置侧消费这些结果，不受缓存影响。
+pub(crate) struct ChunkAnalysis {
+    shaped: ShapedText,
+    clusters: Vec<Span>,
+    /// normal 断行切分（`white-space` 不折行时为整段单 span），按
+    /// min-content 模式分档懒算：`[非 min-content, min-content]`。
+    /// `overflow-wrap: break-word` 的紧急断点在两档语义下参与面不同。
+    spans: [Option<Vec<Span>>; 2],
+    /// 紧急断点切分（仅 `overflow-wrap` 非 normal 时有值；min-content
+    /// 语义下断行不消费它，消费方按模式遮蔽）。
+    emergency: Option<Vec<Span>>,
+}
+
+/// 一个 min-content 档位的 normal 断行切分（CSS Text 3 §5.4）。
+fn mode_spans(chunk: &TextChunk, min_content: bool, clusters: &[Span]) -> Vec<Span> {
+    if chunk.style.white_space.wraps() {
+        let options = break_options(&chunk.style, min_content);
+        split_spans(
+            &chunk.text,
+            clusters,
+            &break_opportunities(&chunk.text, &options),
+        )
+    } else {
+        vec![Span {
+            byte_start: 0,
+            byte_end: chunk.text.len(),
+        }]
+    }
+}
+
+/// 紧急断点切分（`overflow-wrap: break-word` / `anywhere`；CSS Text 3 §5.4）。
+/// normal 语义无紧急断点，返回 `None`。
+fn emergency_spans(chunk: &TextChunk, clusters: &[Span]) -> Option<Vec<Span>> {
+    if chunk.style.overflow_wrap == OverflowWrapValue::Normal {
+        return None;
+    }
+    let mut options = break_options(&chunk.style, false);
+    options.overflow_wrap = match chunk.style.overflow_wrap {
+        OverflowWrapValue::BreakWord => OverflowWrap::BreakWord,
+        OverflowWrapValue::Anywhere => OverflowWrap::Anywhere,
+        OverflowWrapValue::Normal => OverflowWrap::Normal,
+    };
+    Some(split_spans(
+        &chunk.text,
+        clusters,
+        &break_opportunities(&chunk.text, &options),
+    ))
+}
+
+/// 填充 `items` 中尚未分析的文本 chunk（H4，调用方为 run 节点）。
+///
+/// shaped 与簇映射只算一次；两个 min-content 档位的 normal 切分与紧急
+/// 断点切分各自懒算（measure 通常先走非 min 档，min 档只在 min-content
+/// 测量时补齐）。
+pub(crate) fn ensure_analysis(
+    shaper: &dyn TextShaper,
+    items: &[InlineItem],
+    analysis: &mut [Option<ChunkAnalysis>],
+    min_content: bool,
+) {
+    debug_assert_eq!(analysis.len(), items.len(), "analysis 与 items 平行");
+    for (index, item) in items.iter().enumerate() {
+        let InlineItem::Text(chunk) = item else {
+            continue;
+        };
+        if let Some(existing) = &mut analysis[index] {
+            if existing.spans[min_content as usize].is_none() {
+                existing.spans[min_content as usize] =
+                    Some(mode_spans(chunk, min_content, &existing.clusters));
+            }
+            if !min_content && existing.emergency.is_none() {
+                existing.emergency = emergency_spans(chunk, &existing.clusters);
+            }
+            continue;
+        }
+        let shaped = shaper
+            .shape(&chunk.text, &text_style(&chunk.style))
+            .unwrap_or(ShapedText {
+                glyphs: Vec::new(),
+                fonts: Vec::new(),
+                width: 0.0,
+                height: 0.0,
+            });
+        let clusters = cluster_map(&chunk.text, &shaped);
+        let spans = {
+            let mut slots: [Option<Vec<Span>>; 2] = [None, None];
+            slots[min_content as usize] = Some(mode_spans(chunk, min_content, &clusters));
+            slots
+        };
+        let emergency = if min_content {
+            None
+        } else {
+            emergency_spans(chunk, &clusters)
+        };
+        analysis[index] = Some(ChunkAnalysis {
+            shaped,
+            clusters,
+            spans,
+            emergency,
+        });
+    }
+}
+
 /// 贪心断行与行盒组装。
 ///
+/// `analysis` 是与 `items` 平行的逐 chunk 宽度无关分析（见
+/// [`ensure_analysis`]，由 run 节点持有并跨宽度档位复用）。`metrics` 是
+/// 布局级度量缓存（同一 TextStyle 整次布局只整形一次探针）。
 /// `block_style` 提供 strut（行盒的高度下限与基线位置）。原子图片按基线
 /// 对齐（底边落在基线上，CSS 2.1 §10.8.1），不参与断行（不可拆）。
 /// `min_content` 为真时按 min-content 语义断行（`overflow-wrap: break-word`
 /// 的紧急断点不参与）。`first_line_indent` 是已解析的首行缩进（CSS Text
 /// 3 §4；测量路径与后续行由调用方保证传 0）——从首行可用宽中扣减。
 pub(crate) fn build_lines(
-    shaper: &dyn TextShaper,
+    shaping: &crate::ShapingContext<'_>,
     items: &[InlineItem],
+    analysis: &[Option<ChunkAnalysis>],
     max_width: f32,
     block_style: &ComputedStyle,
     min_content: bool,
@@ -845,32 +958,8 @@ pub(crate) fn build_lines(
     // 非有限值）。
     let max_width = if max_width.is_nan() { 0.0 } else { max_width };
 
-    // 每块文本只整形一次（cluster 映射与断点都基于同一结果）
-    let shaped_items: Vec<Option<ShapedText>> = items
-        .iter()
-        .map(|item| match item {
-            InlineItem::Text(chunk) => Some(
-                shaper
-                    .shape(&chunk.text, &text_style(&chunk.style))
-                    .unwrap_or(ShapedText {
-                        glyphs: Vec::new(),
-                        fonts: Vec::new(),
-                        width: 0.0,
-                        height: 0.0,
-                    }),
-            ),
-            _ => None,
-        })
-        .collect();
-
     // strut：块自身字体参与每个行盒（CSS 2.1 §10.8.1）
-    let strut_metrics = shaper
-        .metrics(&text_style(block_style))
-        .unwrap_or(FontMetrics {
-            ascent: 0.0,
-            descent: 0.0,
-            line_height: 0.0,
-        });
+    let strut_metrics = shaping.metrics(&text_style(block_style));
     let strut_line_height = used_line_height(block_style, strut_metrics);
     let strut_half_leading =
         (strut_line_height - (strut_metrics.ascent + strut_metrics.descent)) / 2.0;
@@ -878,9 +967,9 @@ pub(crate) fn build_lines(
     let strut_below = strut_metrics.descent + strut_half_leading;
 
     let mut builder = LineBuilder {
-        shaper,
+        shaping,
         items,
-        shaped_items,
+        analysis,
         max_width,
         strut_above,
         strut_below,
@@ -915,42 +1004,20 @@ pub(crate) fn build_lines(
                 builder.place_atomic(index, atomic.fragment.border_box.width, break_before);
                 previous = Some(index);
             }
-            InlineItem::Text(chunk) => {
-                let shaped = builder.shaped_items[index]
+            InlineItem::Text(_) => {
+                // 断行切分已按档位缓存；min-content 语义下紧急断点不参与
+                //（与缓存前的即时计算一致）
+                let analysis = builder.analysis[index]
                     .as_ref()
-                    .expect("text item shaped");
-                let clusters = cluster_map(&chunk.text, shaped);
-                let normal_options = break_options(&chunk.style, min_content);
-                let normal_spans = if chunk.style.white_space.wraps() {
-                    split_spans(
-                        &chunk.text,
-                        &clusters,
-                        &break_opportunities(&chunk.text, &normal_options),
-                    )
+                    .expect("text item analyzed");
+                let normal_spans = analysis.spans[min_content as usize]
+                    .as_ref()
+                    .expect("spans for requested mode");
+                let emergency = if min_content {
+                    None
                 } else {
-                    vec![Span {
-                        byte_start: 0,
-                        byte_end: chunk.text.len(),
-                    }]
+                    analysis.emergency.as_deref()
                 };
-                // 紧急断点（break-word / anywhere）：仅在整段放不下一行时使用；
-                // min-content 下 break-word 的紧急断点不参与（CSS Text 3 §5.4）。
-                let emergency_spans =
-                    if !min_content && chunk.style.overflow_wrap != OverflowWrapValue::Normal {
-                        let mut options = normal_options;
-                        options.overflow_wrap = match chunk.style.overflow_wrap {
-                            OverflowWrapValue::BreakWord => OverflowWrap::BreakWord,
-                            OverflowWrapValue::Anywhere => OverflowWrap::Anywhere,
-                            OverflowWrapValue::Normal => OverflowWrap::Normal,
-                        };
-                        Some(split_spans(
-                            &chunk.text,
-                            &clusters,
-                            &break_opportunities(&chunk.text, &options),
-                        ))
-                    } else {
-                        None
-                    };
                 for (position, span) in normal_spans.iter().enumerate() {
                     let break_before = if position == 0 {
                         previous
@@ -958,7 +1025,7 @@ pub(crate) fn build_lines(
                     } else {
                         true
                     };
-                    builder.place_text(index, span, break_before, emergency_spans.as_deref());
+                    builder.place_text(index, span, break_before, emergency);
                 }
                 previous = Some(index);
             }
@@ -976,9 +1043,9 @@ pub(crate) fn build_lines(
 
 /// 断行状态：已放置片段、行内游标与行盒输出。
 struct LineBuilder<'a> {
-    shaper: &'a dyn TextShaper,
+    shaping: &'a crate::ShapingContext<'a>,
     items: &'a [InlineItem],
-    shaped_items: Vec<Option<ShapedText>>,
+    analysis: &'a [Option<ChunkAnalysis>],
     max_width: f32,
     strut_above: f32,
     strut_below: f32,
@@ -997,15 +1064,18 @@ struct LineBuilder<'a> {
 }
 
 impl LineBuilder<'_> {
-    /// 一个文本块样式下的字体度量。
+    /// 一个文本 chunk 的整形结果（宽度无关，来自逐 chunk 分析缓存）。
+    fn shaped(&self, item_index: usize) -> Option<&ShapedText> {
+        self.analysis
+            .get(item_index)
+            .and_then(|slot| slot.as_ref())
+            .map(|analysis| &analysis.shaped)
+    }
+
+    /// 一个文本块样式下的字体度量（布局级缓存：同一样式整次布局只
+    /// 整形一次探针）。
     fn metrics(&self, style: &ComputedStyle) -> FontMetrics {
-        self.shaper
-            .metrics(&text_style(style))
-            .unwrap_or(FontMetrics {
-                ascent: 0.0,
-                descent: 0.0,
-                line_height: 0.0,
-            })
+        self.shaping.metrics(&text_style(style))
     }
 
     /// 一个文本片段的簇分组与每簇的 advance 增量。
@@ -1023,7 +1093,7 @@ impl LineBuilder<'_> {
         let InlineItem::Text(chunk) = &self.items[item_index] else {
             return (Vec::new(), Vec::new());
         };
-        let Some(shaped) = self.shaped_items[item_index].as_ref() else {
+        let Some(shaped) = self.shaped(item_index) else {
             return (Vec::new(), Vec::new());
         };
         let mut groups = cluster_groups(shaped, glyphs, span_end, &chunk.text, &chunk.tabs);
@@ -1086,7 +1156,7 @@ impl LineBuilder<'_> {
         if start >= end {
             return None;
         }
-        let shaped = self.shaped_items[item_index].as_ref()?;
+        let shaped = self.shaped(item_index)?;
         let glyphs = glyph_range(shaped, start, end);
         if glyphs.is_empty() {
             return None;
@@ -1106,9 +1176,7 @@ impl LineBuilder<'_> {
             return;
         };
         let glyphs = {
-            let shaped = self.shaped_items[item_index]
-                .as_ref()
-                .expect("text item shaped");
+            let shaped = self.shaped(item_index).expect("text item shaped");
             glyph_range(shaped, start, end)
         };
         if glyphs.is_empty() {
@@ -1116,7 +1184,7 @@ impl LineBuilder<'_> {
         }
         let spacing = Spacing::of(&chunk.style);
         let width = {
-            let shaped = self.shaped_items[item_index].as_ref().expect("shaped");
+            let shaped = self.shaped(item_index).expect("shaped");
             let (_, deltas) = self.span_groups_deltas(item_index, &glyphs, end, self.cursor);
             glyph_width(shaped, &glyphs) + deltas.iter().sum::<f32>()
         };
@@ -1304,7 +1372,7 @@ impl LineBuilder<'_> {
             {
                 let stop = trailing_space_start(&chunk.text, start, end);
                 if stop < end
-                    && let Some(shaped) = self.shaped_items[last.item_index].as_ref()
+                    && let Some(shaped) = self.shaped(last.item_index)
                 {
                     let cut = shaped
                         .glyphs
@@ -1397,8 +1465,8 @@ impl LineBuilder<'_> {
         for (position, placed_item) in self.placed.iter().enumerate() {
             match &self.items[placed_item.item_index] {
                 InlineItem::Text(chunk) => {
-                    let shaped = self.shaped_items[placed_item.item_index]
-                        .as_ref()
+                    let shaped = self
+                        .shaped(placed_item.item_index)
                         .expect("text item shaped");
                     let mut glyphs = placed_item.glyphs.clone().expect("text has glyphs");
                     let (span_start, span_end) = placed_item.span.expect("text has span");
