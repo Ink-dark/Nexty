@@ -21,7 +21,6 @@
 
 #![forbid(unsafe_code)]
 
-#[cfg(feature = "cpu")]
 use std::sync::Arc;
 
 use nexty_text::ResolvedFont;
@@ -196,9 +195,9 @@ pub enum Command {
     },
     /// 绘制一幅已解码图像。
     ///
-    /// 像素经 [`Scene::images`] 按下标间接引用，不内联在指令里：`Scene`
-    /// 每帧都要整体 clone（渲染线程按值接收），内联会让每次 clone 退化成
-    /// 大块内存拷贝。
+    /// 像素经 [`Scene::images`] 按下标间接引用，不内联在指令里：像素是
+    /// 数 MB 级的大块内存，按 `Arc` 引用计数共享（构建、发送与光栅全程
+    /// 零拷贝），内联则每次场景移动都会退化成整块拷贝。
     DrawImage {
         /// 目标矩形（图像左上角落点 + 绘制尺寸）。
         rect: Rect,
@@ -247,8 +246,9 @@ impl Image {
 pub struct Scene {
     /// 按绘制顺序排列的指令。
     pub commands: Vec<Command>,
-    /// 图像资源池；[`Command::DrawImage`] 按下标引用。
-    pub images: Vec<Image>,
+    /// 图像资源池（按 `Arc` 共享，构建/发送/光栅全程零像素拷贝）；
+    /// [`Command::DrawImage`] 按下标引用。
+    pub images: Vec<Arc<Image>>,
 }
 
 /// 光栅化结果。
@@ -840,7 +840,7 @@ mod tests {
                 rect: rect(2.0, 3.0, 4.0, 5.0),
                 image: 0,
             }],
-            images: vec![solid_image(4, 5, [0, 128, 255, 255])],
+            images: vec![Arc::new(solid_image(4, 5, [0, 128, 255, 255]))],
         };
         let pixmap = VelloCpuRasterizer::new()
             .rasterize(&scene, size(10, 12))
@@ -864,7 +864,7 @@ mod tests {
                 rect: rect(0.0, 0.0, 4.0, 4.0),
                 image: 0,
             }],
-            images: vec![solid_image(2, 2, [255, 0, 0, 255])],
+            images: vec![Arc::new(solid_image(2, 2, [255, 0, 0, 255]))],
         };
         let pixmap = VelloCpuRasterizer::new()
             .rasterize(&scene, size(6, 6))
@@ -887,7 +887,7 @@ mod tests {
                 rect: rect(6.0, 6.0, 8.0, 8.0),
                 image: 0,
             }],
-            images: vec![solid_image(8, 8, [0, 255, 0, 255])],
+            images: vec![Arc::new(solid_image(8, 8, [0, 255, 0, 255]))],
         };
         let pixmap = VelloCpuRasterizer::new()
             .rasterize(&scene, size(10, 10))
@@ -905,7 +905,7 @@ mod tests {
                 rect: rect(0.0, 0.0, 4.0, 4.0),
                 image: 0,
             }],
-            images: vec![solid_image(4, 4, [255, 255, 255, 128])],
+            images: vec![Arc::new(solid_image(4, 4, [255, 255, 255, 128]))],
         };
         let pixmap = VelloCpuRasterizer::new()
             .rasterize(&scene, size(6, 6))
@@ -924,7 +924,7 @@ mod tests {
                 rect: rect(0.0, 0.0, 4.0, 4.0),
                 image: 7,
             }],
-            images: vec![solid_image(4, 4, [255, 0, 0, 255])],
+            images: vec![Arc::new(solid_image(4, 4, [255, 0, 0, 255]))],
         };
         let pixmap = VelloCpuRasterizer::new()
             .rasterize(&scene, size(6, 6))
@@ -943,7 +943,7 @@ mod tests {
                 rect: rect(0.0, 0.0, 4.0, 4.0),
                 image: 0,
             }],
-            images: vec![Image::new(4, 4, vec![255, 0, 0])],
+            images: vec![Arc::new(Image::new(4, 4, vec![255, 0, 0]))],
         };
         let pixmap = VelloCpuRasterizer::new()
             .rasterize(&scene, size(6, 6))
@@ -962,7 +962,7 @@ mod tests {
                     image: 0,
                 },
             ],
-            images: vec![solid_image(4, 4, [255, 0, 0, 255])],
+            images: vec![Arc::new(solid_image(4, 4, [255, 0, 0, 255]))],
         };
         let pixmap = VelloCpuRasterizer::new()
             .rasterize(&scene, size(6, 6))
@@ -1160,7 +1160,7 @@ mod tests {
                 rect: rect(0.0, 0.0, 4.0, 4.0),
                 image: 0,
             }],
-            images: vec![image],
+            images: vec![Arc::new(image)],
         };
         let pixmap = VelloCpuRasterizer::new()
             .rasterize(&scene, size(6, 6))

@@ -601,7 +601,7 @@ impl BrowserApp {
         let Some(renderer) = &self.renderer else {
             return;
         };
-        match renderer.render(&scene, viewport) {
+        match renderer.render(scene, viewport) {
             Ok(pixmap) => gpu.present(&pixmap, window),
             Err(error) => {
                 // 渲染失败不拖垮主进程：清屏为灰色并上报

@@ -10,6 +10,7 @@
 //! 决定底色）；片段树不做滚动裁剪。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use nexty_css::{
     ComputedStyle, MediaViewport, Rgba, Stylesheet, compute_document_styles,
@@ -30,7 +31,8 @@ pub struct Page {
     /// 作者样式表（视口变化后重级联用；UA 样式表固定不存）。
     stylesheets: Vec<Stylesheet>,
     /// 已解码图片（`<img>` 节点 → RGBA 图像），构建 Scene 时进入图片池。
-    pub images: HashMap<NodeId, Image>,
+    /// 按 `Arc` 共享：构建/发送/光栅全程零像素拷贝（M1）。
+    pub images: HashMap<NodeId, Arc<Image>>,
 }
 
 /// 用已解析文档与作者样式表构建页面（UA 样式表固定为 nexty-css 的 HTML 默认）。
@@ -44,7 +46,7 @@ pub struct Page {
 pub fn build_page(
     document: Document,
     stylesheets: Vec<Stylesheet>,
-    images: HashMap<NodeId, Image>,
+    images: HashMap<NodeId, Arc<Image>>,
 ) -> Page {
     let sheet_refs: Vec<&Stylesheet> = stylesheets.iter().collect();
     let styles = compute_document_styles(&document, &sheet_refs, Some(html_ua_stylesheet()));
@@ -539,7 +541,8 @@ fn draw_image_at(
         Some(index) => *index,
         None => {
             let index = scene.images.len();
-            scene.images.push(source.clone());
+            // Arc 引用计数共享像素：同一节点多图与跨帧重建均零拷贝（M1）
+            scene.images.push(Arc::clone(source));
             pool.insert(node, index);
             index
         }

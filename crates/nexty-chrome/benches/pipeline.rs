@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::hint::black_box;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nexty_chrome::bench::{
@@ -64,7 +65,7 @@ struct Corpus {
     name: &'static str,
     html: String,
     css: String,
-    images: HashMap<NodeId, Image>,
+    images: HashMap<NodeId, Arc<Image>>,
 }
 
 impl Corpus {

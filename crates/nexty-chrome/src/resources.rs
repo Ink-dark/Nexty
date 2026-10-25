@@ -9,6 +9,7 @@
 //! 图片失败 = 该节点不产生像素（布局回退默认对象尺寸 300×150）。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use nexty_css::Stylesheet;
 use nexty_dom::{Document, NodeId};
@@ -35,8 +36,9 @@ pub const MAX_IMAGE_BODY_BYTES: usize = 50 * 1024 * 1024;
 pub struct Subresources {
     /// 作者样式表，按级联优先级排列（inline 与外链按文档出现顺序交错）。
     pub stylesheets: Vec<Stylesheet>,
-    /// 已解码图片（`<img>` 节点 → RGBA 图像）。
-    pub images: HashMap<NodeId, Image>,
+    /// 已解码图片（`<img>` 节点 → RGBA 图像）。同一 URL 的多个节点共享
+    /// 一份像素（`Arc` 引用计数，M1 零拷贝）。
+    pub images: HashMap<NodeId, Arc<Image>>,
 }
 
 /// 抓取文档的子资源（CSS + 图片）。
@@ -118,7 +120,7 @@ pub fn fetch_subresources(
         }
     }
 
-    let mut images: HashMap<NodeId, Image> = HashMap::new();
+    let mut images: HashMap<NodeId, Arc<Image>> = HashMap::new();
     for (task, url) in image_tasks.iter().enumerate() {
         let Some(bytes) = &image_bytes[task] else {
             continue; // 抓取失败：该图所有节点都无像素（降级）
@@ -126,8 +128,10 @@ pub fn fetch_subresources(
         match decode(bytes) {
             Ok(image) => {
                 if let Some(nodes) = image_urls.get(url) {
+                    // 一份像素按 Arc 共享给该 URL 的全部节点（M1 零拷贝）
+                    let shared = Arc::new(image);
                     for node in nodes {
-                        images.insert(*node, image.clone());
+                        images.insert(*node, Arc::clone(&shared));
                     }
                 }
             }

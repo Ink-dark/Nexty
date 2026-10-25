@@ -401,7 +401,7 @@ fn render_thread_round_trips() {
     };
     let pixmap = thread
         .render(
-            &scene,
+            scene,
             Size {
                 width: 8,
                 height: 8,
@@ -443,14 +443,16 @@ fn render_thread_survives_panic_and_keeps_serving() {
         height: 4,
     };
 
-    let error = thread.render(&scene, size).expect_err("first call panics");
+    let error = thread
+        .render(scene.clone(), size)
+        .expect_err("first call panics");
     match error {
         RenderError::Panicked(message) => assert!(message.contains("injected")),
         RenderError::Raster(_) => panic!("expected panic error"),
     }
 
     // 兜底后线程存活：第二次调用正常返回
-    let pixmap = thread.render(&scene, size).expect("second call succeeds");
+    let pixmap = thread.render(scene, size).expect("second call succeeds");
     assert_eq!(pixmap.data, vec![1, 2, 3, 4]);
 }
 
@@ -465,7 +467,7 @@ fn render_thread_reports_raster_errors() {
     let thread = RenderThread::spawn(Arc::new(AlwaysEmpty));
     let error = thread
         .render(
-            &Scene::default(),
+            Scene::default(),
             Size {
                 width: 0,
                 height: 0,
@@ -571,6 +573,24 @@ fn load_page_with_resources(
     (document, resources)
 }
 
+/// M1 零拷贝：同一 URL 的多个 `<img>` 节点共享同一份像素（解码一次，
+/// `Arc` 引用计数），页面池内两两 `Arc::ptr_eq`。
+#[test]
+fn same_url_images_share_one_pixel_buffer() {
+    let fetcher = MockFetcher::new();
+    fetcher.serve("https://page.test/dot.png", &tiny_png());
+    let html = "<body><img src=dot.png><p>x</p><img src=dot.png></body>";
+    let (_, sub) = load_page_with_resources(&fetcher, "https://page.test/index.html", html);
+    assert_eq!(sub.images.len(), 2, "两个节点都有像素");
+    let [a, b] = sub
+        .images
+        .values()
+        .collect::<Vec<_>>()
+        .try_into()
+        .expect("two entries");
+    assert!(Arc::ptr_eq(a, b), "同 URL 的两个节点共享一份像素");
+}
+
 /// 含外链 CSS + 图片的页面：级联按源顺序，图片按 DrawImage 下发。
 #[test]
 fn subresources_load_and_scene_carries_external_css_and_image() {
@@ -610,6 +630,13 @@ fn subresources_load_and_scene_carries_external_css_and_image() {
     assert_eq!(scene.images.len(), 1, "图片池一份像素");
     assert_eq!(index, 0);
     assert!(approx(rect.width, 10.0) && approx(rect.height, 10.0));
+    // M1 零拷贝：场景图片池与页面图片池是同一份像素（Arc 引用计数共享，
+    // 构建路径无深拷贝）
+    let page_image = page.images.values().next().expect("page has image");
+    assert!(
+        Arc::ptr_eq(page_image, &scene.images[0]),
+        "scene 与 page 的图片必须是同一份像素"
+    );
     // 图片落点在地址栏下方内容区（y > 0）且在文本之后
     assert!(rect.y > 0.0);
     assert!(

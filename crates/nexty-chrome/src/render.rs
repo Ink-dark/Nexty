@@ -80,16 +80,20 @@ impl RenderThread {
 
     /// 请求一帧光栅化，阻塞等待结果。
     ///
+    /// 接收 `Scene` **所有权**（M1 零拷贝）：app 侧构建后直接 move，不再
+    /// 整体 clone 一份发线程——场景含全部字形与图片 `Arc`，整体克隆是每
+    /// 帧一次的整树深拷贝。
+    ///
     /// # Errors
     ///
     /// 光栅失败或渲染线程 panic 时返回 [`RenderError`]；通道断裂
     /// （线程意外退出）也归入 [`RenderError::Panicked`]。
-    pub fn render(&self, scene: &Scene, size: Size) -> Result<Pixmap, RenderError> {
+    pub fn render(&self, scene: Scene, size: Size) -> Result<Pixmap, RenderError> {
         let (reply_sender, reply_receiver) = std::sync::mpsc::channel();
         self.sender
             .as_ref()
             .expect("render thread sender")
-            .send((scene.clone(), size, reply_sender))
+            .send((scene, size, reply_sender))
             .map_err(|_| RenderError::Panicked("render thread terminated".to_owned()))?;
         reply_receiver
             .recv()

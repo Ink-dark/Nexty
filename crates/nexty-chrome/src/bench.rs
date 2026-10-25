@@ -10,6 +10,7 @@
 //! - [`CountingShaper`] 把 H4 的放大倍数表达为 shape / metrics 调用次数
 //!   （机器无关），是 T2 优化前后的对照量。
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nexty_dom::{Document, Namespace, NodeId, NodeKind};
@@ -243,9 +244,9 @@ fn image_nodes(document: &Document) -> Vec<NodeId> {
 }
 
 /// 为文档里的每个 `<img>` 生成一张确定性 RGBA 图（320×200，按节点序
-/// 填充渐变噪声图案），返回页面图片池。
+/// 填充渐变噪声图案），返回页面图片池（`Arc` 共享，与 `Page.images` 同型）。
 #[must_use]
-pub fn fill_images(document: &Document) -> std::collections::HashMap<NodeId, Image> {
+pub fn fill_images(document: &Document) -> std::collections::HashMap<NodeId, Arc<Image>> {
     const WIDTH: u32 = 320;
     const HEIGHT: u32 = 200;
     let nodes = image_nodes(document);
@@ -264,7 +265,7 @@ pub fn fill_images(document: &Document) -> std::collections::HashMap<NodeId, Ima
                 ]);
             }
         }
-        images.insert(*node, Image::new(WIDTH, HEIGHT, data));
+        images.insert(*node, Arc::new(Image::new(WIDTH, HEIGHT, data)));
     }
     images
 }
