@@ -386,7 +386,10 @@ fn document_title_extraction() {
 
 #[test]
 fn render_thread_round_trips() {
-    let thread = RenderThread::spawn(Arc::new(nexty_paint::VelloCpuRasterizer::new()));
+    let thread = RenderThread::spawn(
+        Arc::new(nexty_paint::VelloCpuRasterizer::new()),
+        Arc::new(|| {}),
+    );
     let scene = Scene {
         commands: vec![Command::FillRect {
             rect: nexty_paint::Rect {
@@ -434,9 +437,12 @@ impl Rasterizer for PanicsOnce {
 
 #[test]
 fn render_thread_survives_panic_and_keeps_serving() {
-    let thread = RenderThread::spawn(Arc::new(PanicsOnce {
-        calls: AtomicUsize::new(0),
-    }));
+    let thread = RenderThread::spawn(
+        Arc::new(PanicsOnce {
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(|| {}),
+    );
     let scene = Scene::default();
     let size = Size {
         width: 4,
@@ -464,7 +470,7 @@ fn render_thread_reports_raster_errors() {
             Err(RasterError::EmptySize)
         }
     }
-    let thread = RenderThread::spawn(Arc::new(AlwaysEmpty));
+    let thread = RenderThread::spawn(Arc::new(AlwaysEmpty), Arc::new(|| {}));
     let error = thread
         .render(
             Scene::default(),
