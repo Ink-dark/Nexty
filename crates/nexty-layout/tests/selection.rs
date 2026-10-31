@@ -278,6 +278,49 @@ fn text_position(node: NodeId, offset: usize) -> TextPosition {
     TextPosition { node, offset }
 }
 
+/// 浮动环绕：浮动旁的行仍在 `TextMap` 里可命中，选区矩形按收缩后的行几何
+/// （左缘让出左浮动，不与浮动重叠）。
+#[test]
+fn wrapped_lines_are_hit_testable_and_selectable() {
+    let words = "word ".repeat(20);
+    let (document, root) = layout(
+        &format!(
+            "<body><div style=\"float: left; width: 100px; height: 60px\"></div>\
+             {words}</body>"
+        ),
+        "",
+        400.0,
+    );
+    let body_node = find(&document, &root, "body").unwrap().node;
+    let text_node = direct_text_node(&document, body_node);
+    let map = TextMap::new(&root);
+
+    // 首行文本在浮动右侧：该点命中首个词内的源偏移（0..4）
+    let hit = map.hit(120.0, 8.0).expect("hit on wrapped first line");
+    assert_eq!(hit.node, text_node);
+    assert!(hit.offset <= 4, "命中首词内部（offset={}）", hit.offset);
+    // 浮动盒覆盖的点（左侧 0–100px）：无精确文本，按吸附语义落到最近的
+    // 正文行首（浮动盒本身不是文本，不产生命中原点）
+    let snapped = map.hit(50.0, 8.0).expect("snaps to nearest line");
+    assert_eq!(snapped.node, text_node);
+    assert!(
+        snapped.offset <= 1,
+        "吸附到行首附近（offset={}）",
+        snapped.offset
+    );
+    // 选区矩形不会伸进浮动盒：首行相对 body 内容盒的左缘 ≥ 100
+    let origin = content_origin(&document, &root, "body").expect("body origin");
+    let rects = map.rects(text_position(text_node, 0), text_position(text_node, 4));
+    assert!(!rects.is_empty());
+    for rect in &rects {
+        assert!(
+            origin.0 + rect.x >= 100.0 - 0.01,
+            "浮动旁的选区矩形让出浮动（左缘={}）",
+            origin.0 + rect.x
+        );
+    }
+}
+
 #[test]
 fn hit_snaps_to_glyph_halves_and_line_ends() {
     let (document, root) = layout("<p>ab</p>", "", 400.0);
