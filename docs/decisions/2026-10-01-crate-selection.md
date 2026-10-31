@@ -130,3 +130,8 @@ MusKitty 从零手写浏览器核心模块（HTML/CSS/Layout/Render/Network 全�
 - **swash 退出**：选型时假设文本整形栈为 `parley + swash + fontique`。落地时核实：parley 0.11 的整形后端是 `harfrust`（HarfBuzz 整形算法的 Rust 实现，纯 Rust、Apache-2.0），字体选择用 `fontique`，swash 不参与。`nexty-text` 只依赖 parley，swash 移出依赖树。
 - **vello_hybrid 缓接**：GPU 后端需要 wgpu device/surface，只有 chrome 层能提供。本轮 `nexty-paint` 仅落地 `vello_cpu` 后端并摘除 vello_hybrid 依赖，`Rasterizer` trait 保留为双后端接缝；接入时按上文约束对齐 wgpu 版本（当前 vello_hybrid 0.2 → wgpu 29）。
 - **nexty-text 的 `FontFamily` 处理**：CSS 字体族列表的解析（族名 / generic 关键字 / 回退顺序）直接交给 parley 的 `FontFamily::Source`，本层不重复解析。
+
+## 修正记录（2026-10-31，float 轮）
+
+- **float 放置采用 taffy `float_layout`，不自研**：浮动放置、`clear`、块盒/BFC 避让与容器高度贡献（`FloatContext` / BFC 槽位 / `float_content_contribution`）由 taffy 0.14 的 `float_layout` feature 提供，`nexty-layout` 只做样式映射（`float`/`clear`）与 blockify 拦截（绝对/固定定位上 `float: none`；flex/grid item 由 taffy 算法忽略，等价于计算值 none）。
+- **上游边界：measure 叶没有行盒收缩**。taffy 的浮动实现只对**有子内容可下钻**的盒子收缩可用宽；run 叶（自研文本叶）是 measure 节点，拿不到浮动区间，行盒会与浮动重叠。`nexty-layout` 补一个**环绕修正 pass**：首轮解算后按 taffy 已放置的浮动矩形逐行收缩重排 run 叶行盒（`build_lines` 的 `LineConstraints.floats`），行数变化时回写叶定高再解算一轮（浮动尺寸与文本无关，一次迭代即固定点）。浮动矩形沿祖先 BFC 传播到后代 run 叶（跨块边界），遇建立新 BFC 的盒子截断。

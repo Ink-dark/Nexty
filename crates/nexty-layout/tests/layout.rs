@@ -1771,6 +1771,38 @@ fn float_left_wraps_subsequent_text() {
     );
 }
 
+/// 浮动在祖先容器、文本在后代块（`<p>`）内：祖先 BFC 的浮动同样收缩后代
+/// 行盒（CSS 2.2 §9.5 的行盒规则不分块边界）。
+#[test]
+fn ancestor_float_wraps_descendant_paragraph() {
+    let words = "word ".repeat(40);
+    let (document, root) = layout(
+        &format!(
+            "<body><div style=\"float: left; width: 100px; height: 60px\">F</div>\
+             <p>{words}</p></body>"
+        ),
+        "p { margin: 0 }",
+        400.0,
+    );
+    let paragraph = find(&document, &root, "p").expect("paragraph fragment");
+    let mut y = paragraph.border_box.y;
+    let mut beside = 0usize;
+    for line in &paragraph.lines {
+        if y < 60.0 - 0.01 {
+            let x = line
+                .runs
+                .first()
+                .and_then(|run| run.glyphs.first())
+                .map(|glyph| glyph.x + paragraph.border_box.x)
+                .unwrap_or(f32::MAX);
+            assert!(x >= 100.0 - 0.01, "段内行让出浮动（y={y}, x={x}）");
+            beside += 1;
+        }
+        y += line.height;
+    }
+    assert!(beside >= 1, "浮动旁至少一行（实际 {beside}）");
+}
+
 /// 右浮动：浮动旁的行右缘收缩到浮动左缘之前。
 #[test]
 fn float_right_shrinks_line_right_edge() {

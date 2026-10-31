@@ -72,3 +72,40 @@ float 优先于 table / position:fixed）。
 
 ## 整轮退出条件
 T1–T5 退出条件全部满足；`goal.md` 归档 + push；等用户验收。
+
+---
+
+## 归档结果（2026-10-31）
+
+**落地方式**（侦察后调整）：taffy 0.14 自带 `float_layout`（浮动放置 / clear /
+BFC 槽位 / 高度贡献），本轮启用该 feature 而非自研浮动放置。taffy 的上游边界是
+**measure 叶没有行盒收缩**（run 叶拿不到浮动区间，文本会与浮动重叠），由
+`nexty-layout` 的**环绕修正 pass** 补齐：首轮解算后按 taffy 已放置的浮动矩形
+逐行收缩重排 run 叶行盒，行数变化时回写叶定高再解算一轮（一次迭代固定点）。
+浮动矩形沿祖先 BFC 传播到后代 run 叶（跨 `<p>` 等块边界），遇新 BFC 截断。
+
+**版本**：css 0.1.15（`float`/`clear` 解析）、layout 0.1.29（接线 + 环绕 pass +
+跨容器传播修复）。
+
+**commit**：
+- `952d723` css：float/clear 解析（CSS 2.1 §9.5），不继承（0.1.15）
+- `9821385` layout：启用 taffy float_layout + 样式映射 + 环绕 pass（0.1.28）
+- `6d62b99` layout：浮动行盒的命中与选区几何测试
+- T5 收尾（本文档 + AGENTS.md + ADR + 跨容器传播修复）
+
+**测试**：layout 集成测试 +7（左右浮动环绕、clear、BFC 高度包含、双浮动并排、
+右侧行右缘收缩、图片浮动、祖先浮动影响后代段落）；选区 +1（环绕行的命中与
+选区矩形让出浮动）；全 workspace 绿。
+
+**实机冒烟**（`.workbuddy/t3-test/float.html`，http://127.0.0.1:8931/）：
+左浮动 160×120 + 右浮动 120×90 图文环绕逐行收缩、第 5 行起回到全宽、`clear:
+both` 段落在浮动下方、`overflow:hidden` 容器内文本让出内部浮动；双击选词 +
+Ctrl+C + 滚动正常。**顺带确认的 paint 缺口**（非本轮）：`background-color`
+未下发绘制，验证浮动盒位置需用 `border`。
+
+**修过的过程性缺陷**：首版环绕 pass 只处理「同容器的 run 叶」，实机抓到
+`<body>` 浮动 + `<p>` 文本不收缩——改为递归携带绝对坐标与活跃浮动表。
+
+**遗留（下轮候选）**：行顶 y 判定不做行内跨区间细化（行跨入更窄区间时按行顶
+宽放置）；浮动只按文档序判定「前置」，复杂交叠堆叠以 taffy 放置为准；
+`float: inline-start/end` 未做；paint 的 background-color / 圆角 / 渐变仍缺。
