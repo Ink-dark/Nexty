@@ -17,13 +17,15 @@ use nexty_dom::{Document, NodeId, NodeKind};
 use crate::parser::{Declaration, MediaViewport, StyleRule, Stylesheet, parse_inline_style};
 use crate::selector::{NextySelector, atom_str, match_element_selectors};
 use crate::value::{
-    AbsoluteSize, AlignItemsValue, AlignSelfValue, BorderColorValue, BorderStyle, BorderWidthValue,
-    BoxSizingValue, ClearValue, CssWideKeyword, DeclaredValue, DisplayValue, FlexDirectionValue,
-    FlexWrapValue, FloatValue, FontFamilyValue, FontSizeValue, FontStyleValue, FontWeightValue,
-    GapValue, GridAutoFlowValue, GridTrackList, InsetValue, JustifyContentValue, LineHeightValue,
-    MAX_CSS_LENGTH, MarginValue, OverflowValue, OverflowWrapValue, PaddingValue, PositionValue,
-    PropertyId, PropertyValue, Rgba, SizeValue, SpacingValue, TabSizeValue, TextAlignValue,
-    TextIndentValue, ViewportUnit, WhiteSpaceValue, WordBreakValue,
+    AbsoluteSize, AlignItemsValue, AlignSelfValue, BackgroundImageValue, BorderColorValue,
+    BorderRadiusValue, BorderStyle, BorderWidthValue, BoxSizingValue, ClearValue, CssWideKeyword,
+    DeclaredValue, DisplayValue, FlexDirectionValue, FlexWrapValue, FloatValue, FontFamilyValue,
+    FontSizeValue, FontStyleValue, FontWeightValue, GapValue, GridAutoFlowValue, GridTrackList,
+    InsetValue, JustifyContentValue, LineHeightValue, MAX_CSS_LENGTH, MarginValue, OverflowValue,
+    OverflowWrapValue, PaddingValue, PositionValue, PropertyId, PropertyValue, Rgba, SizeValue,
+    SpacingValue, TabSizeValue, TextAlignValue, TextDecorationColorValue, TextDecorationLineValue,
+    TextDecorationStyleValue, TextIndentValue, ViewportUnit, WhiteSpaceValue, WordBreakValue,
+    ZIndexValue,
 };
 
 /// 本层 UA 的 medium 字号基准（CSS Fonts 4 §2.5：initial 值由 UA 决定，
@@ -39,6 +41,9 @@ pub struct ComputedStyle {
     pub color: Rgba,
     /// `background-color`。
     pub background_color: Rgba,
+    /// `background-image`（CSS Backgrounds 3 §2；不继承；基础档仅
+    /// none / linear-gradient，色标位置已归一为 0–1）。
+    pub background_image: BackgroundImageValue,
     /// 计算字号（CSS px）。
     pub font_size: f32,
     /// 计算字重（1–1000）。
@@ -66,6 +71,19 @@ pub struct ComputedStyle {
     pub text_indent: TextIndentValue,
     /// `tab-size`（CSS Text 3 §5；整数形态由 layout 按空格 advance 解析）。
     pub tab_size: TabSizeValue,
+    /// `text-decoration-line`（CSS Text Decoration 3 §3；不继承——规范的
+    /// 装饰线「传播」语义不实现，由消费方按元素自身 computed style 画，
+    /// 记偏差）。
+    pub text_decoration_line: TextDecorationLineValue,
+    /// `text-decoration-style`（CSS Text Decoration 3 §5；解析存储，
+    /// 渲染仅 solid——偏差）。
+    pub text_decoration_style: TextDecorationStyleValue,
+    /// `text-decoration-color`（CSS Text Decoration 3 §4；currentcolor 已按
+    /// 本元素 color 解析）。
+    pub text_decoration_color: Rgba,
+    /// `z-index`（CSS Position 3 §5；不继承；基础定序由 chrome pipeline
+    /// 消费，完整 stacking context 留 K7）。
+    pub z_index: ZIndexValue,
     /// `width`（百分比由 layout 解析）。
     pub width: SizeValue,
     /// `height`（百分比由 layout 解析）。
@@ -126,6 +144,9 @@ pub struct ComputedStyle {
     pub border_style: Edges<BorderStyle>,
     /// 四边 border 颜色（currentcolor 已按本元素 color 解析）。
     pub border_color: Edges<Rgba>,
+    /// 四角 border-radius（top-left / top-right / bottom-right / bottom-left；
+    /// 百分比相对边框盒对应轴尺寸，由消费方解析）。
+    pub border_radius: Corners<BorderRadiusValue>,
 }
 
 /// 四边值（top / right / bottom / left）。
@@ -154,6 +175,34 @@ impl<T: Copy> Edges<T> {
     }
 }
 
+/// 四角值（top-left / top-right / bottom-right / bottom-left，
+/// [CSS Backgrounds 3 §5.1](https://drafts.csswg.org/css-backgrounds-3/#border-radius)
+/// 的角顺序）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Corners<T> {
+    /// 左上角。
+    pub top_left: T,
+    /// 右上角。
+    pub top_right: T,
+    /// 右下角。
+    pub bottom_right: T,
+    /// 左下角。
+    pub bottom_left: T,
+}
+
+impl<T: Copy> Corners<T> {
+    /// 用同一值填充四角。
+    #[must_use]
+    pub const fn splat(value: T) -> Self {
+        Self {
+            top_left: value,
+            top_right: value,
+            bottom_right: value,
+            bottom_left: value,
+        }
+    }
+}
+
 impl ComputedStyle {
     /// 全部属性取 initial 值。
     ///
@@ -166,6 +215,7 @@ impl ComputedStyle {
             display: DisplayValue::Inline,
             color: Rgba::opaque(0, 0, 0),
             background_color: Rgba::transparent(),
+            background_image: BackgroundImageValue::None,
             font_size: MEDIUM_FONT_SIZE,
             font_weight: 400.0,
             font_style: FontStyleValue::Normal,
@@ -179,6 +229,10 @@ impl ComputedStyle {
             word_spacing: SpacingValue::Normal,
             text_indent: TextIndentValue::Length(0.0),
             tab_size: TabSizeValue::Integer(8),
+            text_decoration_line: TextDecorationLineValue::None,
+            text_decoration_style: TextDecorationStyleValue::Solid,
+            text_decoration_color: Rgba::opaque(0, 0, 0),
+            z_index: ZIndexValue::Auto,
             width: SizeValue::Auto,
             height: SizeValue::Auto,
             min_width: SizeValue::Auto,
@@ -209,6 +263,7 @@ impl ComputedStyle {
             border_width: Edges::splat(0.0),
             border_style: Edges::splat(BorderStyle::None),
             border_color: Edges::splat(Rgba::opaque(0, 0, 0)),
+            border_radius: Corners::splat(BorderRadiusValue::Length(0.0)),
         }
     }
 }
@@ -240,12 +295,13 @@ impl PropertyId {
 /// 全部属性的固定枚举顺序。
 ///
 /// 顺序承载计算依赖：`FontSize` 先于 `LineHeight`（百分比按自身字号折算）、
-/// `Color` 先于 border 颜色（currentcolor）、border style 先于 width
-/// （none/hidden 时宽度归零）。
-const PROPERTY_ORDER: [PropertyId; 64] = [
+/// `Color` 先于 border / text-decoration 颜色（currentcolor）、border style
+/// 先于 width（none/hidden 时宽度归零）。
+const PROPERTY_ORDER: [PropertyId; 73] = [
     PropertyId::Display,
     PropertyId::Color,
     PropertyId::BackgroundColor,
+    PropertyId::BackgroundImage,
     PropertyId::FontSize,
     PropertyId::FontWeight,
     PropertyId::FontStyle,
@@ -259,6 +315,9 @@ const PROPERTY_ORDER: [PropertyId; 64] = [
     PropertyId::WordSpacing,
     PropertyId::TextIndent,
     PropertyId::TabSize,
+    PropertyId::TextDecorationLine,
+    PropertyId::TextDecorationStyle,
+    PropertyId::TextDecorationColor,
     PropertyId::Width,
     PropertyId::Height,
     PropertyId::MinWidth,
@@ -276,6 +335,7 @@ const PROPERTY_ORDER: [PropertyId; 64] = [
     PropertyId::Right,
     PropertyId::Bottom,
     PropertyId::Left,
+    PropertyId::ZIndex,
     PropertyId::FlexDirection,
     PropertyId::FlexWrap,
     PropertyId::FlexShrink,
@@ -307,6 +367,10 @@ const PROPERTY_ORDER: [PropertyId; 64] = [
     PropertyId::BorderRightColor,
     PropertyId::BorderBottomColor,
     PropertyId::BorderLeftColor,
+    PropertyId::BorderTopLeftRadius,
+    PropertyId::BorderTopRightRadius,
+    PropertyId::BorderBottomRightRadius,
+    PropertyId::BorderBottomLeftRadius,
 ];
 
 /// 级联 origin 桶（CSS Cascade 5 §6.4，仅 UA 与 author 两个 origin；
@@ -981,6 +1045,7 @@ resolve_viewport!(resolve_inset, InsetValue);
 resolve_viewport!(resolve_margin, MarginValue);
 resolve_viewport!(resolve_padding, PaddingValue);
 resolve_viewport!(resolve_gap, GapValue);
+resolve_viewport!(resolve_border_radius, BorderRadiusValue);
 
 /// 逐属性解析出 computed style。
 fn resolve_all(
@@ -1010,6 +1075,9 @@ fn resolve_all(
             }
             (PropertyId::BackgroundColor, Decision::Use(PropertyValue::Color(value))) => {
                 style.background_color = *value;
+            }
+            (PropertyId::BackgroundImage, Decision::Use(PropertyValue::BackgroundImage(value))) => {
+                style.background_image = value.clone();
             }
             (PropertyId::FontSize, Decision::Use(PropertyValue::FontSize(value))) => {
                 style.font_size = compute_font_size(value, parent_font_size);
@@ -1076,6 +1144,28 @@ fn resolve_all(
                     }
                     other => other,
                 };
+            }
+            (
+                PropertyId::TextDecorationLine,
+                Decision::Use(PropertyValue::TextDecorationLine(value)),
+            ) => {
+                style.text_decoration_line = *value;
+            }
+            (
+                PropertyId::TextDecorationStyle,
+                Decision::Use(PropertyValue::TextDecorationStyle(value)),
+            ) => {
+                style.text_decoration_style = *value;
+            }
+            (
+                PropertyId::TextDecorationColor,
+                Decision::Use(PropertyValue::TextDecorationColor(value)),
+            ) => {
+                // currentcolor 按本元素 color 解析（与 border 颜色同语义）
+                style.text_decoration_color = resolve_text_decoration_color(*value, style.color);
+            }
+            (PropertyId::ZIndex, Decision::Use(PropertyValue::ZIndex(value))) => {
+                style.z_index = *value;
             }
             (PropertyId::Width, Decision::Use(PropertyValue::Size(value))) => {
                 style.width = resolve_size(*value, viewport);
@@ -1221,6 +1311,30 @@ fn resolve_all(
             (PropertyId::BorderLeftColor, Decision::Use(PropertyValue::BorderColor(value))) => {
                 style.border_color.left = resolve_border_color(*value, style.color);
             }
+            (
+                PropertyId::BorderTopLeftRadius,
+                Decision::Use(PropertyValue::BorderRadius(value)),
+            ) => {
+                style.border_radius.top_left = resolve_border_radius(*value, viewport);
+            }
+            (
+                PropertyId::BorderTopRightRadius,
+                Decision::Use(PropertyValue::BorderRadius(value)),
+            ) => {
+                style.border_radius.top_right = resolve_border_radius(*value, viewport);
+            }
+            (
+                PropertyId::BorderBottomRightRadius,
+                Decision::Use(PropertyValue::BorderRadius(value)),
+            ) => {
+                style.border_radius.bottom_right = resolve_border_radius(*value, viewport);
+            }
+            (
+                PropertyId::BorderBottomLeftRadius,
+                Decision::Use(PropertyValue::BorderRadius(value)),
+            ) => {
+                style.border_radius.bottom_left = resolve_border_radius(*value, viewport);
+            }
             // 关键字与继承：按属性回退
             (property, decision @ (Decision::Parent | Decision::Initial)) => {
                 let source = match decision {
@@ -1231,6 +1345,9 @@ fn resolve_all(
                     PropertyId::Display => style.display = source.display,
                     PropertyId::Color => style.color = source.color,
                     PropertyId::BackgroundColor => style.background_color = source.background_color,
+                    PropertyId::BackgroundImage => {
+                        style.background_image = source.background_image.clone();
+                    }
                     PropertyId::FontSize => style.font_size = source.font_size,
                     PropertyId::FontWeight => style.font_weight = source.font_weight,
                     PropertyId::FontStyle => style.font_style = source.font_style,
@@ -1244,6 +1361,16 @@ fn resolve_all(
                     PropertyId::WordSpacing => style.word_spacing = source.word_spacing,
                     PropertyId::TextIndent => style.text_indent = source.text_indent,
                     PropertyId::TabSize => style.tab_size = source.tab_size,
+                    PropertyId::TextDecorationLine => {
+                        style.text_decoration_line = source.text_decoration_line;
+                    }
+                    PropertyId::TextDecorationStyle => {
+                        style.text_decoration_style = source.text_decoration_style;
+                    }
+                    PropertyId::TextDecorationColor => {
+                        style.text_decoration_color = source.text_decoration_color;
+                    }
+                    PropertyId::ZIndex => style.z_index = source.z_index,
                     PropertyId::Width => style.width = source.width,
                     PropertyId::Height => style.height = source.height,
                     PropertyId::MinWidth => style.min_width = source.min_width,
@@ -1314,6 +1441,18 @@ fn resolve_all(
                     PropertyId::BorderLeftColor => {
                         style.border_color.left = source.border_color.left;
                     }
+                    PropertyId::BorderTopLeftRadius => {
+                        style.border_radius.top_left = source.border_radius.top_left;
+                    }
+                    PropertyId::BorderTopRightRadius => {
+                        style.border_radius.top_right = source.border_radius.top_right;
+                    }
+                    PropertyId::BorderBottomRightRadius => {
+                        style.border_radius.bottom_right = source.border_radius.bottom_right;
+                    }
+                    PropertyId::BorderBottomLeftRadius => {
+                        style.border_radius.bottom_left = source.border_radius.bottom_left;
+                    }
                 }
             }
             // 声明值与属性不匹配只可能来自程序错误；保持 initial 值
@@ -1338,6 +1477,14 @@ fn resolve_border_color(value: BorderColorValue, color: Rgba) -> Rgba {
     match value {
         BorderColorValue::Rgba(rgba) => rgba,
         BorderColorValue::CurrentColor => color,
+    }
+}
+
+/// text-decoration-color 的 computed 值：currentcolor 按本元素 color 解析。
+fn resolve_text_decoration_color(value: TextDecorationColorValue, color: Rgba) -> Rgba {
+    match value {
+        TextDecorationColorValue::Rgba(rgba) => rgba,
+        TextDecorationColorValue::CurrentColor => color,
     }
 }
 
@@ -2100,6 +2247,33 @@ mod tests {
         assert_eq!(styles[&pre].white_space, WhiteSpaceValue::PreWrap);
     }
 
+    /// UA 表给 `<a>` 链接 `text-decoration: underline`（WHATWG §15.3.4
+    /// Phrasing content 中 `:link`/`:visited` 规则的无伪类近似），非 a
+    /// 元素不受影响，author 声明可覆盖。
+    #[test]
+    fn ua_stylesheet_sets_link_underline() {
+        let document = build_document("<a href=\"https://example.com\">link</a><p>text</p>");
+        let styles = compute_document_styles(&document, &[], Some(html_ua_stylesheet()));
+        let a = find_first_by_name(&document, "a").expect("a");
+        assert_eq!(
+            styles[&a].text_decoration_line,
+            TextDecorationLineValue::Underline
+        );
+        let p = find_first_by_name(&document, "p").expect("p");
+        assert_eq!(
+            styles[&p].text_decoration_line,
+            TextDecorationLineValue::None
+        );
+
+        // author 普通声明压过 UA
+        let sheet = Stylesheet::parse("a { text-decoration: none }");
+        let styles = compute_document_styles(&document, &[&sheet], Some(html_ua_stylesheet()));
+        assert_eq!(
+            styles[&a].text_decoration_line,
+            TextDecorationLineValue::None
+        );
+    }
+
     /// CSS Text 3 四属性：initial、em 按自身字号折算、percentage 保留原值、
     /// 继承（四属性均 inherited）。
     #[test]
@@ -2379,5 +2553,148 @@ mod tests {
             .expect("style attr")
             .as_ptr();
         assert!(std::ptr::eq(first_ptr, second_ptr), "原文未变应复用");
+    }
+
+    // ---- K2 绘制扩展：新属性 computed 与继承性 ----
+
+    /// 四组新属性均不继承：父元素有值，子元素保持 initial。
+    #[test]
+    fn drawing_extension_properties_are_not_inherited() {
+        let style = style_of(
+            "<div style=\"text-decoration: underline wavy; z-index: 5; \
+             border-radius: 8px; background-image: linear-gradient(90deg, red, blue)\">
+             <p>x</p></div>",
+            &[],
+            "p",
+        );
+        assert_eq!(
+            style.text_decoration_line,
+            TextDecorationLineValue::None,
+            "text-decoration 不继承"
+        );
+        assert_eq!(style.text_decoration_style, TextDecorationStyleValue::Solid);
+        assert_eq!(style.z_index, ZIndexValue::Auto, "z-index 不继承");
+        assert_eq!(
+            style.border_radius.top_left,
+            BorderRadiusValue::Length(0.0),
+            "border-radius 不继承"
+        );
+        assert_eq!(
+            style.background_image,
+            BackgroundImageValue::None,
+            "background-image 不继承"
+        );
+    }
+
+    /// text-decoration 简写展开进 cascade：line/style/color 三字段各自生效，
+    /// color 的 currentcolor 按本元素 color 解析。
+    #[test]
+    fn text_decoration_computed_resolves_currentcolor() {
+        let style = style_of(
+            "<p style=\"color: blue; text-decoration: underline wavy\">x</p>",
+            &[],
+            "p",
+        );
+        assert_eq!(
+            style.text_decoration_line,
+            TextDecorationLineValue::Underline
+        );
+        assert_eq!(style.text_decoration_style, TextDecorationStyleValue::Wavy);
+        assert_eq!(
+            style.text_decoration_color,
+            Rgba::opaque(0, 0, 255),
+            "currentcolor 按本元素 color"
+        );
+        // 显式 color 成分覆盖 currentcolor
+        let style = style_of(
+            "<p style=\"color: blue; text-decoration: red underline\">x</p>",
+            &[],
+            "p",
+        );
+        assert_eq!(style.text_decoration_color, Rgba::opaque(255, 0, 0));
+    }
+
+    /// z-index：整数进 computed；`inherit` 取父 computed 值（fallback 分支）。
+    #[test]
+    fn z_index_cascade_and_inherit() {
+        let document =
+            build_document("<div style=\"z-index: -3\"><p style=\"z-index: inherit\">x</p></div>");
+        let refs: Vec<&Stylesheet> = vec![];
+        let div = find_first_by_name(&document, "div").expect("div");
+        let div_style = cascade(&document, div, &refs, None, None);
+        assert_eq!(div_style.z_index, ZIndexValue::Integer(-3));
+        let p = find_first_by_name(&document, "p").expect("p");
+        let p_style = cascade(&document, p, &refs, None, Some(&div_style));
+        assert_eq!(p_style.z_index, ZIndexValue::Integer(-3), "inherit 取父值");
+    }
+
+    /// background-image：渐变带着归一后的色标位置进 computed style。
+    #[test]
+    fn background_image_gradient_reaches_computed_style() {
+        let style = style_of(
+            "<p style=\"background-image: linear-gradient(to right, red, blue 50%, green)\">x</p>",
+            &[],
+            "p",
+        );
+        let BackgroundImageValue::LinearGradient(gradient) = &style.background_image else {
+            panic!("gradient should reach computed style")
+        };
+        assert_eq!(gradient.angle, 90.0);
+        assert_eq!(gradient.stops.len(), 3);
+        assert_eq!(gradient.stops[0].color, Rgba::opaque(255, 0, 0));
+        assert_eq!(gradient.stops[1].position, 0.5);
+        assert_eq!(gradient.stops[2].position, 1.0);
+    }
+
+    /// border-radius：1–4 值展开到四角；视口单位有视口时折算、无视口保留。
+    #[test]
+    fn border_radius_computed_values() {
+        let style = style_of(
+            "<p style=\"border-radius: 10px 20px 30px 40px\">x</p>",
+            &[],
+            "p",
+        );
+        assert_eq!(
+            style.border_radius.top_left,
+            BorderRadiusValue::Length(10.0)
+        );
+        assert_eq!(
+            style.border_radius.top_right,
+            BorderRadiusValue::Length(20.0)
+        );
+        assert_eq!(
+            style.border_radius.bottom_right,
+            BorderRadiusValue::Length(30.0)
+        );
+        assert_eq!(
+            style.border_radius.bottom_left,
+            BorderRadiusValue::Length(40.0)
+        );
+
+        let document = build_document("<p></p>");
+        let sheet = Stylesheet::parse("p { border-radius: 2vw 3vh }");
+        let refs = vec![&sheet];
+        let p = find_first_by_name(&document, "p").expect("p");
+        let viewport = MediaViewport {
+            width: 800.0,
+            height: 600.0,
+        };
+        let with_viewport = cascade_in(&document, p, &refs, None, None, Some(viewport));
+        assert_eq!(
+            with_viewport.border_radius.top_left,
+            BorderRadiusValue::Length(16.0),
+            "2vw = 16px"
+        );
+        assert_eq!(
+            with_viewport.border_radius.top_right,
+            BorderRadiusValue::Length(18.0),
+            "3vh = 18px"
+        );
+        let without_viewport = cascade(&document, p, &refs, None, None);
+        assert_eq!(
+            without_viewport.border_radius.top_left,
+            BorderRadiusValue::Viewport(2.0, ViewportUnit::Vw),
+            "无视口保留原值"
+        );
     }
 }

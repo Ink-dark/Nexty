@@ -7,8 +7,9 @@
 //! 行为 ground truth：CSS Syntax、Selectors、CSS Cascade 规范。
 //!
 //! 已落地：属性值模型与逐属性解析（`value`）、选择器解析与 arena DOM 匹配
-//! （`selector`）、样式表与声明块解析（`parser`）、自研 cascade 与 computed
-//! style（`cascade`）、UA 默认样式表（`ua`）。
+//! （`selector`）、样式表与声明块解析（`parser`，含 `@media` 求值与
+//! `@font-face` 规则）、自研 cascade 与 computed style（`cascade`）、UA 默认
+//! 样式表（`ua`）。
 //!
 //! **Feature**：按上表的五个模块一一对应，默认全开。依赖链为
 //! `values` → `selectors` → `stylesheets` → {`cascade`, `ua-stylesheet`}，
@@ -31,22 +32,28 @@ mod value;
 
 #[cfg(feature = "cascade")]
 pub use cascade::{
-    ComputedStyle, Edges, InlineStyleCache, cascade, cascade_in, compute_document_styles,
+    ComputedStyle, Corners, Edges, InlineStyleCache, cascade, cascade_in, compute_document_styles,
     compute_document_styles_in, compute_document_styles_in_with_cache,
 };
 #[cfg(feature = "stylesheets")]
-pub use parser::{Declaration, MediaViewport, StyleRule, Stylesheet, parse_inline_style};
+pub use parser::{
+    Declaration, FontFaceDisplay, FontFaceRule, FontFaceSource, FontFaceStyle, MediaViewport,
+    StyleRule, Stylesheet, parse_inline_style,
+};
 #[cfg(feature = "selectors")]
 pub use selector::{SelectorError, matches_selector};
 #[cfg(feature = "ua-stylesheet")]
 pub use ua::html_ua_stylesheet;
 #[cfg(feature = "values")]
 pub use value::{
-    AbsoluteSize, AlignItemsValue, AlignSelfValue, BorderColorValue, BorderStyle, BorderWidthValue,
-    BoxSizingValue, ClearValue, CssWideKeyword, DeclaredValue, DisplayValue, FlexDirectionValue,
-    FlexWrapValue, FloatValue, FontFamilyValue, FontSizeValue, FontStyleValue, FontWeightValue,
-    GapValue, GridAutoFlowValue, GridTrack, GridTrackList, InsetValue, JustifyContentValue,
-    LineHeightValue, MAX_CSS_LENGTH, MarginValue, OverflowValue, OverflowWrapValue, PaddingValue,
-    PositionValue, PropertyId, PropertyValue, Rgba, SizeValue, SpacingValue, TabSizeValue,
-    TextAlignValue, TextIndentValue, ViewportUnit, WhiteSpaceValue, WordBreakValue,
+    AbsoluteSize, AlignItemsValue, AlignSelfValue, BackgroundImageValue, BorderColorValue,
+    BorderRadiusValue, BorderStyle, BorderWidthValue, BoxSizingValue, ClearValue, CssWideKeyword,
+    DeclaredValue, DisplayValue, FlexDirectionValue, FlexWrapValue, FloatValue, FontFamilyValue,
+    FontSizeValue, FontStyleValue, FontWeightValue, GapValue, GradientColorStop, GridAutoFlowValue,
+    GridTrack, GridTrackList, InsetValue, JustifyContentValue, LineHeightValue,
+    LinearGradientValue, MAX_CSS_LENGTH, MarginValue, OverflowValue, OverflowWrapValue,
+    PaddingValue, PositionValue, PropertyId, PropertyValue, Rgba, SizeValue, SpacingValue,
+    TabSizeValue, TextAlignValue, TextDecorationColorValue, TextDecorationLineValue,
+    TextDecorationStyleValue, TextIndentValue, ViewportUnit, WhiteSpaceValue, WordBreakValue,
+    ZIndexValue,
 };

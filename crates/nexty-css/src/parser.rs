@@ -10,9 +10,25 @@
 //! - 未知属性按无效声明处理；未知 at-rule（`@import` / `@supports` / …）整块跳过。
 //! - `@media` 按视口条件求值（[`Stylesheet::parse_with_viewport`]）：命中的
 //!   规则按源顺序就地展开参与级联，未命中或未提供视口的整块丢弃。
+//! - `@font-face` 按简化档解析为 [`FontFaceRule`]（CSS Fonts 4 §4），由
+//!   [`Stylesheet::font_faces`] 按源顺序携带；必需描述符 `font-family`
+//!   缺失或非法 → 整条规则丢弃；`src` 单项非法 → 跳过该源，其余保留。
 //!
 //! 已知偏差：`@supports` 等其余 at-rule 不求值（整体跳过）；媒体特性只认
-//! `min/max-width/height`（px）；嵌套 `@media` 不支持。
+//! `min/max-width/height`（px）；嵌套 at-rule 不支持（含 `@media` 内的
+//! `@font-face`）。
+//!
+//! `@font-face` 简化档偏差：描述符只认 `font-family`（必需） / `src` /
+//! `font-weight`（单值） / `font-style` / `font-display`，其余
+//! （`unicode-range` / `font-stretch` / `font-variant` 等）按无效描述符丢弃；
+//! `font-style` 只认 `normal` / `italic`（`oblique` 不识别）；`font-weight`
+//! 单值数字或 `normal` / `bold` 关键字，非整数字重四舍五入为整数存储
+//! （下游 face 权重类型为整数，实际字体 OS/2 权重亦为整数）；`font-display`
+//! 只解析存储，加载行为恒「就绪后重排一次」（swap 简化，五种取值行为相同）；
+//! `src` 的 `tech()` 提示与裸字符串形式不识别（含 `tech()` 的源按无效跳过），
+//! `url()` 为空视为无效源，`format()` 提示只存不校验（woff/woff2 等格式
+//! 判断由字体加载层决策）；未加引号的多词族名（`font-family: My Font`、
+//! `local(Helvetica Neue)`）不支持，引号形式可用。
 //!
 //! **Feature**：本模块受 `stylesheets` feature 控制（由 lib.rs 装配）。`StyleRule`
 //! 的 `selectors` / `specificity` 字段由 `cascade` 模块读取，故关闭 cascade 时
@@ -22,10 +38,13 @@
 
 use crate::selector::{NextySelector, parse_selector_list};
 use crate::value::{
-    BorderColorValue, BorderStyle, BorderWidthValue, DeclaredValue, PropertyId, PropertyValue,
-    parse_border_color_value, parse_border_style_value, parse_border_width_value,
+    BackgroundImageValue, BorderColorValue, BorderStyle, BorderWidthValue, DeclaredValue,
+    PropertyId, PropertyValue, Rgba, TextDecorationColorValue, TextDecorationLineValue,
+    TextDecorationStyleValue, parse_background_image_value, parse_border_color_value,
+    parse_border_radius_value, parse_border_style_value, parse_border_width_value, parse_color,
     parse_css_wide_keyword, parse_declared_value, parse_font_shorthand, parse_gap_value,
-    parse_inset_value, parse_margin_value, parse_padding_value,
+    parse_inset_value, parse_margin_value, parse_padding_value, parse_text_decoration_color_value,
+    parse_text_decoration_line_value, parse_text_decoration_style_value,
 };
 use cssparser::{
     AtRuleParser, DeclarationParser, ParseError, Parser, QualifiedRuleParser, RuleBodyItemParser,
@@ -36,6 +55,8 @@ use cssparser::{
 #[derive(Debug, Clone, Default)]
 pub struct Stylesheet {
     rules: Vec<StyleRule>,
+    /// `@font-face` 规则（源顺序；必需描述符非法的规则已丢弃）。
+    font_faces: Vec<FontFaceRule>,
 }
 
 /// `@media` 求值的视口条件（CSS px）。
@@ -71,17 +92,31 @@ impl Stylesheet {
         let mut rule_parser = StylesheetRuleParser { viewport };
         let mut input = Parser::new(css);
         let mut rules = Vec::new();
-        // at-rule 产出的是规则组（@media 展开），普通规则是单元素组
+        let mut font_faces = Vec::new();
+        // at-rule 产出的是规则组（@media 展开 / 单条 @font-face），
+        // 普通规则是单元素组
         for group in StyleSheetParser::new(&mut input, &mut rule_parser).flatten() {
-            rules.extend(group);
+            match group {
+                TopLevelRule::Style(style_rules) => rules.extend(style_rules),
+                TopLevelRule::FontFace(rule) => font_faces.push(rule),
+            }
         }
-        Stylesheet { rules }
+        Stylesheet { rules, font_faces }
     }
 
     /// 按源顺序返回全部样式规则。
     #[must_use]
     pub fn rules(&self) -> &[StyleRule] {
         &self.rules
+    }
+
+    /// 按源顺序返回全部 `@font-face` 规则。
+    ///
+    /// 供下游编排字体子资源抓取与注册（K4）：`family` 参与族名匹配，
+    /// `sources` 按序尝试。不参与级联。
+    #[must_use]
+    pub fn font_faces(&self) -> &[FontFaceRule] {
+        &self.font_faces
     }
 }
 
@@ -123,7 +158,90 @@ pub struct Declaration {
     pub important: bool,
 }
 
-/// 顶层样式表规则解析：接受样式规则与 `@media`（带视口条件时求值）。
+/// 一条 `@font-face` 规则（[CSS Fonts 4 §4](https://drafts.csswg.org/css-fonts-4/#font-face-rule)
+/// 简化档，偏差见模块文档）。
+///
+/// 字段语义与下游字体描述符（`FontFaceDescriptor { family: String,
+/// weight: u16, style: FontStyle::{Normal, Italic} }`）一一对应：可选描述符
+/// 未指定时为 `None`，按描述符 initial 值映射（weight → 400、style → normal）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct FontFaceRule {
+    /// `font-family` 描述符（必需；缺失或非法的规则已在解析期丢弃）。
+    pub family: String,
+    /// `src` 描述符：按源顺序排列、按序尝试的源列表（非法项已跳过；
+    /// 描述符存在但全部源无效时为空列表——下游按「永远不可用 → 回退
+    /// 系统字体」处理）。
+    pub sources: Vec<FontFaceSource>,
+    /// `font-weight` 描述符（[CSS Fonts 4](https://drafts.csswg.org/css-fonts-4/#descdef-font-face-font-weight)，
+    /// 单值 1–1000；`None` = 未指定，语义默认 400）。
+    pub weight: Option<u16>,
+    /// `font-style` 描述符（`None` = 未指定，语义默认 normal）。
+    pub style: Option<FontFaceStyle>,
+    /// `font-display` 描述符（只解析存储；行为恒 swap 简化——偏差）。
+    pub display: Option<FontFaceDisplay>,
+}
+
+/// `src` 描述符的一个源（[CSS Fonts 4](https://drafts.csswg.org/css-fonts-4/#descdef-font-face-src)
+/// 简化档）：按序尝试，前一个失败才轮到下一个。
+#[derive(Debug, Clone, PartialEq)]
+pub enum FontFaceSource {
+    /// 外部资源：`url(…)` + 可选 `format(…)` 提示（提示只存不校验）。
+    Url {
+        /// 资源地址（cssparser 已去转义；相对地址由抓取方按文档 base 解析）。
+        url: String,
+        /// `format()` 提示字符串（无提示时为空列表）。
+        format_hints: Vec<String>,
+    },
+    /// 本地字体：`local(…)` 引用的已安装字体名。
+    Local {
+        /// 本地字体名（`<string>` 或单个 `<custom-ident>`）。
+        name: String,
+    },
+}
+
+/// `font-style` 描述符取值（`normal` / `italic`；`oblique` 不识别——偏差）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FontFaceStyle {
+    /// `normal`（描述符 initial）。
+    Normal,
+    /// `italic`。
+    Italic,
+}
+
+/// `font-display` 描述符取值
+/// （[CSS Fonts 4](https://drafts.csswg.org/css-fonts-4/#descdef-font-face-font-display)）。
+///
+/// 当前只解析存储：加载行为恒「就绪后重排一次」（swap 简化——偏差）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FontFaceDisplay {
+    /// `auto`（描述符 initial）。
+    Auto,
+    /// `block`。
+    Block,
+    /// `swap`。
+    Swap,
+    /// `fallback`。
+    Fallback,
+    /// `optional`。
+    Optional,
+}
+
+/// 顶层规则解析产物：样式规则组（qualified 规则单元素、`@media` 展开多
+/// 元素）或一条 `@font-face` 规则。cssparser 要求两个 trait 的产出同型，
+/// 故用枚举承载后在 [`Stylesheet::parse_inner`] 分流。
+enum TopLevelRule {
+    Style(Vec<StyleRule>),
+    FontFace(FontFaceRule),
+}
+
+/// 顶层 at-rule 的 prelude：`@media` 查询或无 prelude 的 `@font-face`。
+enum AtRulePrelude {
+    Media(MediaQuery),
+    FontFace,
+}
+
+/// 顶层样式表规则解析：接受样式规则、`@media`（带视口条件时求值）
+/// 与 `@font-face`。
 struct StylesheetRuleParser {
     /// `@media` 求值条件；`None` 时 `@media` 不命中（整块丢弃）。
     viewport: Option<MediaViewport>,
@@ -131,7 +249,7 @@ struct StylesheetRuleParser {
 
 impl<'i> QualifiedRuleParser<'i> for StylesheetRuleParser {
     type Prelude = Vec<NextySelector>;
-    type QualifiedRule = Vec<StyleRule>;
+    type QualifiedRule = TopLevelRule;
     type Error = ();
 
     fn parse_prelude(
@@ -152,19 +270,19 @@ impl<'i> QualifiedRuleParser<'i> for StylesheetRuleParser {
             .map(NextySelector::to_css_string)
             .collect::<Vec<_>>()
             .join(", ");
-        Ok(vec![StyleRule {
+        Ok(TopLevelRule::Style(vec![StyleRule {
             selectors: prelude,
             selector_text,
             declarations: parse_declaration_block(input),
-        }])
+        }]))
     }
 }
 
 // 未知 at-rule（@import / @supports / …）走默认拒绝，
 // StyleSheetParser 按规范把整块消费掉。
 impl<'i> AtRuleParser<'i> for StylesheetRuleParser {
-    type Prelude = MediaQuery;
-    type AtRule = Vec<StyleRule>;
+    type Prelude = AtRulePrelude;
+    type AtRule = TopLevelRule;
     type Error = ();
 
     fn parse_prelude(
@@ -173,7 +291,15 @@ impl<'i> AtRuleParser<'i> for StylesheetRuleParser {
         input: &mut Parser<'i>,
     ) -> Result<Self::Prelude, ParseError<Self::Error>> {
         if name.eq_ignore_ascii_case("media") {
-            parse_media_query(input).ok_or_else(ParseError::<()>::unexpected_token)
+            parse_media_query(input)
+                .map(AtRulePrelude::Media)
+                .ok_or_else(ParseError::<()>::unexpected_token)
+        } else if name.eq_ignore_ascii_case("font-face") {
+            // @font-face 无 prelude（CSS Fonts 4 §4）；带 prelude 的规则整条丢弃
+            input
+                .expect_exhausted()
+                .map_err(|_| ParseError::<()>::unexpected_token())?;
+            Ok(AtRulePrelude::FontFace)
         } else {
             Err(ParseError::unexpected_token())
         }
@@ -185,18 +311,38 @@ impl<'i> AtRuleParser<'i> for StylesheetRuleParser {
         _start: &cssparser::ParserState,
         input: &mut Parser<'i>,
     ) -> Result<Self::AtRule, ParseError<Self::Error>> {
-        // 内层按 rule list 解析（块必须整体消费后再决定去留）；
-        // 嵌套 at-rule 在内层解析器里按未知拒绝
-        let mut inner = MediaQueryRuleParser;
-        let mut rules = Vec::new();
-        for group in RuleBodyParser::new(input, &mut inner).flatten() {
-            rules.extend(group);
+        match prelude {
+            AtRulePrelude::Media(query) => {
+                // 内层按 rule list 解析（块必须整体消费后再决定去留）；
+                // 嵌套 at-rule 在内层解析器里按未知拒绝
+                let mut inner = MediaQueryRuleParser;
+                let mut rules = Vec::new();
+                for group in RuleBodyParser::new(input, &mut inner).flatten() {
+                    rules.extend(group);
+                }
+                let matched = match self.viewport {
+                    Some(viewport) => query.matches(viewport),
+                    None => false,
+                };
+                Ok(TopLevelRule::Style(if matched {
+                    rules
+                } else {
+                    Vec::new()
+                }))
+            }
+            AtRulePrelude::FontFace => {
+                // 描述符块：逐条解析，非法描述符就地丢弃（CSS Fonts 4 §4）
+                let mut descriptors = FontFaceDescriptorsParser;
+                let mut items = Vec::new();
+                for item in RuleBodyParser::new(input, &mut descriptors).flatten() {
+                    items.push(item);
+                }
+                // 必需描述符 font-family 缺失 → 整条规则丢弃
+                parse_font_face_rule(items)
+                    .map(TopLevelRule::FontFace)
+                    .ok_or_else(ParseError::<()>::unexpected_token)
+            }
         }
-        let matched = match self.viewport {
-            Some(viewport) => prelude.matches(viewport),
-            None => false,
-        };
-        Ok(if matched { rules } else { Vec::new() })
     }
 }
 
@@ -380,6 +526,322 @@ fn parse_media_feature(input: &mut Parser<'_>) -> Result<MediaFeature, ()> {
     }
 }
 
+// ---- @font-face 描述符解析（CSS Fonts 4 §4） ----
+
+/// `@font-face` 块内单项解析结果（描述符产出；非法项由 cssparser 错误恢复丢弃）。
+enum FontFaceItem {
+    Family(String),
+    Sources(Vec<FontFaceSource>),
+    Weight(u16),
+    Style(FontFaceStyle),
+    Display(FontFaceDisplay),
+}
+
+/// `@font-face` 块内描述符解析器：只接受描述符声明，拒绝嵌套规则与 at-rule。
+struct FontFaceDescriptorsParser;
+
+impl<'i> DeclarationParser<'i> for FontFaceDescriptorsParser {
+    type Declaration = FontFaceItem;
+    type Error = ();
+
+    fn parse_value<'t>(
+        &mut self,
+        name: cssparser::CowRcStr<'i>,
+        input: &mut Parser<'i>,
+        _declaration_start: &cssparser::ParserState,
+    ) -> Result<FontFaceItem, ParseError<Self::Error>> {
+        let item = if name.eq_ignore_ascii_case("font-family") {
+            parse_font_face_family(input).map(FontFaceItem::Family)
+        } else if name.eq_ignore_ascii_case("src") {
+            Ok(FontFaceItem::Sources(parse_font_face_sources(input)))
+        } else if name.eq_ignore_ascii_case("font-weight") {
+            parse_font_face_weight(input).map(FontFaceItem::Weight)
+        } else if name.eq_ignore_ascii_case("font-style") {
+            parse_font_face_style(input).map(FontFaceItem::Style)
+        } else if name.eq_ignore_ascii_case("font-display") {
+            parse_font_face_display(input).map(FontFaceItem::Display)
+        } else {
+            // 未知 / 记偏差不解析的描述符（unicode-range、font-stretch、
+            // font-variant、font-feature-settings…）按无效描述符丢弃
+            Err(())
+        };
+        item.map_err(|_| ParseError::<()>::unexpected_token())
+    }
+}
+
+impl<'i> QualifiedRuleParser<'i> for FontFaceDescriptorsParser {
+    type Prelude = ();
+    type QualifiedRule = FontFaceItem;
+    type Error = ();
+}
+
+impl<'i> AtRuleParser<'i> for FontFaceDescriptorsParser {
+    type Prelude = ();
+    type AtRule = FontFaceItem;
+    type Error = ();
+}
+
+impl<'i> RuleBodyItemParser<'i, FontFaceItem, ()> for FontFaceDescriptorsParser {
+    // @font-face 块内只解析描述符声明（属性声明语法相同，但语义是描述符）
+    fn parse_declarations(&self) -> bool {
+        true
+    }
+
+    fn parse_qualified(&self) -> bool {
+        false
+    }
+}
+
+/// 组装 `@font-face` 规则：同一描述符多次出现取最后一条；必需的
+/// `font-family` 缺失（含描述符全部非法）→ 整条规则丢弃（返回 `None`）。
+fn parse_font_face_rule(items: Vec<FontFaceItem>) -> Option<FontFaceRule> {
+    let mut rule = FontFaceRule {
+        family: String::new(),
+        sources: Vec::new(),
+        weight: None,
+        style: None,
+        display: None,
+    };
+    for item in items {
+        match item {
+            FontFaceItem::Family(family) => rule.family = family,
+            FontFaceItem::Sources(sources) => rule.sources = sources,
+            FontFaceItem::Weight(weight) => rule.weight = Some(weight),
+            FontFaceItem::Style(style) => rule.style = Some(style),
+            FontFaceItem::Display(display) => rule.display = Some(display),
+        }
+    }
+    if rule.family.is_empty() {
+        None
+    } else {
+        Some(rule)
+    }
+}
+
+/// 族名不能取的关键字：CSS-wide 关键字（描述符禁用）与 `default`（CSS Fonts 4
+/// 将其与 CSS-wide 关键字一并排除在族名之外）。
+fn is_reserved_family_name(name: &str) -> bool {
+    ["initial", "inherit", "unset", "revert", "default"]
+        .iter()
+        .any(|keyword| name.eq_ignore_ascii_case(keyword))
+}
+
+/// `font-family` 描述符（必需；简化档）：`<string>` 或单个 `<custom-ident>`，
+/// 空族名非法；未加引号的多词族名不支持（偏差）。
+fn parse_font_face_family(input: &mut Parser<'_>) -> Result<String, ()> {
+    let family = match input.next().map_err(|_| ())? {
+        Token::QuotedString(family) => family.to_string(),
+        Token::Ident(family) if !is_reserved_family_name(family) => family.to_string(),
+        _ => return Err(()),
+    };
+    if family.is_empty() {
+        return Err(());
+    }
+    input.expect_exhausted().map_err(|_| ())?;
+    Ok(family)
+}
+
+/// `font-weight` 描述符（单值简化档）：`<number [1,1000]>` 或 `normal`（400） /
+/// `bold`（700）关键字；相对关键字 `bolder` / `lighter` 描述符不适用，按无效
+/// 丢弃。非整数字重四舍五入为整数存储（偏差：下游 face 权重为整数）。
+fn parse_font_face_weight(input: &mut Parser<'_>) -> Result<u16, ()> {
+    let weight = match input.next().map_err(|_| ())? {
+        Token::Number { value, .. } if (1.0..=1000.0).contains(value) => value.round() as u16,
+        Token::Ident(name) if name.eq_ignore_ascii_case("normal") => 400,
+        Token::Ident(name) if name.eq_ignore_ascii_case("bold") => 700,
+        _ => return Err(()),
+    };
+    input.expect_exhausted().map_err(|_| ())?;
+    Ok(weight)
+}
+
+/// `font-style` 描述符（简化档）：`normal` / `italic`；`oblique` 不识别（偏差）。
+fn parse_font_face_style(input: &mut Parser<'_>) -> Result<FontFaceStyle, ()> {
+    let style = match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("normal") => FontFaceStyle::Normal,
+        Token::Ident(name) if name.eq_ignore_ascii_case("italic") => FontFaceStyle::Italic,
+        _ => return Err(()),
+    };
+    input.expect_exhausted().map_err(|_| ())?;
+    Ok(style)
+}
+
+/// `font-display` 描述符：五关键字只解析存储（行为恒 swap 简化——偏差）。
+fn parse_font_face_display(input: &mut Parser<'_>) -> Result<FontFaceDisplay, ()> {
+    let display = match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("auto") => FontFaceDisplay::Auto,
+        Token::Ident(name) if name.eq_ignore_ascii_case("block") => FontFaceDisplay::Block,
+        Token::Ident(name) if name.eq_ignore_ascii_case("swap") => FontFaceDisplay::Swap,
+        Token::Ident(name) if name.eq_ignore_ascii_case("fallback") => FontFaceDisplay::Fallback,
+        Token::Ident(name) if name.eq_ignore_ascii_case("optional") => FontFaceDisplay::Optional,
+        _ => return Err(()),
+    };
+    input.expect_exhausted().map_err(|_| ())?;
+    Ok(display)
+}
+
+/// `src` 描述符：逗号分隔有序列表，逐项解析；单项非法 → 跳过该源，其余
+/// 保留（全部无效 → 空列表，规则保留）。项内只认 `url(…)`（含带引号的
+/// `url("…")`）可选尾随一个 `format(…)`，或 `local(…)`。
+fn parse_font_face_sources(input: &mut Parser<'_>) -> Vec<FontFaceSource> {
+    let mut sources = Vec::new();
+    // 待定项：已解析出一个源，等逗号或结束才收录；项内出现其他 token 则整项作废
+    let mut pending: Option<FontFaceSource> = None;
+    loop {
+        let token = match input.next() {
+            Ok(token) => token,
+            Err(_) => {
+                // src 描述符结束（parse_until_after 已限定到 `;` 前）
+                if let Some(source) = pending.take() {
+                    sources.push(source);
+                }
+                break;
+            }
+        };
+        match token {
+            Token::Comma => {
+                if let Some(source) = pending.take() {
+                    sources.push(source);
+                }
+            }
+            Token::Function(name) if name.eq_ignore_ascii_case("format") => {
+                // format() 只能尾随同项的 url()：挂到待定项，或整项作废
+                let attachable = matches!(
+                    &pending,
+                    Some(FontFaceSource::Url { format_hints, .. }) if format_hints.is_empty()
+                );
+                let hints = if attachable {
+                    input
+                        .parse_nested_block(|input| parse_format_hints(input))
+                        .ok()
+                } else {
+                    // 位置非法的 format()：仍需消费其块再跳到逗号
+                    let _ = input.parse_nested_block(|_input| {
+                        Err::<(), _>(ParseError::<()>::unexpected_token())
+                    });
+                    None
+                };
+                match (hints, &mut pending) {
+                    (Some(hints), Some(FontFaceSource::Url { format_hints, .. })) => {
+                        *format_hints = hints;
+                    }
+                    _ => {
+                        pending = None;
+                        skip_to_comma(input);
+                    }
+                }
+            }
+            token => match parse_font_face_source(token.clone(), input) {
+                Ok(source) if pending.is_none() => pending = Some(source),
+                _ => {
+                    // 无效项，或同项出现第二个源：整项作废，跳到下一项
+                    pending = None;
+                    skip_to_comma(input);
+                }
+            },
+        }
+    }
+    sources
+}
+
+/// 解析一个源项的首个 token（`token` 为已消费项的克隆，与 parser 解引用）：
+/// `url(…)` / `url("…")` / `local(…)`。空 `url()` 与裸字符串等其余形式按无效处理。
+fn parse_font_face_source(token: Token<'_>, input: &mut Parser<'_>) -> Result<FontFaceSource, ()> {
+    match token {
+        Token::UnquotedUrl(url) if !url.is_empty() => Ok(FontFaceSource::Url {
+            url: url.to_string(),
+            format_hints: Vec::new(),
+        }),
+        Token::Function(name) if name.eq_ignore_ascii_case("url") => {
+            let url = input
+                .parse_nested_block(|input| parse_quoted_url(input))
+                .map_err(|_| ())?;
+            if url.is_empty() {
+                return Err(());
+            }
+            Ok(FontFaceSource::Url {
+                url,
+                format_hints: Vec::new(),
+            })
+        }
+        Token::Function(name) if name.eq_ignore_ascii_case("local") => {
+            let name = input
+                .parse_nested_block(|input| parse_local_name(input))
+                .map_err(|_| ())?;
+            Ok(FontFaceSource::Local { name })
+        }
+        _ => Err(()),
+    }
+}
+
+/// `url("…")` 带引号形式：函数块内恰好一个非空 `<string>`。
+fn parse_quoted_url(input: &mut Parser<'_>) -> Result<String, ParseError<()>> {
+    let url = match input.next() {
+        Ok(Token::QuotedString(url)) => url.to_string(),
+        _ => return Err(ParseError::unexpected_token()),
+    };
+    input
+        .expect_exhausted()
+        .map_err(|_| ParseError::unexpected_token())?;
+    Ok(url)
+}
+
+/// `local(…)` 内容：非空 `<string>` 或单个 `<custom-ident>`
+/// （未加引号的多词族名不支持——偏差）。
+fn parse_local_name(input: &mut Parser<'_>) -> Result<String, ParseError<()>> {
+    let name = match input.next() {
+        Ok(Token::QuotedString(name)) => name.to_string(),
+        Ok(Token::Ident(name)) if !is_reserved_family_name(name) => name.to_string(),
+        _ => return Err(ParseError::unexpected_token()),
+    };
+    if name.is_empty() {
+        return Err(ParseError::unexpected_token());
+    }
+    input
+        .expect_exhausted()
+        .map_err(|_| ParseError::unexpected_token())?;
+    Ok(name)
+}
+
+/// `format(<string>#)` 提示：只接受带引号字符串（规范语法），逗号分隔；
+/// 至少一项，含其他 token 则整个源项无效。
+fn parse_format_hints(input: &mut Parser<'_>) -> Result<Vec<String>, ParseError<()>> {
+    let mut hints = Vec::new();
+    loop {
+        match input.next() {
+            Ok(Token::QuotedString(hint)) => hints.push(hint.to_string()),
+            Ok(Token::Comma) => continue,
+            Err(_) => break,
+            Ok(_) => return Err(ParseError::unexpected_token()),
+        }
+    }
+    if hints.is_empty() {
+        return Err(ParseError::unexpected_token());
+    }
+    Ok(hints)
+}
+
+/// 跳过一个源项的剩余 token（到逗号或 src 描述符结束）；嵌套块整体消费，
+/// 避免块内逗号提前截断。
+fn skip_to_comma(input: &mut Parser<'_>) {
+    loop {
+        match input.next() {
+            Err(_) | Ok(Token::Comma) => break,
+            Ok(
+                Token::Function(_)
+                | Token::ParenthesisBlock
+                | Token::SquareBracketBlock
+                | Token::CurlyBracketBlock,
+            ) => {
+                let _ = input.parse_nested_block(|_input| {
+                    Err::<(), _>(ParseError::<()>::unexpected_token())
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
 /// 解析一个声明块（`{ ... }` 内容或内联 style 属性值）。
 ///
 /// 无效声明（含未知属性）就地跳过，其余保留（CSS Syntax §5.5）。
@@ -522,6 +984,181 @@ fn expand_shorthand(name: &str, input: &mut Parser<'_>) -> Option<Result<Shortha
             )));
         }
         return Some(parse_gap_shorthand(input));
+    }
+
+    // text-decoration 简写：<'text-decoration-line'> || <'text-decoration-style'>
+    // || <'text-decoration-color'>（CSS Text Decoration 3 §3.3 基础档；缺省成分
+    // 重置为 initial——line none / style solid / color currentcolor。thickness
+    // 成分与 `blink` 不识别，整条无效——偏差）。
+    if name.eq_ignore_ascii_case("text-decoration") {
+        if let Ok(keyword) = input.try_parse(parse_css_wide_keyword) {
+            let important = input.try_parse(cssparser::parse_important).is_ok();
+            if input.expect_exhausted().is_err() {
+                return Some(Err(()));
+            }
+            let longhands = [
+                PropertyId::TextDecorationLine,
+                PropertyId::TextDecorationStyle,
+                PropertyId::TextDecorationColor,
+            ];
+            return Some(Ok((
+                longhands
+                    .into_iter()
+                    .map(|property| (property, DeclaredValue::CssWide(keyword)))
+                    .collect(),
+                important,
+            )));
+        }
+        let mut line = None;
+        let mut style = None;
+        let mut color = None;
+        loop {
+            if line.is_none()
+                && let Ok(value) = input.try_parse(parse_text_decoration_line_value)
+            {
+                line = Some(value);
+                continue;
+            }
+            if style.is_none()
+                && let Ok(value) = input.try_parse(parse_text_decoration_style_value)
+            {
+                style = Some(value);
+                continue;
+            }
+            if color.is_none()
+                && let Ok(value) = input.try_parse(parse_text_decoration_color_value)
+            {
+                color = Some(value);
+                continue;
+            }
+            break;
+        }
+        if line.is_none() && style.is_none() && color.is_none() {
+            return Some(Err(()));
+        }
+        let important = input.try_parse(cssparser::parse_important).is_ok();
+        if input.expect_exhausted().is_err() {
+            return Some(Err(()));
+        }
+        return Some(Ok((
+            vec![
+                (
+                    PropertyId::TextDecorationLine,
+                    DeclaredValue::Typed(PropertyValue::TextDecorationLine(
+                        line.unwrap_or(TextDecorationLineValue::None),
+                    )),
+                ),
+                (
+                    PropertyId::TextDecorationStyle,
+                    DeclaredValue::Typed(PropertyValue::TextDecorationStyle(
+                        style.unwrap_or(TextDecorationStyleValue::Solid),
+                    )),
+                ),
+                (
+                    PropertyId::TextDecorationColor,
+                    DeclaredValue::Typed(PropertyValue::TextDecorationColor(
+                        color.unwrap_or(TextDecorationColorValue::CurrentColor),
+                    )),
+                ),
+            ],
+            important,
+        )));
+    }
+
+    // background 简写：[ <bg-image> || <bg-color> ]（CSS Backgrounds 3 §2 的
+    // 两 longhand 基础子集；position / size / repeat / attachment / origin /
+    // clip 成分与多层背景不识别，整条无效——偏差）。缺省成分重置为 initial
+    // （image none / color transparent）。
+    if name.eq_ignore_ascii_case("background") {
+        if let Ok(keyword) = input.try_parse(parse_css_wide_keyword) {
+            let important = input.try_parse(cssparser::parse_important).is_ok();
+            if input.expect_exhausted().is_err() {
+                return Some(Err(()));
+            }
+            let longhands = [PropertyId::BackgroundImage, PropertyId::BackgroundColor];
+            return Some(Ok((
+                longhands
+                    .into_iter()
+                    .map(|property| (property, DeclaredValue::CssWide(keyword)))
+                    .collect(),
+                important,
+            )));
+        }
+        let mut image = None;
+        let mut color = None;
+        loop {
+            if image.is_none()
+                && let Ok(value) = input.try_parse(parse_background_image_value)
+            {
+                image = Some(value);
+                continue;
+            }
+            if color.is_none()
+                && let Ok(value) = input.try_parse(parse_color)
+            {
+                color = Some(value);
+                continue;
+            }
+            break;
+        }
+        if image.is_none() && color.is_none() {
+            return Some(Err(()));
+        }
+        let important = input.try_parse(cssparser::parse_important).is_ok();
+        if input.expect_exhausted().is_err() {
+            return Some(Err(()));
+        }
+        return Some(Ok((
+            vec![
+                (
+                    PropertyId::BackgroundImage,
+                    DeclaredValue::Typed(PropertyValue::BackgroundImage(
+                        image.unwrap_or(BackgroundImageValue::None),
+                    )),
+                ),
+                (
+                    PropertyId::BackgroundColor,
+                    DeclaredValue::Typed(PropertyValue::Color(
+                        color.unwrap_or_else(Rgba::transparent),
+                    )),
+                ),
+            ],
+            important,
+        )));
+    }
+
+    // border-radius 简写：<length-percentage [0,∞]>{1,4}（CSS Backgrounds 3
+    // §5.1 基础档；`/` 椭圆语法不识别，整条无效——偏差）。
+    if name.eq_ignore_ascii_case("border-radius") {
+        if let Ok(keyword) = input.try_parse(parse_css_wide_keyword) {
+            let important = input.try_parse(cssparser::parse_important).is_ok();
+            if input.expect_exhausted().is_err() {
+                return Some(Err(()));
+            }
+            return Some(Ok((
+                border_radius_longhands()
+                    .into_iter()
+                    .map(|property| (property, DeclaredValue::CssWide(keyword)))
+                    .collect(),
+                important,
+            )));
+        }
+        let corners = match expand_box_values(input, parse_border_radius_value) {
+            Ok(values) => values,
+            Err(()) => return Some(Err(())),
+        };
+        let important = input.try_parse(cssparser::parse_important).is_ok();
+        if input.expect_exhausted().is_err() {
+            return Some(Err(()));
+        }
+        return Some(Ok((
+            zip_edges(
+                corners,
+                border_radius_longhands(),
+                PropertyValue::BorderRadius,
+            ),
+            important,
+        )));
     }
 
     // 先确认是简写名，再试 CSS-wide 关键字（否则关键字会被误吞且不复位）
@@ -762,6 +1399,16 @@ fn inset_longhands() -> Vec<PropertyId> {
         PropertyId::Right,
         PropertyId::Bottom,
         PropertyId::Left,
+    ]
+}
+
+/// `border-radius` 简写的四角 longhand（顺时针：TL / TR / BR / BL）。
+fn border_radius_longhands() -> Vec<PropertyId> {
+    vec![
+        PropertyId::BorderTopLeftRadius,
+        PropertyId::BorderTopRightRadius,
+        PropertyId::BorderBottomRightRadius,
+        PropertyId::BorderBottomLeftRadius,
     ]
 }
 
@@ -1430,5 +2077,505 @@ mod tests {
                 FontFamilyValue::Generic("serif"),
             ]))
         );
+    }
+
+    // ---- K2 绘制扩展：text-decoration / background / border-radius 简写 ----
+
+    use crate::value::BorderRadiusValue;
+
+    #[test]
+    fn text_decoration_shorthand_expands_with_resets() {
+        // 单成分：缺省成分重置为 initial（line none / style solid / color currentcolor）
+        let sheet = Stylesheet::parse("p { text-decoration: underline }");
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::TextDecorationLine).value,
+            DeclaredValue::Typed(PropertyValue::TextDecorationLine(
+                TextDecorationLineValue::Underline
+            ))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::TextDecorationStyle).value,
+            DeclaredValue::Typed(PropertyValue::TextDecorationStyle(
+                TextDecorationStyleValue::Solid
+            ))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::TextDecorationColor).value,
+            DeclaredValue::Typed(PropertyValue::TextDecorationColor(
+                TextDecorationColorValue::CurrentColor
+            ))
+        );
+
+        // 三成分任意顺序（|| 语义）
+        let sheet = Stylesheet::parse("p { text-decoration: wavy red underline }");
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::TextDecorationLine).value,
+            DeclaredValue::Typed(PropertyValue::TextDecorationLine(
+                TextDecorationLineValue::Underline
+            ))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::TextDecorationStyle).value,
+            DeclaredValue::Typed(PropertyValue::TextDecorationStyle(
+                TextDecorationStyleValue::Wavy
+            ))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::TextDecorationColor).value,
+            DeclaredValue::Typed(PropertyValue::TextDecorationColor(
+                TextDecorationColorValue::Rgba(Rgba::opaque(255, 0, 0))
+            ))
+        );
+
+        // 仅 color 成分合法（line 重置为 none）
+        let sheet = Stylesheet::parse("p { text-decoration: red }");
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::TextDecorationLine).value,
+            DeclaredValue::Typed(PropertyValue::TextDecorationLine(
+                TextDecorationLineValue::None
+            ))
+        );
+
+        // CSS-wide 关键字作用于全部 longhand
+        let sheet = Stylesheet::parse("p { text-decoration: inherit !important }");
+        let declarations = sheet.rules()[0].declarations();
+        assert_eq!(declarations.len(), 3);
+        assert!(declarations.iter().all(|declaration| declaration.important
+            && declaration.value == DeclaredValue::CssWide(CssWideKeyword::Inherit)));
+
+        // thickness 成分与 blink 不识别 → 整条声明丢弃（偏差）
+        assert!(
+            Stylesheet::parse("p { text-decoration: underline 2px }").rules()[0]
+                .declarations()
+                .is_empty()
+        );
+        assert!(
+            Stylesheet::parse("p { text-decoration: blink }").rules()[0]
+                .declarations()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn background_shorthand_expands_with_resets() {
+        // 纯色：image 重置为 none
+        let sheet = Stylesheet::parse("p { background: red }");
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::BackgroundColor).value,
+            DeclaredValue::Typed(PropertyValue::Color(Rgba::opaque(255, 0, 0)))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::BackgroundImage).value,
+            DeclaredValue::Typed(PropertyValue::BackgroundImage(BackgroundImageValue::None))
+        );
+
+        // 渐变 + 颜色任意顺序；缺省 color 重置为 transparent
+        for css in [
+            "p { background: linear-gradient(90deg, red, blue) #0f0 }",
+            "p { background: #0f0 linear-gradient(90deg, red, blue) }",
+        ] {
+            let sheet = Stylesheet::parse(css);
+            assert_eq!(
+                declaration_of(&sheet, 0, PropertyId::BackgroundColor).value,
+                DeclaredValue::Typed(PropertyValue::Color(Rgba::opaque(0, 255, 0))),
+                "{css}"
+            );
+            let image = declaration_of(&sheet, 0, PropertyId::BackgroundImage)
+                .value
+                .clone();
+            let DeclaredValue::Typed(PropertyValue::BackgroundImage(
+                BackgroundImageValue::LinearGradient(gradient),
+            )) = image
+            else {
+                panic!("{css} should carry a linear-gradient")
+            };
+            assert_eq!(gradient.angle, 90.0);
+            assert_eq!(gradient.stops.len(), 2);
+        }
+
+        // 纯渐变：color 重置为 transparent
+        let sheet = Stylesheet::parse("p { background: linear-gradient(red, blue) }");
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::BackgroundColor).value,
+            DeclaredValue::Typed(PropertyValue::Color(Rgba::transparent()))
+        );
+
+        // CSS-wide 关键字
+        let sheet = Stylesheet::parse("p { background: initial }");
+        let declarations = sheet.rules()[0].declarations();
+        assert_eq!(declarations.len(), 2);
+        assert!(declarations.iter().all(
+            |declaration| declaration.value == DeclaredValue::CssWide(CssWideKeyword::Initial)
+        ));
+
+        // position / repeat 等成分不识别 → 整条声明丢弃（偏差）；空值非法
+        assert!(
+            Stylesheet::parse("p { background: url(x.png) no-repeat }").rules()[0]
+                .declarations()
+                .is_empty()
+        );
+        assert!(
+            Stylesheet::parse("p { background: no-repeat red }").rules()[0]
+                .declarations()
+                .is_empty()
+        );
+        assert!(
+            Stylesheet::parse("p { background: }").rules()[0]
+                .declarations()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn border_radius_shorthand_expands_clockwise() {
+        // 单值：四角同值
+        let sheet = Stylesheet::parse("p { border-radius: 10px }");
+        assert_eq!(sheet.rules()[0].declarations().len(), 4);
+        for property in [
+            PropertyId::BorderTopLeftRadius,
+            PropertyId::BorderTopRightRadius,
+            PropertyId::BorderBottomRightRadius,
+            PropertyId::BorderBottomLeftRadius,
+        ] {
+            assert_eq!(
+                declaration_of(&sheet, 0, property).value,
+                DeclaredValue::Typed(PropertyValue::BorderRadius(BorderRadiusValue::Length(10.0)))
+            );
+        }
+
+        // 双值：TL/BR 取第一，TR/BL 取第二
+        let sheet = Stylesheet::parse("p { border-radius: 10px 20px }");
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::BorderTopLeftRadius).value,
+            DeclaredValue::Typed(PropertyValue::BorderRadius(BorderRadiusValue::Length(10.0)))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::BorderTopRightRadius).value,
+            DeclaredValue::Typed(PropertyValue::BorderRadius(BorderRadiusValue::Length(20.0)))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::BorderBottomRightRadius).value,
+            DeclaredValue::Typed(PropertyValue::BorderRadius(BorderRadiusValue::Length(10.0)))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::BorderBottomLeftRadius).value,
+            DeclaredValue::Typed(PropertyValue::BorderRadius(BorderRadiusValue::Length(20.0)))
+        );
+
+        // 三值：TR/BL 取第二；四值顺时针
+        let sheet = Stylesheet::parse("p { border-radius: 10px 20px 30px }");
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::BorderBottomLeftRadius).value,
+            DeclaredValue::Typed(PropertyValue::BorderRadius(BorderRadiusValue::Length(20.0)))
+        );
+        let sheet = Stylesheet::parse("p { border-radius: 10% 20px 30% 40px }");
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::BorderTopLeftRadius).value,
+            DeclaredValue::Typed(PropertyValue::BorderRadius(BorderRadiusValue::Percent(0.1)))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::BorderBottomLeftRadius).value,
+            DeclaredValue::Typed(PropertyValue::BorderRadius(BorderRadiusValue::Length(40.0)))
+        );
+
+        // CSS-wide 关键字
+        let sheet = Stylesheet::parse("p { border-radius: unset }");
+        let declarations = sheet.rules()[0].declarations();
+        assert_eq!(declarations.len(), 4);
+        assert!(
+            declarations
+                .iter()
+                .all(|declaration| declaration.value
+                    == DeclaredValue::CssWide(CssWideKeyword::Unset))
+        );
+
+        // `/` 椭圆语法不识别 → 整条声明丢弃（偏差）
+        assert!(
+            Stylesheet::parse("p { border-radius: 10px / 20px }").rules()[0]
+                .declarations()
+                .is_empty()
+        );
+        assert!(
+            Stylesheet::parse("p { border-radius: 10px 20px / 5px }").rules()[0]
+                .declarations()
+                .is_empty()
+        );
+    }
+
+    // ---- K4 T1：@font-face 解析（CSS Fonts 4 §4） ----
+
+    fn url_source(url: &str, hints: &[&str]) -> FontFaceSource {
+        FontFaceSource::Url {
+            url: url.to_string(),
+            format_hints: hints.iter().map(|hint| hint.to_string()).collect(),
+        }
+    }
+
+    fn local_source(name: &str) -> FontFaceSource {
+        FontFaceSource::Local {
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn font_face_parses_descriptors_with_defaults() {
+        let sheet =
+            Stylesheet::parse("@font-face { font-family: \"My Font\"; src: url(fonts/a.ttf); }");
+        // @font-face 不进样式规则列表
+        assert!(sheet.rules().is_empty());
+        let faces = sheet.font_faces();
+        assert_eq!(faces.len(), 1);
+        assert_eq!(faces[0].family, "My Font");
+        assert_eq!(faces[0].sources, vec![url_source("fonts/a.ttf", &[])]);
+        // 可选描述符未指定 → None（下游按 initial 值映射：400 / normal / auto）
+        assert_eq!(faces[0].weight, None);
+        assert_eq!(faces[0].style, None);
+        assert_eq!(faces[0].display, None);
+    }
+
+    #[test]
+    fn font_face_keeps_source_order_across_url_and_local() {
+        // 多 src：逗号分隔有序列表，按序尝试语义由顺序承载
+        let sheet = Stylesheet::parse(
+            "@font-face { font-family: Fallback; src: local(Arial), \
+             url(a.woff2) format(\"woff2\"), url(b.ttf) format(\"truetype\"), \
+             url(\"quoted.otf\"), local(\"My Font\"); }",
+        );
+        let sources = &sheet.font_faces()[0].sources;
+        assert_eq!(
+            sources,
+            &[
+                local_source("Arial"),
+                url_source("a.woff2", &["woff2"]),
+                url_source("b.ttf", &["truetype"]),
+                url_source("quoted.otf", &[]),
+                local_source("My Font"),
+            ]
+        );
+    }
+
+    #[test]
+    fn font_face_without_required_family_is_dropped() {
+        // 缺 font-family → 整条规则丢弃，后续规则不受影响
+        let sheet = Stylesheet::parse("@font-face { src: url(a.ttf) } p { color: red }");
+        assert!(sheet.font_faces().is_empty());
+        assert_eq!(sheet.rules().len(), 1);
+        // font-family 非法：CSS-wide 关键字
+        assert!(
+            Stylesheet::parse("@font-face { font-family: inherit; src: url(a.ttf) }")
+                .font_faces()
+                .is_empty()
+        );
+        // font-family 非法：未加引号的多词族名（偏差：不支持）
+        assert!(
+            Stylesheet::parse("@font-face { font-family: My Font; src: url(a.ttf) }")
+                .font_faces()
+                .is_empty()
+        );
+        // font-family 非法：空字符串 / 非标识符
+        assert!(
+            Stylesheet::parse("@font-face { font-family: \"\" }")
+                .font_faces()
+                .is_empty()
+        );
+        assert!(
+            Stylesheet::parse("@font-face { font-family: 42 }")
+                .font_faces()
+                .is_empty()
+        );
+        // 无块的 @font-face 与带 prelude 的 @font-face 整条丢弃
+        assert!(Stylesheet::parse("@font-face;").font_faces().is_empty());
+        assert!(
+            Stylesheet::parse("@font-face bogus { font-family: X }")
+                .font_faces()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn font_face_invalid_sources_are_skipped_individually() {
+        let sheet = Stylesheet::parse(
+            "@font-face { font-family: X; src: url(good.ttf), bogus, \
+             url(\"quoted.woff\") format(\"woff\"), local(), format(\"woff2\"), \
+             \"bare-string.ttf\", url(last.ttf); }",
+        );
+        let sources = &sheet.font_faces()[0].sources;
+        // bogus（非源 token）、local()（空内容）、位置非法的 format()、
+        // 裸字符串四项被跳过，其余按源顺序保留
+        assert_eq!(
+            sources,
+            &[
+                url_source("good.ttf", &[]),
+                url_source("quoted.woff", &["woff"]),
+                url_source("last.ttf", &[]),
+            ]
+        );
+    }
+
+    #[test]
+    fn font_face_with_all_invalid_sources_keeps_rule_with_empty_list() {
+        let sheet = Stylesheet::parse("@font-face { font-family: X; src: bogus, local() }");
+        let faces = sheet.font_faces();
+        assert_eq!(faces.len(), 1);
+        assert!(faces[0].sources.is_empty());
+    }
+
+    #[test]
+    fn font_face_weight_number_and_keyword_forms() {
+        let sheet = Stylesheet::parse(
+            "@font-face { font-family: A; font-weight: 700 } \
+             @font-face { font-family: B; font-weight: bold } \
+             @font-face { font-family: C; font-weight: normal } \
+             @font-face { font-family: D; font-weight: 550.5 } \
+             @font-face { font-family: E; font-weight: bolder } \
+             @font-face { font-family: G; font-weight: 1001 } \
+             @font-face { font-family: H; font-weight: 0 }",
+        );
+        let faces = sheet.font_faces();
+        // weight 是可选描述符：非法值只丢描述符，规则保留
+        assert_eq!(faces.len(), 7);
+        assert_eq!(faces[0].weight, Some(700));
+        assert_eq!(faces[1].weight, Some(700), "bold = 700");
+        assert_eq!(faces[2].weight, Some(400), "normal = 400");
+        assert_eq!(faces[3].weight, Some(551), "非整数四舍五入（偏差）");
+        assert_eq!(faces[4].weight, None, "bolder 描述符不适用");
+        assert_eq!(faces[5].weight, None, "1001 越界");
+        assert_eq!(faces[6].weight, None, "0 越界");
+    }
+
+    #[test]
+    fn font_face_format_hints_are_parsed_and_stored() {
+        // format() 多提示：CSS Fonts 4 允许逗号分隔多个 <string>
+        let sheet = Stylesheet::parse(
+            "@font-face { font-family: X; src: url(a.woff2) format(\"woff2\"), \
+             url(b.otf) format(\"opentype\", \"otf\"), url(c.ttf) format(), \
+             url(d.ttf) format(\"truetype\") }",
+        );
+        let sources = &sheet.font_faces()[0].sources;
+        assert_eq!(sources[0], url_source("a.woff2", &["woff2"]));
+        assert_eq!(
+            sources[1],
+            url_source("b.otf", &["opentype", "otf"]),
+            "多提示按序存储"
+        );
+        assert_eq!(sources[2], url_source("d.ttf", &["truetype"]));
+        // 空 format() 与未加引号的提示（规范语法是 <string>#）使该源无效
+        let sheet = Stylesheet::parse(
+            "@font-face { font-family: X; src: url(c.ttf) format(), url(d.ttf) format(truetype) }",
+        );
+        assert!(sheet.font_faces()[0].sources.is_empty());
+    }
+
+    #[test]
+    fn font_face_style_and_display_forms() {
+        let sheet = Stylesheet::parse(
+            "@font-face { font-family: A; font-style: italic; font-display: swap } \
+             @font-face { font-family: B; font-style: normal; font-display: optional } \
+             @font-face { font-family: C; font-style: oblique; font-display: block } \
+             @font-face { font-family: D; font-style: oblique 30deg; font-display: fallback } \
+             @font-face { font-family: E; font-display: auto }",
+        );
+        let faces = sheet.font_faces();
+        assert_eq!(faces.len(), 5, "可选描述符非法只丢描述符");
+        assert_eq!(faces[0].style, Some(FontFaceStyle::Italic));
+        assert_eq!(faces[0].display, Some(FontFaceDisplay::Swap));
+        assert_eq!(faces[1].style, Some(FontFaceStyle::Normal));
+        assert_eq!(faces[1].display, Some(FontFaceDisplay::Optional));
+        assert_eq!(faces[2].style, None, "oblique 不识别（偏差）");
+        assert_eq!(faces[2].display, Some(FontFaceDisplay::Block));
+        assert_eq!(faces[3].style, None, "oblique 带角度同样不识别");
+        assert_eq!(faces[3].display, Some(FontFaceDisplay::Fallback));
+        assert_eq!(faces[4].display, Some(FontFaceDisplay::Auto));
+    }
+
+    #[test]
+    fn font_face_family_string_and_ident_forms() {
+        let sheet = Stylesheet::parse(
+            "@font-face { font-family: Custom; src: url(a.ttf) } \
+             @font-face { font-family: \"With Space\"; src: url(b.ttf) } \
+             @font-face { font-family: initial; src: url(c.ttf) } \
+             @font-face { font-family: default; src: url(d.ttf) }",
+        );
+        let faces = sheet.font_faces();
+        assert_eq!(faces.len(), 2, "CSS-wide 关键字与 default 不能作族名");
+        assert_eq!(faces[0].family, "Custom");
+        assert_eq!(faces[1].family, "With Space");
+    }
+
+    #[test]
+    fn font_face_duplicate_descriptors_last_wins() {
+        let sheet = Stylesheet::parse(
+            "@font-face { font-family: A; font-family: B; font-weight: 300; \
+             font-weight: 700; src: url(one.ttf); src: url(two.ttf) format(\"t2\"); }",
+        );
+        let face = &sheet.font_faces()[0];
+        assert_eq!(face.family, "B");
+        assert_eq!(face.weight, Some(700));
+        assert_eq!(face.sources, vec![url_source("two.ttf", &["t2"])]);
+    }
+
+    #[test]
+    fn font_face_descriptor_with_important_is_dropped() {
+        // 描述符不接受 !important：带该标志的描述符按无效丢弃
+        let sheet = Stylesheet::parse("@font-face { font-family: X !important } p { color: red }");
+        assert!(
+            sheet.font_faces().is_empty(),
+            "必需描述符带 !important → 丢整条"
+        );
+        assert_eq!(sheet.rules().len(), 1);
+        let sheet = Stylesheet::parse("@font-face { font-family: X; font-weight: 700 !important }");
+        assert_eq!(
+            sheet.font_faces()[0].weight,
+            None,
+            "可选描述符带 !important 丢弃"
+        );
+        let sheet = Stylesheet::parse("@font-face { font-family: X; src: url(a.ttf) !important }");
+        assert!(
+            sheet.font_faces()[0].sources.is_empty(),
+            "src 带 !important 整个描述符无效"
+        );
+    }
+
+    #[test]
+    fn font_face_unknown_descriptors_are_dropped() {
+        // unicode-range / font-stretch / font-variant 等记偏差不解析：
+        // 按无效描述符丢弃，规则保留
+        let sheet = Stylesheet::parse(
+            "@font-face { font-family: X; unicode-range: U+0-7F; font-stretch: condensed; \
+             font-variant: small-caps; src: url(a.ttf) }",
+        );
+        let faces = sheet.font_faces();
+        assert_eq!(faces.len(), 1);
+        assert_eq!(faces[0].sources, vec![url_source("a.ttf", &[])]);
+    }
+
+    #[test]
+    fn font_faces_keep_source_order_and_do_not_disturb_style_rules() {
+        let sheet = Stylesheet::parse(
+            "@font-face { font-family: A; src: url(a.ttf) } \
+             p { color: red } \
+             @font-face { font-family: B; font-family: C; src: url(b.ttf) } \
+             q { color: blue } \
+             @font-face { src: url(c.ttf) }",
+        );
+        assert_eq!(rule_texts(&sheet), vec!["p", "q"]);
+        let faces = sheet.font_faces();
+        assert_eq!(faces.len(), 2, "缺 family 的第三条丢弃");
+        assert_eq!(faces[0].family, "A");
+        assert_eq!(faces[1].family, "C", "重复描述符最后生效");
+    }
+
+    #[test]
+    fn font_face_inside_media_is_not_supported() {
+        // 嵌套 at-rule 不支持（既有偏差）：@media 内的 @font-face 整块跳过
+        let sheet = Stylesheet::parse_with_viewport(
+            "@media screen { @font-face { font-family: X; src: url(a.ttf) } }",
+            MediaViewport {
+                width: 800.0,
+                height: 600.0,
+            },
+        );
+        assert!(sheet.font_faces().is_empty());
+        assert!(sheet.rules().is_empty());
     }
 }
