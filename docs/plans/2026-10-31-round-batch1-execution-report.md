@@ -43,6 +43,21 @@ paint **0.1.8** / chrome **0.1.29**（layout 0.1.29 为 float 轮既有）。
    image-heavy 与滚动风暴按用户指示跳过（滚动 rasterize 维持 10–16s/帧
    本属预期，视口裁剪属 K9）。
 
+### 6b. CI runner 首次基线（bench CI 首跑，50 帧全量）
+
+后续 CI 手动触发的趋势对比以本次为锚点（ubuntu runner，Noto CJK 字体，
+绝对数字与本机 Windows 口径不可直接对比）：
+
+| 场景 | first-load (ms) parse/cascade/layout/scene | 滚动 translate / rasterize (ms) |
+| --- | --- | --- |
+| text-heavy | 7.9 / 16.1 / 239.6 / 3.8 | 2.383 / **2472.0** |
+| rules-heavy | 21.9 / 295.3 / 235.7 / 5.1 | 2.405 / **1685.1** |
+| image-heavy | 0.0 / 0.1 / 0.3 / 0.0 | 0.006 / **6.8** |
+
+四条机器无关断言全绿（shape 1.00×/0.96×、metrics 10/1/1、resize runs 5、
+滚动 emit 0×3）——K9（视口裁剪/增量光栅）的 bench 门槛（稳态 ≤33ms/帧）
+以 CI 口径直接可判。
+
 ## 三、执行事件与编排者修复记录
 
 1. **K2 T3 子代理被框架挂起中断在收尾**（代码主体已在，回执丢失）：编排者
