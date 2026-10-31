@@ -36,6 +36,7 @@ tools/acceptance/
     ├── batch1/k3/             # K3 GBK 字节、302 落点页、缓存页
     ├── batch1/k4/             # K4 @font-face 正常页与 404 回退页
     ├── batch2/k13/            # K13 formats 页 + favicon 两态页（二进制 fixture 复用 paint tests/data）
+    ├── batch2/k6/             # K6 容器滚动三页（嵌套 / hidden 裁剪 / 容器滚动条）
     ├── core/                  # 长页主页 + 第二页 + dot.png（滚动/键盘/选区/链接）
     ├── links/                 # 链接点击与行内图片形态
     └── legacy/                # 历史轮次页面原样迁入（t3 文本/图片/float，float 冒烟）
@@ -75,6 +76,19 @@ app.rs，接线随批次收口合入）。未接线时导航不发图标请求�
 | K13-3 | `/k13icon` | `/stats` 有 `/k13-link-icon.ico` 且无 `/favicon.ico`（link 优先，不回落） | `/stats` |
 | K13-4 | `/k13icon` 二次导航 | `/k13-link-icon.ico` 计数不变（会话去重） | `/stats` |
 | K13-5 | `/k13noicon` | 无 link 回落：`/stats` 有 `/favicon.ico` 计数，图标照常出现 | `/stats` + 截图 |
+
+## 回归清单（批次 2 增量，K6 容器滚动）
+
+| # | 路由 | 判据 | 判定方式 |
+| --- | --- | --- | --- |
+| K6-1 | `/k6nested` | 外层与内层右侧各有一条滚动条，各自独立拖拽 | 截图目测 |
+| K6-2 | `/k6nested` | 滚轮在内层先滚内层；内层到顶/底后冒泡外层，外层到边界后冒泡页面 | 滚轮 + 截图 |
+| K6-3 | `/k6nested` | 拖内层滚动条只动内层内容，页面不滚 | 拖拽 + 截图 |
+| K6-4 | `/k6nested` | 外层滚一段后 resize：偏移保留并按新 scrollable overflow 夹取 | resize + 截图 |
+| K6-5 | `/k6hidden` | overflow:hidden 只裁剪：超出部分不可见且不渗出边框；无滚动条 | 截图目测 |
+| K6-6 | `/k6hidden` | 滚轮悬停 hidden 容器：容器不动，页面照常滚（冒泡越过） | 滚轮 + 截图 |
+| K6-7 | `/k6bar` | thumb 按内容比例取高；拖拽抓取点不跳变，顶/底端点对齐 | 拖拽 + 截图 |
+| K6-8 | `/k6bar` | 点击 thumb 上/下轨道翻一页；拖容器滚动条期间页面不滚 | 点击/拖拽 + 截图 |
 
 历史轮次页面（`/legacy/...`）的判据写在各页面末尾或对应轮次文档
 （`docs/plans/`）中；这些页面在当年验收通过后原样迁入，改动需同步更新本文档。

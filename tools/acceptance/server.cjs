@@ -38,6 +38,10 @@ const ALIASES = {
   "/k13": "batch2/k13/formats.html",
   "/k13icon": "batch2/k13/favicon-link.html",
   "/k13noicon": "batch2/k13/favicon-nolink.html",
+  // K6 容器滚动三页（批次 2）：静态路径 pages/batch2/k6/*.html 亦可直接访问
+  "/k6nested": "batch2/k6/nested-scroll.html",
+  "/k6hidden": "batch2/k6/hidden-clip.html",
+  "/k6bar": "batch2/k6/container-scrollbar.html",
 };
 
 // K13 formats 页四张 8x8 fixture：URL → crates/nexty-paint/tests/data/ 下的

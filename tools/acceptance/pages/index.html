@@ -85,7 +85,7 @@
   <p>与主站 <code>core/index.html</code> 结构一致的回归形态。</p>
 </div>
 
-<h2>批次 2（K13 图片格式 + favicon）</h2>
+<h2>批次 2（K13 图片格式 + favicon / K6 容器滚动）</h2>
 
 <div class="item">
   <h3><a href="/k13">/k13</a> — 图片格式并排（png / jpeg / gif / webp）</h3>
@@ -104,6 +104,24 @@
   <h3><a href="/k13noicon">/k13noicon</a> — favicon 两态页 ②（无 link，回落）</h3>
   <p>无 <code>link[rel~=icon]</code>：回落站点根 <code>/favicon.ico</code>，图标照常出现；
   <a href="/stats">/stats</a> 有 <code>/favicon.ico</code> 计数。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/k6nested">/k6nested</a> — K6 嵌套滚动（内外双层 overflow:auto）</h3>
+  <p>内外两层各自出现滚动条且独立拖拽；滚轮在内层先滚、到边界冒泡外层再冒泡页面；
+  拖内层滚动条不带动页面；resize 后偏移保留并夹取。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/k6hidden">/k6hidden</a> — K6 hidden 裁剪</h3>
+  <p>overflow:hidden 容器只显示顶部内容、无滚动条；滚轮不可滚它、直接冒泡页面；
+  被裁内容不渗出边框。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/k6bar">/k6bar</a> — K6 容器滚动条拖拽</h3>
+  <p>容器右缘滚动条：thumb 按内容比例取高；拖拽抓取点不跳变、端点对齐；
+  轨道点击翻页；拖容器滚动条期间页面不滚。</p>
 </div>
 
 <h2>核心站（滚动 / 键盘 / 选区 / 图片）</h2>

@@ -1,0 +1,49 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>K6 容器滚动条</title>
+<style>
+  body { font-family: sans-serif; margin: 16px; }
+  .box { overflow: auto; width: 480px; height: 300px; border: 2px solid #336; padding: 10px; background-color: #f4f4fb; }
+  .block { height: 30px; background-color: #d7dbf5; margin: 5px 0; }
+  p { margin: 6px 0; }
+</style>
+</head>
+<body>
+<h3>K6 container scrollbar：容器滚动条拖拽</h3>
+<ol>
+  <li>容器（蓝框）右缘出现滚动条：轨道贯穿 padding box 高度、thumb 按内容比例取高；</li>
+  <li>按住 thumb 拖动：内容随手走，抓取点不跳变；拖到轨道底 = 内容末尾、拖到轨道顶 = 内容开头；</li>
+  <li>点击 thumb 上/下轨道空白：向上/下翻一页（步长 = 容器可视高）；</li>
+  <li>拖容器滚动条期间页面（窗口级）不滚动，地址栏等工具带不受影响；</li>
+  <li>滚轮悬停容器：容器先滚，到边界后冒泡到页面。</li>
+</ol>
+
+<div class="box">
+  <p>容器首行（scroll = 0 可见）</p>
+  <div class="block">01</div>
+  <div class="block">02</div>
+  <div class="block">03</div>
+  <div class="block">04</div>
+  <div class="block">05</div>
+  <div class="block">06</div>
+  <div class="block">07</div>
+  <div class="block">08</div>
+  <div class="block">09</div>
+  <div class="block">10</div>
+  <div class="block">11</div>
+  <div class="block">12</div>
+  <div class="block">13</div>
+  <div class="block">14</div>
+  <div class="block">15</div>
+  <div class="block">16</div>
+  <div class="block">17</div>
+  <div class="block">18</div>
+  <div class="block">19</div>
+  <div class="block">20</div>
+  <p>容器末行（拖到底可见）</p>
+</div>
+<p>容器之后的正文（页面滚动时可见，容器拖拽不应带动它）。</p>
+</body>
+</html>
