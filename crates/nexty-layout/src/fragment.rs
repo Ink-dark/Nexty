@@ -56,6 +56,20 @@ pub struct Fragment {
     pub children: Vec<Fragment>,
     /// 行内内容（该盒的文本行；与块级子片段互斥出现）。
     pub lines: Vec<LineFragment>,
+    /// 滚动容器标志（K6 T0 接缝，T2 填充；当前恒 `false`）。
+    ///
+    /// 任一轴 `overflow` 为 `auto`/`scroll`（用户可滚动）时为真；`hidden`
+    /// 只裁剪不可滚动，裁剪语义由消费方按 [`Fragment::style`] 的
+    /// `overflow_x`/`overflow_y` 判定。
+    pub scrollable: bool,
+    /// scrollable overflow rect（CSS Overflow §3 简化档；T2 填充，当前恒
+    /// `None`）：自身内容盒 + 后代边框盒（含行内原子盒与文本行横向溢出）
+    /// 的并集，相对片段自身**边框盒**左上角；遇嵌套滚动容器截断（其内部
+    /// 溢出由自身裁剪，贡献收敛为自身边框盒）。仅滚动/裁剪容器有值。
+    ///
+    /// 滚动偏移不参与布局解算：本字段与全部布局输出均与滚动状态无关，
+    /// 滚动由消费方在绘制期以平移施加（K6 契约，见 crate 文档）。
+    pub scrollable_overflow: Option<Rect>,
 }
 
 /// 行的起点来源（复制文本与选区跨行拼接用）。
@@ -79,6 +93,9 @@ impl Default for LineStart {
 /// 一行文本。
 #[derive(Debug, Clone, PartialEq)]
 pub struct LineFragment {
+    /// 行顶相对片段内容盒顶部的 y（行盒堆叠游标；选区矩形与滚动溢出
+    /// 纵向带消费）。
+    pub top: f32,
     /// 基线相对片段内容盒顶部的 y。
     pub baseline: f32,
     /// 行高（strut 与行内盒共同决定）。
