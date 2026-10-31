@@ -1,0 +1,71 @@
+name: Bench (manual)
+
+# 手动触发的性能基准（nexty-chrome pipeline bench）。不挂 push/PR：
+# 全页光栅的滚动风暴很重，且绝对数字依赖 runner 硬件。本作业的价值是
+# ①固定的可复现环境（同 runner 类内趋势可比）②机器无关的回归断言
+# （resize 合帧 runs、滚动 emit=0、shape≈1×chunks、metrics≤10——
+# bench 内置断言，破坏即非零退出翻红）③数字入 Job Summary 与 artifact 存档。
+# 本地完整基线仍是 docs/2026-10-25-perf-baseline.md（Windows 10 实测），
+# CI runner 的绝对数字与它不可直接对比。
+
+on:
+  workflow_dispatch:
+    inputs:
+      scroll_frames:
+        description: "滚动风暴帧数（全页光栅每帧 10s+，小帧数控成本；0 = 跳过滚动风暴；本地基线口径为 50）"
+        required: false
+        default: "5"
+
+concurrency:
+  group: bench-manual
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  bench:
+    name: pipeline bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies (winit / wgpu link deps + CJK fonts)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libx11-dev libxi-dev libgl1-mesa-dev libasound2-dev libpulse-dev \
+            libtss2-dev libxkbcommon-dev libwayland-dev libxcb1-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxrandr-dev libdbus-1-dev libdrm-dev libgbm-dev \
+            libegl1-mesa-dev libgles2-mesa-dev libfontconfig1-dev \
+            vulkan-tools libvulkan-dev \
+            fonts-noto-cjk
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run pipeline bench
+        env:
+          BENCH_MODE: "1"
+          BENCH_SCROLL_FRAMES: ${{ inputs.scroll_frames }}
+        run: |
+          set -o pipefail
+          cargo bench -p nexty-chrome --bench pipeline 2>&1 | tee bench-output.txt
+      - name: Append to job summary
+        if: always()
+        run: |
+          {
+            echo "## pipeline bench"
+            echo ""
+            echo "runner: $(uname -m), $(nproc) cores, scroll_frames=${{ inputs.scroll_frames }}"
+            echo ""
+            echo '```'
+            cat bench-output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-output
+          path: bench-output.txt
+          if-no-files-found: error
