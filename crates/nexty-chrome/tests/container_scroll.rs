@@ -17,7 +17,7 @@ use nexty_text::ParleyTextShaper;
 /// 按 id 找元素节点。
 fn find_by_id(page: &pipeline::Page, id: &str) -> NodeId {
     fn walk(page: &pipeline::Page, node: NodeId, id: &str) -> Option<NodeId> {
-        if let Some(nexty_dom::NodeKind::Element(data)) = page.document.node(node)
+        if let Some(nexty_dom::NodeKind::Element(data)) = page.document.borrow().node(node)
             && data
                 .attributes
                 .iter()
@@ -26,10 +26,11 @@ fn find_by_id(page: &pipeline::Page, id: &str) -> NodeId {
             return Some(node);
         }
         page.document
+            .borrow()
             .children(node)
             .find_map(|child| walk(page, child, id))
     }
-    walk(page, page.document.root(), id).expect("element with id")
+    walk(page, page.document.borrow().root(), id).expect("element with id")
 }
 
 /// 布局一页（默认视口宽 400）。
