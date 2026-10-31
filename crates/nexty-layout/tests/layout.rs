@@ -1218,7 +1218,9 @@ fn word_spacing_separators_count_into_narrow_measurement() {
 #[test]
 fn justify_flushes_non_last_lines_to_container_width() {
     // 非末行右缘贴满容器（机会点均匀分配自由空间），末行左 ragged。
-    // 断言不依赖具体断行位置：任何非末 justify 行的行宽都 = 可用宽。
+    // 断言不依赖字体度量：不断言具体像素宽（各平台字体 advance 不同），
+    // 而是断言不变量——所有非末行 justify 后右缘彼此相等（同为可用宽），
+    // 且都大于末行右缘（末行不分配）。
     let (document, root) = layout(
         "<body><p style=\"width: 100px; text-align: justify\">\
          aaa bbb ccc ddd eee fff ggg hhh</p></body>",
@@ -1227,15 +1229,22 @@ fn justify_flushes_non_last_lines_to_container_width() {
     );
     let p = find(&document, &root, "p").expect("p fragment");
     assert!(p.lines.len() >= 2, "文本折成多行");
-    for (index, line) in p.lines[..p.lines.len() - 1].iter().enumerate() {
-        let (_, end) = line_extent(line);
+    let non_last: Vec<f32> = p.lines[..p.lines.len() - 1]
+        .iter()
+        .map(|line| line_extent(line).1)
+        .collect();
+    let last_end = line_extent(p.lines.last().expect("last line")).1;
+    let flushed = non_last[0];
+    for (index, end) in non_last.iter().enumerate() {
         assert!(
-            approx(end, 100.0),
-            "第 {index} 行 justify 后右缘贴容器：{end}"
+            approx(*end, flushed),
+            "第 {index} 行 justify 后右缘与首行一致：{end} vs {flushed}"
+        );
+        assert!(
+            *end > last_end,
+            "第 {index} 行右缘大于末行（末行不分配）：{end} vs {last_end}"
         );
     }
-    let (_, last_end) = line_extent(p.lines.last().expect("last line"));
-    assert!(last_end < 100.0, "末行不分配，左 ragged：{last_end}");
 }
 
 #[test]
@@ -1427,19 +1436,38 @@ fn text_indent_applies_before_alignment() {
 
 #[test]
 fn text_indent_participates_in_justified_first_line() {
-    // justify：首行带缩进且右缘仍贴满容器（首行须有 2+ 个放置项才有机会点）
+    // justify：首行带缩进且右缘仍贴满容器（首行须有 2+ 个放置项才有机会点）。
+    // 语料用单字母词，保证任何平台字体下缩进后的首行都能放下两个词——
+    // 否则（如 ubuntu 的宽 serif 上首行只剩一个词）无机会点、正确行为是
+    // 不拉伸，断言就会把字体差异误判成实现缺陷。
     let (document, root) = layout(
         "<body><p style=\"width: 100px; text-indent: 40px; text-align: justify\">\
-         aaa bbb ccc ddd</p></body>",
+         a b c d e f g h i j k l m n o p</p></body>",
         "",
         400.0,
     );
     let p = find(&document, &root, "p").expect("p fragment");
     assert!(p.lines.len() >= 2);
     let first_x = p.lines[0].runs[0].glyphs[0].x;
-    let (_, end) = line_extent(&p.lines[0]);
     assert!(approx(first_x, 40.0), "缩进保留：{first_x}");
-    assert!(approx(end, 100.0), "首行 justify 右缘贴满：{end}");
+    // 不变量（不依赖字体度量）：非末行（含首行）右缘彼此相等，且都大于
+    // 末行右缘——缩进只占首行行首，不改变 justify 的右缘。
+    let non_last: Vec<f32> = p.lines[..p.lines.len() - 1]
+        .iter()
+        .map(|line| line_extent(line).1)
+        .collect();
+    let last_end = line_extent(p.lines.last().expect("last line")).1;
+    let flushed = non_last[0];
+    for (index, end) in non_last.iter().enumerate() {
+        assert!(
+            approx(*end, flushed),
+            "第 {index} 行 justify 后右缘与首行一致：{end} vs {flushed}"
+        );
+        assert!(
+            *end > last_end,
+            "第 {index} 行右缘大于末行（末行不分配）：{end} vs {last_end}"
+        );
+    }
 }
 
 #[test]
