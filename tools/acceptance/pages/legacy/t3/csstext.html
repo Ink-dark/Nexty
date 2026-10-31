@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>CSS Text 验收</title>
+<style>
+body { margin: 16px; font-size: 16px; }
+h2 { font-size: 18px; margin: 12px 0 4px 0; }
+.justify { text-align: justify; width: 420px; }
+.indent-px { text-indent: 40px; width: 420px; }
+.indent-pct { text-indent: 10%; width: 420px; }
+.spaced { letter-spacing: 4px; font-size: 24px; }
+.wordspace { word-spacing: 12px; }
+pre { margin: 4px 0; }
+.tab4 { tab-size: 4; }
+.right-hang { text-align: right; white-space: pre-wrap; width: 420px; }
+.atomic { display: inline-block; width: 120px; padding: 6px; background-color: #dde8ff; }
+</style>
+</head>
+<body>
+<h2>justify 两端对齐</h2>
+<p class="justify">浏览器引擎的文本排版要求行内内容在软折行处把自由空间均匀分配到可折叠空格与 CJK 断点上，使段落的非末行右缘贴满容器，末行保持左对齐。这一段包含中文与 English words 混排，用于目测两端对齐效果。</p>
+
+<h2>text-indent 首行缩进</h2>
+<p class="indent-px">这一段首行缩进 40 像素，第二行以后不缩进。段落排版中首行缩进是中文书籍最常见的段首样式，正文折行后其余各行顶格排布，与缩进形成对比。</p>
+<p class="indent-pct">这一段首行缩进百分之十（相对包含块宽度折算），缩进量随窗口宽度变化，与上面的固定像素缩进对照。</p>
+
+<h2>letter-spacing / word-spacing</h2>
+<p class="spaced">字距标题 ABC</p>
+<p class="wordspace">词距测试 one two three four</p>
+
+<h2>tab-size 制表</h2>
+<pre class="tab4">ab	cdef
+ab	chij</pre>
+
+<h2>pre-wrap 行尾空格悬挂（右对齐）</h2>
+<div class="right-hang">可见文本   </div>
+
+<h2>行内原子盒选择</h2>
+<p>外部 ab <span class="atomic">盒内 xy 两行</span> 外部 cd</p>
+
+<h2>块嵌行内（M9）</h2>
+<p>段落 a <span><div>块级 X 不再丢弃</div></span> 段落 b</p>
+</body>
+</html>

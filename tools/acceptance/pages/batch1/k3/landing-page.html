@@ -1,0 +1,14 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>302 落点页</title>
+</head>
+<body style="margin:16px">
+<h1>302 落点页</h1>
+<p>本页经 /redir 302 跳转到达 /landing/dir/page.html。</p>
+<p><a href="sub.html">相对链接 sub.html</a>（应解析为 /landing/dir/sub.html）</p>
+<p><img src="dot.png" width="40" height="20" alt="rel dot">（相对图片，应解析为 /landing/dir/dot.png）</p>
+<p>判据：点击相对链接后落点是 /landing/dir/sub.html；图片能显示（服务器 /stats 应记录 /landing/dir/dot.png）。</p>
+</body>
+</html>

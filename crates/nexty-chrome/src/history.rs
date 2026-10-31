@@ -67,6 +67,15 @@ impl History {
         self.back.push(leaving);
         Some(self.current.clone())
     }
+
+    /// 原地改写当前条目（不产生新条目、不动前后栈）。
+    ///
+    /// 302 落点语义（WHATWG 会话历史）：重定向结束后条目记为最终 URL——
+    /// 地址栏、刷新、页内相对链接的解析基准（`current`）随之落在落点；
+    /// 后退仍回前一页，前进仍进原前进项（由调用方在页面安装时调用）。
+    pub fn replace_current(&mut self, url: impl Into<String>) {
+        self.current = url.into();
+    }
 }
 
 #[cfg(test)]
@@ -113,6 +122,32 @@ mod tests {
         history.push("a");
         assert!(!history.can_back(), "重复当前条目不入栈");
         assert!(history.go_back().is_none());
+    }
+
+    /// 302 落点语义（WHATWG 会话历史）：替换当前条目为最终 URL，
+    /// 前后栈与可用性标志不变；后退仍回前一页，前进仍进原前进项。
+    #[test]
+    fn replace_current_rewrites_entry_in_place() {
+        let mut history = History::new("about:blank");
+        history.push("https://a.test/start");
+        history.push("https://a.test/redirected");
+
+        history.replace_current("https://final.test/landing");
+        assert_eq!(history.current(), "https://final.test/landing");
+        assert!(history.can_back(), "后退栈不变");
+        assert!(!history.can_forward(), "前进栈不变");
+        assert_eq!(history.go_back().as_deref(), Some("https://a.test/start"));
+        // 前进重放进的是**改写后**的条目（替换重写当前，不保留旧值）
+        assert_eq!(
+            history.go_forward().as_deref(),
+            Some("https://final.test/landing")
+        );
+
+        // 替换不产生新条目：连续替换只改当前值，栈深度不变
+        history.replace_current("https://final.test/landing2");
+        assert_eq!(history.current(), "https://final.test/landing2");
+        assert!(history.can_back());
+        assert!(!history.can_forward(), "替换不产生新条目");
     }
 
     #[test]

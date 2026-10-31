@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Float smoke test</title>
+<style>
+  body { margin: 20px; font-family: serif; font-size: 18px; line-height: 1.5; }
+  .left-img {
+    float: left;
+    width: 160px;
+    height: 120px;
+    margin: 0 14px 8px 0;
+    background: #4a90d9; border: 2px solid #1a4f8a;
+  }
+  .right-box {
+    float: right;
+    width: 120px;
+    height: 90px;
+    margin: 0 0 8px 14px;
+    background: #d97a4a; border: 2px solid #8a3f1a;
+  }
+  .clearer { clear: both; }
+  h2 { font-size: 20px; }
+</style>
+</head>
+<body>
+  <h2>Float: 图文环绕</h2>
+  <div class="left-img"></div>
+  <div class="right-box"></div>
+  <p id="wrap">
+    这是一段围绕左侧蓝框与右侧橙框浮动的长文本。行盒应该在浮动盒旁边收缩，
+    不应与任何浮动盒重叠；当文本行进到浮动盒底缘之下后，应恢复为全宽排布。
+    floating text wraps around the boxes on both sides. the line boxes shrink
+    beside the floats and return to the full container width once past the
+    bottom edges of both floated boxes. 继续添加一些中文文本以保证行数足够多，
+    覆盖浮动盒下方区域，验证恢复全宽的行为。end of the wrapping paragraph.
+  </p>
+  <p class="clearer" id="after">clear: both 之后的段落，必须完整落在两个浮动盒的下方。</p>
+  <h2>Float: BFC 高度收缩</h2>
+  <div style="overflow: hidden; background: #eef;">
+    <div style="float: left; width: 100px; height: 60px; background: #7ac47a; border: 2px solid #3f8a3f;"></div>
+    <p style="margin: 0">overflow: hidden 容器应包含内部的浮动盒高度。</p>
+  </div>
+</body>
+</html>

@@ -1,0 +1,139 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Nexty 验收资产索引</title>
+<style>
+  body { font-family: system-ui, "Segoe UI", sans-serif; margin: 24px; line-height: 1.6; color: #222; max-width: 60rem; }
+  h1 { border-bottom: 2px solid #333; padding-bottom: .3rem; }
+  h2 { margin-top: 1.8rem; border-bottom: 1px solid #ddd; padding-bottom: .2rem; font-size: 1.1rem; }
+  h3 { margin: 1.1rem 0 .2rem; font-size: 1rem; font-family: monospace; }
+  p { margin: .2rem 0; }
+  code { background: #f6f6f6; padding: 0 .25rem; border-radius: 3px; }
+  .note { color: #666; font-size: .9rem; }
+  .item { border-left: 3px solid #ddd; padding-left: .8rem; margin: .6rem 0; }
+</style>
+</head>
+<body>
+<h1>Nexty 验收资产索引</h1>
+<p class="note">由 <code>node tools/acceptance/server.cjs</code> 提供。每条资产对应一条可复现的验收判据；完整回归清单见 <code>tools/acceptance/README.md</code>。此页刻意不用 table（table 布局尚未实现）。</p>
+
+<h2>批次 1（K1 事件 / K2 绘制 / K3 导航网络 / K4 字体）</h2>
+
+<div class="item">
+  <h3><a href="/k2">/k2</a> — K2 视觉对照页（五组）</h3>
+  <p>圆角卡片 / 渐变横幅 / UA 链接下划线 / z-index 叠放 / body 背景传播。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/k2z">/k2z</a> — K2 放大对照</h3>
+  <p>40px 下划线；三色两两重叠的 z-index 顺序（绿 3 &gt; 蓝 2 &gt; 红 1）；三向渐变。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/k2u">/k2u</a> — K2 装饰线专项</h3>
+  <p>UA / 继承 / 内联 / overline / line-through 五种来源同时出现。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/k2one">/k2one</a> — 单行裸链接（48px）</h3>
+  <p>仅 UA 链接带下划线；对照行（纯文本）无下划线。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/k2a">/k2a</a> — 作者表链接下划线</h3>
+  <p>作者样式表 <code>a{underline}</code> 与 UA 表路径对照，两行都应带下划线。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/gbk">/gbk</a> — GBK 编码页（<code>charset=gbk</code>）</h3>
+  <p>标题/正文/标点无乱码，不进错误页。字节由 <code>gbk-page.src.html</code> 经 iconv 生成。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/redir">/redir</a> — 302 → <code>/landing/dir/page.html</code></h3>
+  <p>落点正确；相对图片按落点解析（<a href="/stats">/stats</a> 有 <code>/landing/dir/dot.png</code>）；相对链接应按落点解析为 <code>/landing/dir/sub.html</code>（历史缺陷，见 README）。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/cached">/cached</a> — HTTP 缓存页（<code>max-age=120</code>）</h3>
+  <p>导航两次后 <a href="/stats">/stats</a> 的 <code>/cached</code> 计数仍为 1（第二次命中缓存）。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/font">/font</a> — @font-face（Space Mono）</h3>
+  <p>两行字形明显不同；再次导航不重复抓取字体（<code>/stats</code> 无新增字体请求）。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/font404">/font404</a> — @font-face 404（不同 family 名）</h3>
+  <p>两行同字体（系统回退）；无豆腐块、不报错。刻意用不同 family 名，避免命中会话级注册表。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/links/link-test.html">/links/link-test.html</a> — 链接点击（段落内 / 图片后）</h3>
+  <p>单次点击即导航；图片与链接同排。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/links/link-body.html">/links/link-body.html</a> — body 直接行内 img + a</h3>
+  <p>同排、下划线、可点击。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/links/link-index.html">/links/link-index.html</a> — 索引片段（img 与 a 同排）</h3>
+  <p>与主站 <code>core/index.html</code> 结构一致的回归形态。</p>
+</div>
+
+<h2>核心站（滚动 / 键盘 / 选区 / 图片）</h2>
+
+<div class="item">
+  <h3><a href="/core/">/core/</a> — 长页主页</h3>
+  <p>滚轮 / PageUp/PageDown / Home/End 滚动；链接导航；图片；地址栏焦点与页面焦点切换。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/core/page2.html">/core/page2.html</a> — 第二页</h3>
+  <p>相对链接与「返回主页」往返；后退 / 前进（Alt+←/→）。</p>
+</div>
+
+<h2>历史轮次资产（原样迁入）</h2>
+
+<div class="item">
+  <h3><a href="/legacy/t3/index.html">/legacy/t3/index.html</a></h3>
+  <p>块级堆叠 / margin 折叠 / flex / border-box / 行内混排。判据见页面内注释与对应轮次文档。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/legacy/t3/selection.html">/legacy/t3/selection.html</a></h3>
+  <p>选区：中文段落 / pre / br / 长 URL / 链接；拖拽、双击、Shift+点击、Ctrl+A/C。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/legacy/t3/links.html">/legacy/t3/links.html</a></h3>
+  <p>60 个滚动标记 + 链接：滚动定位与链接命中。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/legacy/t3/float.html">/legacy/t3/float.html</a> · <a href="/legacy/float/float-smoke.html">/legacy/float/float-smoke.html</a></h3>
+  <p>float 放置与文本环绕、clear。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/legacy/t3/csstext.html">/legacy/t3/csstext.html</a> · <a href="/legacy/t3/text-break.html">text-break</a></h3>
+  <p>CSS Text（justify / text-indent / letter-spacing / word-spacing / tab-size）与断行 / white-space / br。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/legacy/t3/img-block.html">img-block</a> · <a href="/legacy/t3/img-inline.html">img-inline</a> · <a href="/legacy/t3/hugeimg.html">hugeimg</a></h3>
+  <p>图片替换盒：块级 / 行内 / 大图尺寸。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/legacy/t3/diag.html">diag</a> · <a href="/legacy/t3/diag2.html">diag2</a> · <a href="/legacy/t3/deep.html">deep（512 层）</a></h3>
+  <p>诊断探针；深嵌套页用于验证解析入口截断、不栈溢出。</p>
+</div>
+
+<p class="note">辅助端点：<a href="/stats">/stats</a>（各 URL 请求计数，JSON）、<a href="/reset">/reset</a>（清零计数，重跑验收前先打开一次）。</p>
+</body>
+</html>

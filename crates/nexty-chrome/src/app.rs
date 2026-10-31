@@ -72,10 +72,10 @@ enum BackgroundEvent {
 }
 
 /// [`BackgroundEvent::FontsReady`] 的载荷（K4 T3）：抓取成功的字体字节 +
-/// 描述符。`url` 是发起抓取的导航 URL（跨页保护：页面已离开时只入库，
-/// 不重排当前页）。
+/// 描述符。`base_url` 是发起抓取的页面文档 base（302 落点即最终 URL；
+/// 跨页保护：页面已离开时只入库，不重排当前页）。
 struct FontsReadyPayload {
-    url: String,
+    base_url: String,
     fonts: Vec<crate::resources::FetchedFont>,
 }
 
@@ -611,11 +611,17 @@ impl BrowserApp {
                 // @font-face 字体源收集与后台抓取（K4 T3）：不在 load 门控
                 // 内，首帧先用系统字体渲染；字节就绪注册后经 FontsReady
                 // 触发恰好一轮重排（font-display swap 简化）。
-                self.spawn_font_fetch(&resources.stylesheets, &payload.base_url, &payload.url);
+                self.spawn_font_fetch(&resources.stylesheets, &payload.base_url);
                 let page = pipeline::build_page(document, resources.stylesheets, resources.images);
                 let title = pipeline::document_title(&page.document);
                 self.set_page(page, true);
-                self.bar.set_url(payload.url);
+                // 302 落点（WHATWG 会话历史）：条目与地址栏改为最终 URL——
+                // 页内相对链接的解析基准（history.current()）随之落在落点，
+                // 而非重定向前的请求 URL；无重定向时 base_url == url，不变。
+                if payload.base_url != payload.url {
+                    self.history.replace_current(payload.base_url.clone());
+                }
+                self.bar.set_url(payload.base_url);
                 if let Some(window) = &self.window {
                     match title {
                         Some(title) => window.set_title(&format!("{title} - Nexty")),
@@ -642,12 +648,7 @@ impl BrowserApp {
     ///
     /// 无待抓取源（无 @font-face / 全部会话已注册 / woff2 提示跳过）时
     /// 不起线程：已注册字体的重复导航零抓取、零重排。
-    fn spawn_font_fetch(
-        &mut self,
-        stylesheets: &[nexty_css::Stylesheet],
-        base_url: &str,
-        url: &str,
-    ) {
+    fn spawn_font_fetch(&mut self, stylesheets: &[nexty_css::Stylesheet], base_url: &str) {
         let requests = self.fonts.collect(stylesheets, base_url);
         if requests.is_empty() {
             return;
@@ -656,7 +657,7 @@ impl BrowserApp {
             return;
         };
         let proxy = self.proxy.clone();
-        let url = url.to_owned();
+        let base_url = base_url.to_owned();
         std::thread::Builder::new()
             .name("nexty-fonts".to_owned())
             .spawn(move || {
@@ -668,7 +669,7 @@ impl BrowserApp {
                 }
                 let _ =
                     proxy.send_event(BackgroundEvent::FontsReady(Box::new(FontsReadyPayload {
-                        url,
+                        base_url,
                         fonts,
                     })));
             })
@@ -687,7 +688,7 @@ impl BrowserApp {
                 registration.rejected
             );
         }
-        if registration.registered > 0 && payload.url == self.history.current() {
+        if registration.registered > 0 && payload.base_url == self.history.current() {
             self.relayout();
             if let Some(window) = &self.window {
                 window.request_redraw();

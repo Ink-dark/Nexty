@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>K2 放大对照</title>
+</head>
+<body style="margin:16px;background-color:#f0ead6">
+<h2>1. 链接下划线（40px）</h2>
+<p style="font-size:40px">普通文本 <a href="#x">下划线链接</a> 尾文本</p>
+
+<h2>2. z-index 大重叠（红=1 绿=3 蓝=2）</h2>
+<div style="position:relative;width:600px;height:300px">
+  <div style="position:absolute;left:40px;top:40px;width:260px;height:200px;background-color:#dd4444;z-index:1"></div>
+  <div style="position:absolute;left:100px;top:100px;width:260px;height:200px;background-color:#4466cc;z-index:2"></div>
+  <div style="position:absolute;left:0px;top:0px;width:120px;height:120px;background-color:#44aa44;z-index:3"></div>
+</div>
+<p>预期：绿(3) 压红(1) 与蓝(2)；蓝(2) 压红(1)。三块互有重叠，任一互相叠区域颜色反了即为缺陷。</p>
+
+<h2>3. 渐变（400x120）</h2>
+<div style="width:400px;height:120px;background-image:linear-gradient(90deg,#ff0000,#0000ff)"></div>
+<div style="width:400px;height:120px;background-image:linear-gradient(45deg,red,yellow,blue)"></div>
+<div style="width:400px;height:120px;background-image:linear-gradient(to bottom,#00ff00,#000000)"></div>
+<p>预期：红→蓝水平（90deg = to right）、45° 三色过盒中心、绿→黑垂直。</p>
+</body>
+</html>
