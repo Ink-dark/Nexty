@@ -124,6 +124,10 @@ pub enum PropertyId {
     FlexBasis,
     /// `position`。
     Position,
+    /// `float`。
+    Float,
+    /// `clear`。
+    Clear,
     /// `top`。
     Top,
     /// `right`。
@@ -228,6 +232,8 @@ impl PropertyId {
             PropertyId::FlexGrow => "flex-grow",
             PropertyId::FlexBasis => "flex-basis",
             PropertyId::Position => "position",
+            PropertyId::Float => "float",
+            PropertyId::Clear => "clear",
             PropertyId::Top => "top",
             PropertyId::Right => "right",
             PropertyId::Bottom => "bottom",
@@ -270,7 +276,7 @@ impl PropertyId {
     /// （CSS Syntax：声明名匹配大小写不敏感）。
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
-        const ALL: [PropertyId; 62] = [
+        const ALL: [PropertyId; 64] = [
             PropertyId::Display,
             PropertyId::Color,
             PropertyId::BackgroundColor,
@@ -298,6 +304,8 @@ impl PropertyId {
             PropertyId::FlexGrow,
             PropertyId::FlexBasis,
             PropertyId::Position,
+            PropertyId::Float,
+            PropertyId::Clear,
             PropertyId::Top,
             PropertyId::Right,
             PropertyId::Bottom,
@@ -413,6 +421,10 @@ pub enum PropertyValue {
     FlexBasis(SizeValue),
     /// `position` 关键字。
     Position(PositionValue),
+    /// `float` 关键字。
+    Float(FloatValue),
+    /// `clear` 关键字。
+    Clear(ClearValue),
     /// `top` / `right` / `bottom` / `left` 值。
     Inset(InsetValue),
     /// `flex-direction` 关键字。
@@ -810,6 +822,34 @@ pub enum PositionValue {
     Fixed,
 }
 
+/// `float` 值
+/// （[CSS 2.1 §9.5.1](https://www.w3.org/TR/CSS21/visuren.html#float-position)）。
+///
+/// 逻辑值 `inline-start` / `inline-end` 不做，记偏差（本层仅 LTR）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatValue {
+    /// `none`（initial）：不浮动。
+    None,
+    /// `left`：左浮动。
+    Left,
+    /// `right`：右浮动。
+    Right,
+}
+
+/// `clear` 值
+/// （[CSS 2.1 §9.5.2](https://www.w3.org/TR/CSS21/visuren.html#flow-control)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearValue {
+    /// `none`（initial）：允许两侧有浮动。
+    None,
+    /// `left`：下移到左侧浮动之下。
+    Left,
+    /// `right`：下移到右侧浮动之下。
+    Right,
+    /// `both`：下移到任一侧浮动之下。
+    Both,
+}
+
 /// `top` / `right` / `bottom` / `left` 值（inset）
 /// （[CSS Position 3 §3](https://drafts.csswg.org/css-position-3/#insets)）。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1138,6 +1178,8 @@ fn parse_property_value(property: PropertyId, input: &mut Parser<'_>) -> Result<
         PropertyId::FlexGrow => parse_flex_grow(input).map(PropertyValue::FlexGrow),
         PropertyId::FlexBasis => parse_size(input).map(PropertyValue::FlexBasis),
         PropertyId::Position => parse_position(input).map(PropertyValue::Position),
+        PropertyId::Float => parse_float(input).map(PropertyValue::Float),
+        PropertyId::Clear => parse_clear(input).map(PropertyValue::Clear),
         PropertyId::Top | PropertyId::Right | PropertyId::Bottom | PropertyId::Left => {
             parse_inset(input).map(PropertyValue::Inset)
         }
@@ -1396,7 +1438,39 @@ fn parse_position(input: &mut Parser<'_>) -> Result<PositionValue, ()> {
     }
 }
 
-/// `top` / `right` / `bottom` / `left`：<length> | <percentage> | auto。
+/// `float`：none | left | right（ASCII case-insensitive，CSS 2.1 §9.5.1）。
+fn parse_float(input: &mut Parser<'_>) -> Result<FloatValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("none") {
+        Ok(FloatValue::None)
+    } else if name.eq_ignore_ascii_case("left") {
+        Ok(FloatValue::Left)
+    } else if name.eq_ignore_ascii_case("right") {
+        Ok(FloatValue::Right)
+    } else {
+        Err(())
+    }
+}
+
+/// `clear`：none | left | right | both（ASCII case-insensitive，CSS 2.1 §9.5.2）。
+fn parse_clear(input: &mut Parser<'_>) -> Result<ClearValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("none") {
+        Ok(ClearValue::None)
+    } else if name.eq_ignore_ascii_case("left") {
+        Ok(ClearValue::Left)
+    } else if name.eq_ignore_ascii_case("right") {
+        Ok(ClearValue::Right)
+    } else if name.eq_ignore_ascii_case("both") {
+        Ok(ClearValue::Both)
+    } else {
+        Err(())
+    }
+}
 fn parse_inset(input: &mut Parser<'_>) -> Result<InsetValue, ()> {
     match input.next().map_err(|_| ())? {
         Token::Ident(name) if name.eq_ignore_ascii_case("auto") => Ok(InsetValue::Auto),
@@ -2729,8 +2803,8 @@ mod tests {
     #[test]
     fn position_inset_flex_grid_properties_parse() {
         use PropertyValue::{
-            AlignItems, AlignSelf, FlexDirection, FlexShrink, FlexWrap, Gap, GridAutoFlow,
-            GridTrack as GridTrackValue, Inset, JustifyContent, Position,
+            AlignItems, AlignSelf, Clear, FlexDirection, FlexShrink, FlexWrap, Float, Gap,
+            GridAutoFlow, GridTrack as GridTrackValue, Inset, JustifyContent, Position,
         };
         // position
         assert_eq!(
@@ -2742,6 +2816,30 @@ mod tests {
             Position(PositionValue::Fixed)
         );
         parse_err(PropertyId::Position, "sticky");
+
+        // float / clear（CSS 2.1 §9.5.1/§9.5.2）
+        assert_eq!(
+            parse_one(PropertyId::Float, "left"),
+            Float(FloatValue::Left)
+        );
+        assert_eq!(
+            parse_one(PropertyId::Float, "RIGHT"),
+            Float(FloatValue::Right)
+        );
+        assert_eq!(
+            parse_one(PropertyId::Float, "none"),
+            Float(FloatValue::None)
+        );
+        parse_err(PropertyId::Float, "inline-start");
+        assert_eq!(
+            parse_one(PropertyId::Clear, "both"),
+            Clear(ClearValue::Both)
+        );
+        assert_eq!(
+            parse_one(PropertyId::Clear, "Left"),
+            Clear(ClearValue::Left)
+        );
+        parse_err(PropertyId::Clear, "inline-end");
 
         // inset（四边 longhand 共用 InsetValue）
         assert_eq!(

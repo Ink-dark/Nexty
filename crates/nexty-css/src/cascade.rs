@@ -18,12 +18,12 @@ use crate::parser::{Declaration, MediaViewport, StyleRule, Stylesheet, parse_inl
 use crate::selector::{NextySelector, atom_str, match_element_selectors};
 use crate::value::{
     AbsoluteSize, AlignItemsValue, AlignSelfValue, BorderColorValue, BorderStyle, BorderWidthValue,
-    BoxSizingValue, CssWideKeyword, DeclaredValue, DisplayValue, FlexDirectionValue, FlexWrapValue,
-    FontFamilyValue, FontSizeValue, FontStyleValue, FontWeightValue, GapValue, GridAutoFlowValue,
-    GridTrackList, InsetValue, JustifyContentValue, LineHeightValue, MAX_CSS_LENGTH, MarginValue,
-    OverflowValue, OverflowWrapValue, PaddingValue, PositionValue, PropertyId, PropertyValue, Rgba,
-    SizeValue, SpacingValue, TabSizeValue, TextAlignValue, TextIndentValue, ViewportUnit,
-    WhiteSpaceValue, WordBreakValue,
+    BoxSizingValue, ClearValue, CssWideKeyword, DeclaredValue, DisplayValue, FlexDirectionValue,
+    FlexWrapValue, FloatValue, FontFamilyValue, FontSizeValue, FontStyleValue, FontWeightValue,
+    GapValue, GridAutoFlowValue, GridTrackList, InsetValue, JustifyContentValue, LineHeightValue,
+    MAX_CSS_LENGTH, MarginValue, OverflowValue, OverflowWrapValue, PaddingValue, PositionValue,
+    PropertyId, PropertyValue, Rgba, SizeValue, SpacingValue, TabSizeValue, TextAlignValue,
+    TextIndentValue, ViewportUnit, WhiteSpaceValue, WordBreakValue,
 };
 
 /// 本层 UA 的 medium 字号基准（CSS Fonts 4 §2.5：initial 值由 UA 决定，
@@ -88,6 +88,10 @@ pub struct ComputedStyle {
     pub flex_basis: SizeValue,
     /// `position`（CSS Position 3 §2，initial static）。
     pub position: PositionValue,
+    /// `float`（CSS 2.1 §9.5.1，initial none；不继承）。
+    pub float: FloatValue,
+    /// `clear`（CSS 2.1 §9.5.2，initial none；不继承）。
+    pub clear: ClearValue,
     /// 四边 inset（top / right / bottom / left；百分比与 auto 由 layout 解析）。
     pub inset: Edges<InsetValue>,
     /// `flex-direction`（CSS Flexbox §8.3.1，initial row）。
@@ -186,6 +190,8 @@ impl ComputedStyle {
             flex_grow: 0.0,
             flex_basis: SizeValue::Auto,
             position: PositionValue::Static,
+            float: FloatValue::None,
+            clear: ClearValue::None,
             inset: Edges::splat(InsetValue::Auto),
             flex_direction: FlexDirectionValue::Row,
             flex_wrap: FlexWrapValue::NoWrap,
@@ -236,7 +242,7 @@ impl PropertyId {
 /// 顺序承载计算依赖：`FontSize` 先于 `LineHeight`（百分比按自身字号折算）、
 /// `Color` 先于 border 颜色（currentcolor）、border style 先于 width
 /// （none/hidden 时宽度归零）。
-const PROPERTY_ORDER: [PropertyId; 62] = [
+const PROPERTY_ORDER: [PropertyId; 64] = [
     PropertyId::Display,
     PropertyId::Color,
     PropertyId::BackgroundColor,
@@ -264,6 +270,8 @@ const PROPERTY_ORDER: [PropertyId; 62] = [
     PropertyId::FlexGrow,
     PropertyId::FlexBasis,
     PropertyId::Position,
+    PropertyId::Float,
+    PropertyId::Clear,
     PropertyId::Top,
     PropertyId::Right,
     PropertyId::Bottom,
@@ -1102,6 +1110,12 @@ fn resolve_all(
             (PropertyId::Position, Decision::Use(PropertyValue::Position(value))) => {
                 style.position = *value;
             }
+            (PropertyId::Float, Decision::Use(PropertyValue::Float(value))) => {
+                style.float = *value;
+            }
+            (PropertyId::Clear, Decision::Use(PropertyValue::Clear(value))) => {
+                style.clear = *value;
+            }
             (PropertyId::Top, Decision::Use(PropertyValue::Inset(value))) => {
                 style.inset.top = resolve_inset(*value, viewport);
             }
@@ -1241,6 +1255,8 @@ fn resolve_all(
                     PropertyId::FlexGrow => style.flex_grow = source.flex_grow,
                     PropertyId::FlexBasis => style.flex_basis = source.flex_basis,
                     PropertyId::Position => style.position = source.position,
+                    PropertyId::Float => style.float = source.float,
+                    PropertyId::Clear => style.clear = source.clear,
                     PropertyId::Top => style.inset.top = source.inset.top,
                     PropertyId::Right => style.inset.right = source.inset.right,
                     PropertyId::Bottom => style.inset.bottom = source.inset.bottom,
@@ -2008,6 +2024,23 @@ mod tests {
                 tracks: vec![GridTrack::Auto]
             }
         );
+        assert_eq!(style.float, FloatValue::None);
+        assert_eq!(style.clear, ClearValue::None);
+    }
+
+    /// `float` / `clear` 解析进 computed style 且**不**继承（CSS 2.1 §9.5）。
+    #[test]
+    fn float_clear_properties_do_not_inherit() {
+        let document = build_document("<div style=\"float: left; clear: both\"><p>x</p></div>");
+        let parsed = Stylesheet::parse("");
+        let div = find_first_by_name(&document, "div").unwrap();
+        let p = find_first_by_name(&document, "p").unwrap();
+        let div_style = cascade(&document, div, &[&parsed], None, None);
+        assert_eq!(div_style.float, FloatValue::Left);
+        assert_eq!(div_style.clear, ClearValue::Both);
+        let p_style = cascade(&document, p, &[&parsed], None, None);
+        assert_eq!(p_style.float, FloatValue::None);
+        assert_eq!(p_style.clear, ClearValue::None);
     }
 
     /// `white-space` / `overflow-wrap` / `word-break` 均继承，initial 为 `normal`。
