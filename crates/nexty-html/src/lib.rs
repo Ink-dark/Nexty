@@ -7,9 +7,12 @@
 //!
 //! 行为 ground truth：WHATWG HTML Standard §13（Parsing）。
 //!
-//! 公共 API 只有 [`parse_document`] 与 [`parse_fragment`]：输入 UTF-8 字符串，
+//! 公共 API：[`parse_document`] 与 [`parse_fragment`]：输入 UTF-8 字符串，
 //! 输出 [`Document`]。`TreeSink` 实现类型不对外暴露，`QualName` / `Attribute` /
-//! `StrTendril` 等上游类型均在本层内转换为自有类型。
+//! `StrTendril` 等上游类型均在本层内转换为自有类型。另提供
+//! [`parse_document_scripted`]（K5 T4）：script 元素弹出点同步执行回调、
+//! `document.write` 语义前插回输入流的 scripted 驱动（供 WPT scripted 用例
+//! 与上层脚本编排测试；偏差见函数文档）。
 //!
 //! 另提供 [`collect_style_resources`]：把 `<link rel=stylesheet>` 与 `<style>`
 //! 按树序收集为资源清单（只收集不解析），供上层抓取外链 CSS 后按源顺序级联。
@@ -26,7 +29,11 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 #[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 use std::collections::HashSet;
+#[cfg(feature = "parse-document")]
+use std::rc::Rc;
 
+#[cfg(feature = "parse-document")]
+use html5ever::TokenizerResult;
 #[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 use html5ever::tendril::{StrTendril, TendrilSink};
 #[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
@@ -134,6 +141,76 @@ impl FragmentContext {
 pub fn parse_document(html: &str, options: ParseOptions) -> Document {
     let parser = html5ever::parse_document(HtmlTreeSink::new(), to_html_options(options));
     parser.one(html)
+}
+
+/// scripted 解析（K5 T4）：把结果解析进调用方提供的共享文档，并在每个
+/// 解析器插入的 `<script>` 弹出点（`</script>` 处理完成、元素出栈）同步
+/// 执行回调——WHATWG §13.2.4 的「script 已就绪」简化档，供 WPT scripted
+/// 树构建用例与上层脚本编排测试使用。
+///
+/// 回调收到共享文档句柄、script 元素与脚本源文本（子文本节点拼接）；返回值
+/// 是 `document.write` 语义的补充内容——非空时前插回解析器输入流，后续
+/// token（含写出的嵌套 script）照常入树，嵌套 script 同样触发回调。回调内
+/// 对文档的任何变更对后续树构建立即可见（foster parenting / 活动格式元素
+/// 重建读的是活树）。
+///
+/// 与 [`parse_document`] 的差异：文档由调用方持有（Rc 共享，供脚本执行侧
+/// 引擎装配）；`TokenizerResult::Script` 暂停点被消费而非跳过（
+/// [`parse_document`] 的驱动循环忽略 Script，脚本不执行——两入口行为由此
+/// 分叉）。
+///
+/// 偏差（简化档）：片段解析无 scripted 入口；`#script-off` 的语料语义由
+/// 调用方通过 [`ParseOptions::scripting_enabled`] 表达；脚本执行错误不上抛
+/// （回调自行处理）；`document.write` 只在回调执行期间有效（无解析器时的
+/// write 由宿主捕获槽决定去向）。
+/// scripted 解析的 script 断点回调（K5 T4）：共享文档句柄 + script 元素 +
+/// 源文本 → `document.write` 语义的补充内容（空串 = 无写入）。`'h` 为回调
+/// 捕获的宿主状态生命周期（回调通常持有引擎实例与 write 捕获槽）。
+#[cfg(feature = "parse-document")]
+pub type ScriptBreakHook<'h> = dyn FnMut(&Rc<RefCell<Document>>, NodeId, &str) -> String + 'h;
+
+pub fn parse_document_scripted(
+    document: &Rc<RefCell<Document>>,
+    html: &str,
+    options: ParseOptions,
+    on_script: &mut ScriptBreakHook<'_>,
+) {
+    let sink = HtmlTreeSink::with_document(Rc::clone(document));
+    // feed / BufferQueue 都是 &self 内部可变，parser 本体无需 mut。
+    let parser = html5ever::parse_document(sink, to_html_options(options));
+    parser.input_buffer.push_back(StrTendril::from(html));
+    loop {
+        match parser.tokenizer.feed(&parser.input_buffer) {
+            TokenizerResult::Done => break,
+            TokenizerResult::Script(node) => {
+                // 先读脚本源（回调可能改写它），再交回调执行；写出内容前插
+                // 回输入流（WHATWG document.write 的插入点语义简化档——此处
+                // tokenizer 恰停在 </script> 之后）。
+                let source = {
+                    let doc = document.borrow();
+                    script_source(&doc, node)
+                };
+                let written = on_script(document, node, &source);
+                if !written.is_empty() {
+                    parser.input_buffer.push_front(StrTendril::from(written));
+                }
+            }
+            TokenizerResult::EncodingIndicator(_) => {}
+        }
+    }
+    parser.tokenizer.end();
+}
+
+/// 收集 script 元素的源文本（子文本节点拼接，T4）。
+#[cfg(feature = "parse-document")]
+fn script_source(document: &Document, script: NodeId) -> String {
+    let mut out = String::new();
+    for child in document.children(script) {
+        if let Some(NodeKind::Text(data)) = document.node(child) {
+            out.push_str(data);
+        }
+    }
+    out
 }
 
 /// 按 WHATWG HTML §13.4 解析一段 HTML 片段。
@@ -343,7 +420,8 @@ fn to_html_options(options: ParseOptions) -> html5ever::ParseOpts {
 /// 该类型不对外暴露，避免上游类型越过本层边界。
 #[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 struct HtmlTreeSink {
-    document: RefCell<Document>,
+    /// arena 文档（Rc 共享：scripted 解析的脚本执行侧经同一句柄改树，T4）。
+    document: Rc<RefCell<Document>>,
     /// MathML `annotation-xml` 集成点元素。
     ///
     /// `TreeSink::is_mathml_annotation_xml_integration_point` 只在建元素时拿到
@@ -354,8 +432,13 @@ struct HtmlTreeSink {
 #[cfg(any(feature = "parse-document", feature = "parse-fragment"))]
 impl HtmlTreeSink {
     fn new() -> Self {
+        Self::with_document(Rc::new(RefCell::new(Document::new())))
+    }
+
+    /// 以调用方提供的共享句柄建 sink（scripted 解析路径，T4）。
+    fn with_document(document: Rc<RefCell<Document>>) -> Self {
         Self {
-            document: RefCell::new(Document::new()),
+            document,
             mathml_integration_points: RefCell::new(HashSet::new()),
         }
     }
@@ -381,7 +464,9 @@ impl TreeSink for HtmlTreeSink {
     type ElemName<'a> = ElementName;
 
     fn finish(self) -> Document {
-        self.document.into_inner()
+        Rc::try_unwrap(self.document)
+            .expect("HtmlTreeSink::finish: document Rc 仍有其他持有者")
+            .into_inner()
     }
 
     fn parse_error(&self, _msg: Cow<'static, str>) {
@@ -505,7 +590,17 @@ impl TreeSink for HtmlTreeSink {
         prev_element: &NodeId,
         child: NodeOrText<NodeId>,
     ) {
-        if self.document.borrow().parent(*element).is_some() {
+        // Foster parenting 的落点分支（WHATWG §13.2.6.1 步骤 5/6 的语料对齐）。
+        // last table 的父节点是**元素**时插到它之前；父节点是 Document（脚本
+        // 已把表移挂文档）或已游离时，内容回退进 open elements 栈上 table
+        // 之下的前一个元素——脚本摘走 html 后该子树不可达，内容不出现在
+        // 文档 dump 里（WPT scripted_foster01 语料钉住的浏览器行为；
+        // 步骤 5 原文按「父节点」分支会把 fostered 内容写成文档根的子节点，
+        // 与语料不符，记偏差）。
+        let parent = self.document.borrow().parent(*element);
+        let parent_is_element = parent
+            .is_some_and(|p| !matches!(self.document.borrow().node(p), Some(NodeKind::Document)));
+        if parent_is_element {
             self.append_before_sibling(element, child);
         } else {
             self.append(prev_element, child);

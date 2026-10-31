@@ -10,10 +10,11 @@ use rquickjs::function::Rest;
 use rquickjs::{Context, Ctx, Exception, Function, Object, Result as JsResult};
 
 use nexty_dom::{
-    DomRegistry, Event, EventPhase, JsrtError, JsrtGate, JsrtListener, JsrtScope,
-    JsrtTimerCallback, ListenerHandle, ListenerInvocation, ListenerOutcome, NodeId, ScriptError,
-    ScriptErrorKind,
+    DomRegistry, Event, JsrtError, JsrtGate, JsrtListener, JsrtScope, JsrtTimerCallback,
+    ListenerHandle, ListenerInvocation, ListenerOutcome, NodeId, ScriptError, ScriptErrorKind,
 };
+
+use crate::WriteSlot;
 
 /// 绑定层单例（[`DomRegistry`] 无状态）。
 const REGISTRY: DomRegistry = DomRegistry;
@@ -37,13 +38,19 @@ fn throw(ctx: &Ctx<'_>, error: &JsrtError) -> rquickjs::Error {
     Exception::throw_message(ctx, &error.to_string())
 }
 
-/// 在全局对象上注册全部 `__dom_*` 原生绑定（`gate` 克隆进各闭包）。
-pub fn register(context: &Context, gate: &JsrtGate) -> JsResult<()> {
-    context.with(|ctx| register_all(ctx, context, gate))
+/// 在全局对象上注册全部 `__dom_*` 原生绑定（`gate` 克隆进各闭包；
+/// `write_slot` 供 `document.write` 捕获，T4）。
+pub fn register(context: &Context, gate: &JsrtGate, write_slot: &WriteSlot) -> JsResult<()> {
+    context.with(|ctx| register_all(ctx, context, gate, write_slot))
 }
 
 /// 注册体：`'js` 为注册点上下文生命周期——绑定闭包与其 JS 值返回同域。
-fn register_all<'js>(ctx: Ctx<'js>, context: &Context, gate: &JsrtGate) -> JsResult<()> {
+fn register_all<'js>(
+    ctx: Ctx<'js>,
+    context: &Context,
+    gate: &JsrtGate,
+    write_slot: &WriteSlot,
+) -> JsResult<()> {
     let globals = ctx.globals();
 
     // ---- 树变更 ----
@@ -225,6 +232,33 @@ fn register_all<'js>(ctx: Ctx<'js>, context: &Context, gate: &JsrtGate) -> JsRes
     {
         let gate = gate.clone();
         globals.set(
+            "__dom_get_elements_by_tag_name",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, tag: String| -> JsResult<Vec<i64>> {
+                    match REGISTRY.get_elements_by_tag_name(&gate, &tag) {
+                        Ok(nodes) => Ok(nodes.iter().map(|id| id.index() as i64).collect()),
+                        Err(error) => Err(throw(&ctx, &error)),
+                    }
+                },
+            )?,
+        )?;
+    }
+    {
+        let gate = gate.clone();
+        globals.set(
+            "__dom_document_element",
+            Function::new(ctx.clone(), move |ctx: Ctx<'js>| -> JsResult<Option<i64>> {
+                match REGISTRY.document_element(&gate) {
+                    Ok(found) => Ok(found.map(|id| id.index() as i64)),
+                    Err(error) => Err(throw(&ctx, &error)),
+                }
+            })?,
+        )?;
+    }
+    {
+        let gate = gate.clone();
+        globals.set(
             "__dom_get_element_by_id",
             Function::new(
                 ctx.clone(),
@@ -349,6 +383,25 @@ fn register_all<'js>(ctx: Ctx<'js>, context: &Context, gate: &JsrtGate) -> JsRes
         )?;
     }
 
+    // ---- document.write 捕获（T4 scripted 解析）----
+    {
+        let slot = write_slot.clone();
+        globals.set(
+            "__dom_write",
+            Function::new(
+                ctx.clone(),
+                move |_ctx: Ctx<'js>, text: String| -> JsResult<()> {
+                    // 先取出克隆再调用：回调内可能再入本绑定，不持槽借用。
+                    let sink = slot.borrow().clone();
+                    if let Some(sink) = sink {
+                        (sink.borrow_mut())(&text);
+                    }
+                    Ok(())
+                },
+            )?,
+        )?;
+    }
+
     // ---- timers ----
     {
         let gate = gate.clone();
@@ -458,21 +511,13 @@ impl JsrtListener for ListenerBridge {
         &mut self,
         _gate: &JsrtGate,
         scope: Option<&dyn JsrtScope>,
+        invocation: &ListenerInvocation,
         event: &mut Event,
     ) -> Result<(), JsrtError> {
-        let phase = match event.event_phase() {
-            EventPhase::None => 0u8,
-            EventPhase::Capturing => 1,
-            EventPhase::AtTarget => 2,
-            EventPhase::Bubbling => 3,
-        };
-        let invocation = ListenerInvocation {
-            fn_index: self.fn_index,
-            phase,
-            type_: event.type_(),
-            bubbles: event.bubbles(),
-            cancelable: event.cancelable(),
-        };
+        // 派发算法已构造载荷（阶段 / 类型 / target / currentTarget），补上
+        // 自身函数标识后透传。
+        let mut invocation = invocation.clone();
+        invocation.fn_index = self.fn_index;
         if let Some(scope) = scope {
             // JS 侧派发：已在引擎执行环境内，经作用域拉起（不重入锁）。
             return Self::apply(scope.invoke_listener(invocation)?, event);
@@ -491,7 +536,7 @@ impl JsrtListener for ListenerBridge {
 /// 在引擎环境内拉起一个监听器（读取 `__invoke_listener` 的结果对象）。
 fn invoke_listener_in(
     context: &Context,
-    invocation: &ListenerInvocation<'_>,
+    invocation: &ListenerInvocation,
 ) -> JsResult<ListenerOutcome> {
     context.with(|ctx| invoke_listener_outcome(&ctx, invocation))
 }
@@ -499,15 +544,17 @@ fn invoke_listener_in(
 /// 同上，直接以当前 [`Ctx`] 执行（已在引擎环境内时不重入 `with`）。
 fn invoke_listener_outcome(
     ctx: &Ctx<'_>,
-    invocation: &ListenerInvocation<'_>,
+    invocation: &ListenerInvocation,
 ) -> JsResult<ListenerOutcome> {
     let invoke: Function = ctx.globals().get("__invoke_listener")?;
     let result: Object = invoke.call((
         i64::from(invocation.fn_index),
         i64::from(invocation.phase),
-        invocation.type_,
+        invocation.type_.as_str(),
         invocation.bubbles,
         invocation.cancelable,
+        invocation.target_index as i64,
+        invocation.current_target_index as i64,
     ))?;
     Ok(ListenerOutcome {
         error: result.get("error")?,
@@ -525,7 +572,7 @@ struct Ambient<'js> {
 impl<'js> JsrtScope for Ambient<'js> {
     fn invoke_listener(
         &self,
-        invocation: ListenerInvocation<'_>,
+        invocation: ListenerInvocation,
     ) -> Result<ListenerOutcome, JsrtError> {
         invoke_listener_outcome(&self.ctx, &invocation).map_err(|err| {
             JsrtError::Script(ScriptError::new(ScriptErrorKind::Runtime, err.to_string()))

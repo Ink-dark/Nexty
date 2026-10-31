@@ -17,7 +17,7 @@ use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::rc::Rc;
 
 use super::timers::{NESTING_CLAMP_MIN_DELAY_MS, NESTING_CLAMP_THRESHOLD};
-use super::{BindingError, JsrtError, RuntimeState};
+use super::{BindingError, JsrtError, ListenerInvocation, RuntimeState};
 use crate::event::{Event, EventPhase, Task};
 use crate::{Document, NodeId};
 
@@ -36,6 +36,10 @@ use crate::{Document, NodeId};
 pub trait JsrtListener {
     /// 事件命中时被拉起。
     ///
+    /// `invocation` 为本次拉起载荷（阶段 / 类型 / 冒泡 / 目标与当前节点索引），
+    /// 由派发算法构造；适配 crate 据此还原事件门面（T4：target /
+    /// currentTarget）并补充自身函数标识。
+    ///
     /// # Errors
     ///
     /// 引擎回调异常时上抛 [`JsrtError`]。
@@ -43,6 +47,7 @@ pub trait JsrtListener {
         &mut self,
         gate: &JsrtGate,
         scope: Option<&dyn super::super::JsrtScope>,
+        invocation: &ListenerInvocation,
         event: &mut Event,
     ) -> Result<(), JsrtError>;
 }
@@ -376,11 +381,11 @@ impl JsrtGate {
                 break;
             }
             event.set_dispatch_phase(EventPhase::Capturing);
-            self.invoke(node, event, scope, CaptureFilter::CaptureOnly)?;
+            self.invoke(node, event, scope, CaptureFilter::CaptureOnly, target)?;
         }
         if !event.is_propagation_stopped() {
             event.set_dispatch_phase(EventPhase::AtTarget);
-            self.invoke(target, event, scope, CaptureFilter::All)?;
+            self.invoke(target, event, scope, CaptureFilter::All, target)?;
         }
         if event.bubbles() {
             for &node in chain.iter().rev() {
@@ -388,7 +393,7 @@ impl JsrtGate {
                     break;
                 }
                 event.set_dispatch_phase(EventPhase::Bubbling);
-                self.invoke(node, event, scope, CaptureFilter::BubbleOnly)?;
+                self.invoke(node, event, scope, CaptureFilter::BubbleOnly, target)?;
             }
         }
         event.set_dispatch_phase(EventPhase::None);
@@ -406,6 +411,7 @@ impl JsrtGate {
         event: &mut Event,
         scope: Option<&dyn super::super::JsrtScope>,
         filter: CaptureFilter,
+        target: NodeId,
     ) -> Result<(), JsrtError> {
         let ids = {
             let state = self.borrow_state("invoke")?;
@@ -422,7 +428,23 @@ impl JsrtGate {
             let Some(mut callback) = callback else {
                 continue;
             };
-            let result = callback.call(self, scope, event);
+            // 拉起载荷：阶段 / 类型 / 冒泡面 + 目标与当前节点索引（T4 补面）。
+            // type_ 自有拷贝——回调执行期间 event 以 &mut 传入，不能借它。
+            let invocation = ListenerInvocation {
+                fn_index: 0,
+                phase: match event.event_phase() {
+                    crate::event::EventPhase::None => 0,
+                    crate::event::EventPhase::Capturing => 1,
+                    crate::event::EventPhase::AtTarget => 2,
+                    crate::event::EventPhase::Bubbling => 3,
+                },
+                type_: event.type_().to_string(),
+                bubbles: event.bubbles(),
+                cancelable: event.cancelable(),
+                target_index: target.index(),
+                current_target_index: node.index(),
+            };
+            let result = callback.call(self, scope, &invocation, event);
             {
                 let mut state = self.borrow_state_mut("invoke/restore")?;
                 state.listeners.restore(id, callback);

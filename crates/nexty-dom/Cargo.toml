@@ -1,7 +1,7 @@
 [package]
 name = "nexty-dom"
 description = "Nexty 自研 arena DOM"
-version = "0.1.5"
+version = "0.1.6"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

@@ -1,7 +1,7 @@
-﻿[package]
+[package]
 name = "nexty-html"
 description = "Nexty HTML 解析层：html5ever 到自有 DOM 的桥接"
-version = "0.1.5"
+version = "0.1.6"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -16,7 +16,18 @@ parse-document = ["dep:html5ever"]
 parse-fragment = ["dep:html5ever"]
 # 子资源清单收集（样式表 / 图片），只收集不解析，纯遍历自研 DOM。
 resources = []
+# 测试专用：WPT scripted 用例的脚本执行（T4）。不开时 scripted 语料落在
+# 基线；开了才经 parse_document_scripted + JSRT 引擎执行。dev-dependency
+# 无法按 feature 条件引入（cargo 不支持可选 dev-dep），本 feature 只门控
+# 测试代码路径；引擎编译成本仅落在测试目标上，不进 lib 依赖树。
+scripted-tests = ["parse-document"]
 
 [dependencies]
 html5ever = { version = "0.40.1", optional = true }
 nexty-dom = { path = "../nexty-dom", version = "0.1.0" }
+
+[dev-dependencies]
+# 仅 scripted-tests 路径消费（T4 WPT scripted 6 条）：引擎不进 lib 依赖树，
+# 只随测试目标编译（cargo 不支持可选 dev-dependency，见 scripted-tests
+# feature 注释）。
+nexty-jsrt-rquickjs = { path = "../nexty-jsrt-rquickjs", version = "0.1.1" }

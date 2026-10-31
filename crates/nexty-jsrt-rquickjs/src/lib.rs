@@ -43,6 +43,14 @@ use nexty_dom::{
     ScriptHost,
 };
 
+/// `document.write` 内容的宿主回调（T4 scripted 解析用）：Rc 共享 + 内部
+/// 可变，绑定闭包与宿主两侧各持一份句柄。
+pub type WriteSink = Rc<RefCell<dyn FnMut(&str)>>;
+
+/// 捕获槽：装入 [`WriteSink`] 时 `document.write` 内容转发给宿主，未装入时
+/// 为 no-op（解析器外的 write 记偏差忽略）。
+pub(crate) type WriteSlot = Rc<RefCell<Option<WriteSink>>>;
+
 /// rquickjs（QuickJS-NG）引擎的 [`ScriptHost`] 实现。
 struct EngineHost {
     /// 引擎运行时（微任务作业源）。
@@ -51,12 +59,14 @@ struct EngineHost {
     ctx: Context,
     /// 绑定是否已装配（首次 eval时装配，闭包捕获 gate）。
     installed: bool,
+    /// `document.write` 捕获槽（装配绑定时装入绑定闭包，T4）。
+    write_slot: WriteSlot,
 }
 
 impl EngineHost {
     /// 装配原生绑定与 DOM shim（首次 eval 时执行一次）。
     fn install(&mut self, gate: &JsrtGate) -> Result<(), JsrtError> {
-        bindings::register(&self.ctx, gate)
+        bindings::register(&self.ctx, gate, &self.write_slot)
             .and_then(|()| self.ctx.with(|ctx| ctx.eval::<(), _>(shim::SHIM)))
             .map_err(|error| {
                 JsrtError::Script(ScriptError::new(
@@ -128,6 +138,8 @@ fn engine_error(where_: &str, error: rquickjs::Error) -> JsrtError {
 /// `docs/decisions/2026-10-31-jsrt.md`）。
 pub struct Jsrt {
     runtime: JsrtRuntime,
+    /// `document.write` 捕获槽（T4）：与绑定闭包共享。
+    write_slot: WriteSlot,
 }
 
 impl Jsrt {
@@ -138,6 +150,7 @@ impl Jsrt {
     /// 引擎初始化失败返回 [`JsrtError::Script`]（类别 [`ScriptErrorKind::Runtime`]）。
     pub fn new(document: nexty_dom::Document) -> Result<Self, JsrtError> {
         let (rt, ctx) = engine_init()?;
+        let write_slot = Rc::new(RefCell::new(None));
         Ok(Self {
             runtime: JsrtRuntime::new(
                 document,
@@ -145,8 +158,10 @@ impl Jsrt {
                     rt,
                     ctx,
                     installed: false,
+                    write_slot: Rc::clone(&write_slot),
                 }),
             ),
+            write_slot,
         })
     }
 
@@ -158,6 +173,7 @@ impl Jsrt {
     /// 引擎初始化失败返回 [`JsrtError::Script`]。
     pub fn from_shared(document: Rc<RefCell<nexty_dom::Document>>) -> Result<Self, JsrtError> {
         let (rt, ctx) = engine_init()?;
+        let write_slot = Rc::new(RefCell::new(None));
         Ok(Self {
             runtime: JsrtRuntime::from_shared(
                 document,
@@ -165,8 +181,10 @@ impl Jsrt {
                     rt,
                     ctx,
                     installed: false,
+                    write_slot: Rc::clone(&write_slot),
                 }),
             ),
+            write_slot,
         })
     }
 
@@ -180,6 +198,7 @@ impl Jsrt {
         clock: Box<dyn Fn() -> u64>,
     ) -> Result<Self, JsrtError> {
         let (rt, ctx) = engine_init()?;
+        let write_slot = Rc::new(RefCell::new(None));
         Ok(Self {
             runtime: JsrtRuntime::with_timer_clock(
                 document,
@@ -187,10 +206,18 @@ impl Jsrt {
                     rt,
                     ctx,
                     installed: false,
+                    write_slot: Rc::clone(&write_slot),
                 }),
                 clock,
             ),
+            write_slot,
         })
+    }
+
+    /// 装入/卸下 `document.write` 捕获槽（T4 scripted 解析驱动用）：装入后
+    /// 脚本内 `document.write` 的内容逐次转发给回调；卸下后 write 为 no-op。
+    pub fn set_document_write_sink(&mut self, sink: Option<WriteSink>) {
+        *self.write_slot.borrow_mut() = sink;
     }
 
     /// 内层 [`JsrtRuntime`]（钩子注入 / dispatch / post_task 等完整接缝面）。

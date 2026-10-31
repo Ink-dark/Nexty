@@ -23,7 +23,14 @@ use std::fs;
 use std::path::Path;
 
 use nexty_dom::{Document, Namespace, NodeId, NodeKind};
+#[cfg(feature = "scripted-tests")]
+use nexty_html::parse_document_scripted;
 use nexty_html::{FragmentContext, ParseOptions, parse_document, parse_fragment};
+
+/// 脚本引擎是否参与比对（T4）：`scripted-tests` feature 开启时，6 条 scripted
+/// 用例经 [`parse_document_scripted`] + JSRT 引擎同步执行（document.write /
+/// DOM 变更中途生效），不再落入基线；关闭时引擎不参与，它们保持已知差异。
+const SCRIPTED_ENGINE_ACTIVE: bool = cfg!(feature = "scripted-tests");
 
 /// 已知差异基线：`(语料文件, 用例序号, 原因)`。
 ///
@@ -161,8 +168,10 @@ const REASON_SELECTEDCONTENT: &str =
 const REASON_TEMPLATE: &str =
     "html5ever 树构建与最新规范漂移：<template> 置 frameset-ok=false、沿用旧 form 指针语义";
 
-/// 需要脚本执行（`document.write`）的用例，HTML 层不含 JSRT。
-const REASON_SCRIPTED: &str = "需要脚本执行（document.write），HTML 层不含 JSRT";
+/// 需要脚本执行（`document.write`）的用例：`scripted-tests` feature 开启时
+/// 经引擎执行、应直接通过（不从基线豁免）；关闭时 HTML 层不含 JSRT，留在基线。
+const REASON_SCRIPTED: &str =
+    "需要脚本执行（document.write）；--features scripted-tests 开启后由引擎执行";
 
 /// 一条 tree-construction 用例。
 struct Case {
@@ -360,6 +369,14 @@ fn run_case(case: &Case) -> String {
         scripting_enabled: !case.script_off,
     };
 
+    // T4：脚本引擎参与时，完整文档用例（语料 6 条 scripted 均为文档用例）走
+    // scripted 驱动——script 元素弹出点同步执行，document.write 前插回输入流。
+    // 片段用例无 scripted 入口（偏差登记），照旧纯解析。
+    #[cfg(feature = "scripted-tests")]
+    if options.scripting_enabled && case.fragment.is_none() {
+        return run_case_scripted(case);
+    }
+
     match &case.fragment {
         Some(spec) => {
             let (mut document, fragment) =
@@ -379,12 +396,104 @@ fn run_case(case: &Case) -> String {
     }
 }
 
-/// 查基线：命中则给出失败原因。
+/// 查基线：命中则给出失败原因。脚本引擎参与时，scripted 类条目不再豁免
+/// （它们应当经引擎执行后直接通过；命中会被报为 stale，见主循环）。
 fn known_reason(file: &str, index: usize) -> Option<&'static str> {
     KNOWN_DIVERGENCE
         .iter()
         .find(|(name, case, _)| *name == file && *case == index)
         .map(|(_, _, reason)| *reason)
+        .filter(|reason| !(SCRIPTED_ENGINE_ACTIVE && *reason == REASON_SCRIPTED))
+}
+
+// ---- T4：scripted 驱动（仅 scripted-tests feature 下编译） ----
+
+/// 语料脚本执行所需的查询桩：`#id` 或纯标签名（语料只用这两类；完整选择器
+/// 匹配由 chrome 装配 nexty-css 提供，见 T3）。匹配范围不含 scope 自身
+/// （DOM element.querySelector 语义）。
+#[cfg(feature = "scripted-tests")]
+fn scripted_selector_match(document: &Document, scope: NodeId, selector: &str) -> Option<NodeId> {
+    let hit = |document: &Document, node: NodeId| -> bool {
+        let Some(NodeKind::Element(data)) = document.node(node) else {
+            return false;
+        };
+        if let Some(id) = selector.strip_prefix('#') {
+            data.attributes
+                .iter()
+                .any(|attr| attr.name == "id" && attr.value == id)
+        } else if !selector.is_empty()
+            && selector
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            data.namespace == Namespace::Html && data.name.eq_ignore_ascii_case(selector)
+        } else {
+            false
+        }
+    };
+
+    let mut stack = vec![scope];
+    while let Some(node) = stack.pop() {
+        let mut children: Vec<NodeId> = document.children(node).collect();
+        children.reverse();
+        stack.extend(children);
+        if node != scope && hit(document, node) {
+            return Some(node);
+        }
+    }
+    None
+}
+
+/// scripted 用例执行：引擎惰性装配（首个 script 断点），querySelector 走
+/// 语料桩选择器，document.write 内容前插回输入流。脚本执行失败即测试失败
+/// （语料用例的脚本不允许报错）。
+#[cfg(feature = "scripted-tests")]
+fn run_case_scripted(case: &Case) -> String {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let document = Rc::new(RefCell::new(Document::new()));
+    let writes = Rc::new(RefCell::new(Vec::<String>::new()));
+    let mut engine: Option<nexty_jsrt_rquickjs::Jsrt> = None;
+
+    {
+        let writes = Rc::clone(&writes);
+        let mut on_script =
+            |document: &Rc<RefCell<Document>>, _node: NodeId, source: &str| -> String {
+                let engine = engine.get_or_insert_with(|| {
+                    let mut jsrt = nexty_jsrt_rquickjs::Jsrt::from_shared(Rc::clone(document))
+                        .expect("scripted 引擎初始化");
+                    jsrt.runtime_mut()
+                        .set_query_selector_hook(Box::new(scripted_selector_match));
+                    jsrt.set_document_write_sink(Some(Rc::new(RefCell::new({
+                        let writes = Rc::clone(&writes);
+                        move |text: &str| writes.borrow_mut().push(text.to_string())
+                    }))
+                        as nexty_jsrt_rquickjs::WriteSink));
+                    jsrt
+                });
+                engine.eval(source, "script").unwrap_or_else(|error| {
+                    // 语料里存在大量畸形 script 文本（分词用例），按 WPT 语义
+                    // 报错后继续比对树——脚本错误不阻断树构建。
+                    eprintln!("scripted 语料脚本执行失败（继续比对）: {error}");
+                });
+                let written = writes.borrow().join("");
+                writes.borrow_mut().clear();
+                written
+            };
+        parse_document_scripted(
+            &document,
+            &case.data,
+            ParseOptions {
+                scripting_enabled: true,
+            },
+            &mut on_script,
+        );
+    }
+
+    let mut document = document.borrow_mut();
+    let root = document.root();
+    serialize_tree(&mut document, root)
 }
 
 /// 逐文件跑完语料，打印通过率与基线命中情况。

@@ -106,25 +106,29 @@ pub trait JsrtScope {
     /// # Errors
     ///
     /// 引擎侧异常时返回 [`JsrtError::Script`]。
-    fn invoke_listener(
-        &self,
-        invocation: ListenerInvocation<'_>,
-    ) -> Result<ListenerOutcome, JsrtError>;
+    fn invoke_listener(&self, invocation: ListenerInvocation)
+    -> Result<ListenerOutcome, JsrtError>;
 }
 
-/// 监听器拉起请求（引擎无关载荷；`fn_index` 由适配 crate 定义）。
-#[derive(Debug, Clone, Copy)]
-pub struct ListenerInvocation<'a> {
-    /// 适配 crate 侧的函数标识（shim 回调表下标）。
+/// 监听器拉起请求（引擎无关载荷；`fn_index` 由适配 crate 补充）。
+#[derive(Debug, Clone)]
+pub struct ListenerInvocation {
+    /// 适配 crate 侧的函数标识（shim 回调表下标；派发算法构造时置 0，由
+    /// 回调桥以自身标识覆盖）。
     pub fn_index: u32,
     /// 传播阶段（DOM `eventPhase` 序数：0 none / 1 capture / 2 target / 3 bubble）。
     pub phase: u8,
-    /// 事件类型。
-    pub type_: &'a str,
+    /// 事件类型（自有字符串——载荷须在 `&mut Event` 借用之外存活）。
+    pub type_: String,
     /// 是否冒泡。
     pub bubbles: bool,
     /// 是否可取消。
     pub cancelable: bool,
+    /// 派发目标节点的索引值（DOM `event.target` 语义；NodeId::index 形态，
+    /// 适配 crate 据此还原元素包装——T4 补面）。
+    pub target_index: usize,
+    /// 当前正在调用监听器的节点索引值（DOM `event.currentTarget` 语义）。
+    pub current_target_index: usize,
 }
 
 /// 监听器拉起结果（引擎无关载荷）。
@@ -506,6 +510,7 @@ mod tests {
             &mut self,
             _gate: &JsrtGate,
             _scope: Option<&dyn JsrtScope>,
+            _invocation: &ListenerInvocation,
             event: &mut Event,
         ) -> Result<(), JsrtError> {
             self.log.borrow_mut().push(format!(
@@ -933,6 +938,110 @@ mod tests {
             doc.node(text),
             Some(&NodeKind::Text("changed".into())),
             "回调内的绑定改动生效"
+        );
+    }
+
+    // ---- T4 补面：documentElement / getElementsByTagName / 拉起载荷 ----
+
+    /// documentElement 返回文档根的第一个元素子节点；无元素时为空。
+    #[test]
+    fn document_element_returns_first_element_child_of_root() {
+        let mut doc = Document::new();
+        let html = element(&mut doc, "html");
+        doc.append_child(html, doc.root()).unwrap();
+        let doctype = doc.create_node(NodeKind::Doctype(crate::DocumentTypeData {
+            name: "html".into(),
+            public_id: String::new(),
+            system_id: String::new(),
+        }));
+        doc.insert_node(doctype, doc.root(), None);
+
+        let runtime = JsrtRuntime::new(doc, Box::new(FakeHost::noop()));
+        let gate = runtime.gate().clone();
+        let found = runtime.registry().document_element(&gate).unwrap();
+        assert_eq!(found, Some(html));
+    }
+
+    /// getElementsByTagName 按文档序收集 HTML 命名空间同名元素（大小写
+    /// 不敏感），非 HTML 命名空间不收。
+    #[test]
+    fn get_elements_by_tag_name_collects_in_document_order() {
+        let mut doc = Document::new();
+        let html = element(&mut doc, "html");
+        doc.append_child(html, doc.root()).unwrap();
+        let first = element(&mut doc, "font");
+        let second = element(&mut doc, "FONT");
+        let svg = doc.create_node(NodeKind::Element(ElementData {
+            name: "font".into(),
+            namespace: Namespace::Svg,
+            attributes: Vec::new(),
+        }));
+        for node in [first, second, svg] {
+            doc.append_child(node, html).unwrap();
+        }
+
+        let runtime = JsrtRuntime::new(doc, Box::new(FakeHost::noop()));
+        let gate = runtime.gate().clone();
+        let found = runtime
+            .registry()
+            .get_elements_by_tag_name(&gate, "font")
+            .unwrap();
+        assert_eq!(found, vec![first, second], "文档序 + 仅 HTML 命名空间");
+    }
+
+    /// 拉起载荷携带 target / currentTarget 索引（T4：事件门面还原用）。
+    #[test]
+    fn listener_invocation_carries_target_indices() {
+        use std::cell::Cell;
+
+        struct PayloadListener {
+            seen: Rc<Cell<Option<(usize, usize)>>>,
+        }
+
+        impl JsrtListener for PayloadListener {
+            fn call(
+                &mut self,
+                _gate: &JsrtGate,
+                _scope: Option<&dyn JsrtScope>,
+                invocation: &ListenerInvocation,
+                _event: &mut Event,
+            ) -> Result<(), JsrtError> {
+                self.seen.set(Some((
+                    invocation.target_index,
+                    invocation.current_target_index,
+                )));
+                Ok(())
+            }
+        }
+
+        let mut doc = Document::new();
+        let root_child = element(&mut doc, "div");
+        doc.append_child(root_child, doc.root()).unwrap();
+        let child = element(&mut doc, "button");
+        doc.append_child(child, root_child).unwrap();
+
+        let runtime = JsrtRuntime::new(doc, Box::new(FakeHost::noop()));
+        let gate = runtime.gate().clone();
+        let seen = Rc::new(Cell::new(None::<(usize, usize)>));
+        gate.add_listener(
+            child,
+            "click",
+            false,
+            Box::new(PayloadListener {
+                seen: Rc::clone(&seen),
+            }),
+        )
+        .unwrap();
+
+        runtime
+            .registry()
+            .dispatch_event(&gate, None, child, &mut Event::new("click", true, true))
+            .unwrap();
+        // target 阶段：target 与 currentTarget 同为监听器所在节点。
+        assert_eq!(
+            seen.get(),
+            Some((child.index(), child.index())),
+            "target/currentTarget 均指向命中节点"
         );
     }
 }

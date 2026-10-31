@@ -599,3 +599,162 @@ fn from_shared_document_works() {
     assert_eq!(text_of(&jsrt, "__log"), "shared");
     assert!(shared.borrow().node_count() > 1, "共享句柄即运行时文档");
 }
+
+// ---- T4 补面：Event 构造器 / target / 文档查找面 / document.write ----
+
+#[test]
+fn event_constructor_and_dispatch_carries_target() {
+    let mut jsrt = plain_jsrt();
+    assert_ok(
+        &mut jsrt,
+        r#"
+        const body = document.getElementById("__body");
+        const seen = [];
+        body.addEventListener("ping", function (ev) {
+            seen.push([
+                ev.type,
+                ev.bubbles,
+                ev.cancelable,
+                ev.target === body,
+                ev.currentTarget === body,
+                typeof ev.stopPropagation,
+            ].join(","));
+        });
+        const constructed = new Event("ping", { bubbles: true, cancelable: true });
+        if (constructed.type !== "ping" || !constructed.bubbles || !constructed.cancelable) {
+            throw new Error("Event constructor init");
+        }
+        if (constructed.target !== null || constructed.currentTarget !== null) {
+            throw new Error("fresh event has null target");
+        }
+        if (!body.dispatchEvent(constructed)) throw new Error("dispatch not prevented");
+        if (seen.length !== 1 || seen[0] !== "ping,true,true,true,true,function") {
+            throw new Error("listener facade: " + JSON.stringify(seen));
+        }
+    "#,
+    );
+}
+
+#[test]
+fn event_constructor_without_init_defaults() {
+    let mut jsrt = plain_jsrt();
+    assert_ok(
+        &mut jsrt,
+        r#"
+        const ev = new Event("x");
+        if (ev.bubbles !== false || ev.cancelable !== false || ev.eventPhase !== 0) {
+            throw new Error("default init");
+        }
+        let fired = false;
+        document.getElementById("__body").addEventListener("x", function () {
+            if (this !== undefined) { /* 门面无 this 绑定，只验证可达 */ }
+            fired = true;
+        });
+        document.getElementById("__body").dispatchEvent(ev);
+        if (!fired) throw new Error("constructed event dispatches");
+    "#,
+    );
+}
+
+#[test]
+fn get_elements_by_tag_name_in_document_order() {
+    let mut jsrt = plain_jsrt();
+    assert_ok(
+        &mut jsrt,
+        r#"
+        const body = document.getElementById("__body");
+        const a = document.createElement("font"); a.setAttribute("id", "f1");
+        const b = document.createElement("FONT"); b.setAttribute("id", "f2");
+        const s = document.createElement("span");
+        body.appendChild(a); body.appendChild(b); body.appendChild(s);
+        const found = document.getElementsByTagName("font");
+        if (found.length !== 2 || found[0] !== a || found[1] !== b) {
+            throw new Error("order/case: " + found.length);
+        }
+        found[1].setAttribute("size", "5");
+    "#,
+    );
+    let gate = jsrt.gate();
+    let f2 = node_by_id(&jsrt, "f2");
+    let size = jsrt
+        .runtime()
+        .registry()
+        .get_attribute(gate, f2, "size")
+        .unwrap();
+    assert_eq!(size.as_deref(), Some("5"), "返回的是活节点包装");
+}
+
+#[test]
+fn document_element_property_tracks_tree() {
+    let mut jsrt = plain_jsrt();
+    assert_ok(
+        &mut jsrt,
+        r#"
+        const html = document.documentElement;
+        html.setAttribute("id", "__html");
+        if (document.getElementById("__html") !== html) {
+            throw new Error("documentElement is the html wrapper");
+        }
+        html.remove();
+        if (document.documentElement !== null) throw new Error("detached after remove");
+        const fresh = document.createElement("html");
+        document.appendChild(fresh);
+        if (document.documentElement !== fresh) throw new Error("reattached");
+    "#,
+    );
+}
+
+#[test]
+fn element_id_property_maps_to_attribute() {
+    let mut jsrt = plain_jsrt();
+    assert_ok(
+        &mut jsrt,
+        r#"
+        const el = document.createElement("b");
+        el.id = "A";
+        if (el.getAttribute("id") !== "A") throw new Error("setter writes attribute");
+        document.getElementById("__body").appendChild(el);
+        const found = document.getElementById("A");
+        if (found !== el) throw new Error("id visible to getElementById");
+        found.id = "B";
+        if (document.getElementById("A") !== null) throw new Error("old id gone");
+        if (document.getElementById("B") !== el) throw new Error("new id resolves");
+    "#,
+    );
+}
+
+#[test]
+fn document_write_forwards_to_installed_sink_only() {
+    let writes = Rc::new(RefCell::new(Vec::<String>::new()));
+    let mut jsrt = plain_jsrt();
+    // 未装入：no-op
+    assert_ok(&mut jsrt, "document.write('ignored');");
+    assert!(writes.borrow().is_empty());
+
+    jsrt.set_document_write_sink(Some(Rc::new(RefCell::new({
+        let writes = Rc::clone(&writes);
+        move |text: &str| writes.borrow_mut().push(text.to_string())
+    })) as nexty_jsrt_rquickjs::WriteSink));
+    assert_ok(
+        &mut jsrt,
+        r#"
+        document.write("2");
+        document.writeln("3");
+        document.write("a", "b");
+    "#,
+    );
+    assert_eq!(
+        *writes.borrow(),
+        vec![
+            "2".to_string(),
+            "3\n".to_string(),
+            "a".to_string(),
+            "b".to_string()
+        ],
+        "逐次转发，writeln 追加换行，多参按序"
+    );
+
+    jsrt.set_document_write_sink(None);
+    assert_ok(&mut jsrt, "document.write('again');");
+    assert_eq!(writes.borrow().len(), 4, "卸下后 no-op");
+}

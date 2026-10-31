@@ -527,6 +527,51 @@ impl DomRegistry {
         Ok(hook(&doc, node))
     }
 
+    /// `documentElement`（DOM
+    /// [Document.documentElement](https://dom.spec.whatwg.org/#dom-document-documentelement)
+    /// 简化档）：文档根的第一个元素子节点（`<html>`）。
+    ///
+    /// # Errors
+    ///
+    /// 文档借用冲突见 [`JsrtError::Reentrant`]。
+    pub fn document_element(&self, gate: &JsrtGate) -> Result<Option<NodeId>, JsrtError> {
+        let doc = gate.document()?;
+        Ok(doc
+            .children(doc.root())
+            .find(|child| matches!(doc.node(*child), Some(NodeKind::Element(_)))))
+    }
+
+    /// `getElementsByTagName`（DOM
+    /// [get elements by tag name](https://dom.spec.whatwg.org/#dom-document-getelementsbytagname)
+    /// 简化档）：文档序收集 HTML 命名空间下局部名 ASCII 大小写不敏感匹配的
+    /// 元素。偏差：只匹配 HTML 命名空间（外来元素按限定名精确匹配的规范
+    /// 细节不建模）；无 `*` 通配。
+    ///
+    /// # Errors
+    ///
+    /// 文档借用冲突见 [`JsrtError::Reentrant`]。
+    pub fn get_elements_by_tag_name(
+        &self,
+        gate: &JsrtGate,
+        tag: &str,
+    ) -> Result<Vec<NodeId>, JsrtError> {
+        let doc = gate.document()?;
+        let mut out = Vec::new();
+        let mut stack: Vec<NodeId> = vec![doc.root()];
+        while let Some(node) = stack.pop() {
+            if let Some(NodeKind::Element(data)) = doc.node(node)
+                && data.namespace == Namespace::Html
+                && data.name.eq_ignore_ascii_case(tag)
+            {
+                out.push(node);
+            }
+            let mut children: Vec<NodeId> = doc.children(node).collect();
+            children.reverse();
+            stack.extend(children);
+        }
+        Ok(out)
+    }
+
     fn validate_tokens(tokens: &[&str]) -> Result<(), JsrtError> {
         if tokens.iter().any(|token| token.is_empty()) {
             return Err(BindingError::InvalidArgument.into());
