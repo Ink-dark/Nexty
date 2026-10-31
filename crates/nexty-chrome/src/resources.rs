@@ -57,6 +57,11 @@ pub const MAX_IMAGE_BODY_BYTES: usize = 50 * 1024 * 1024;
 /// （分配失败是 abort，panic 兜底兜不住）。
 pub const MAX_FONT_BODY_BYTES: usize = 20 * 1024 * 1024;
 
+/// favicon 响应体字节预算（K13 T2）：真实站点的 favicon 几乎全部小于
+/// 100 KB，1 MiB 已远超，图片档（50 MB）对它明显过宽。超预算按既有降级
+/// 语义缺席——favicon 是纯装饰资源，任何失败都静默降级，不阻塞页面。
+pub const MAX_FAVICON_BODY_BYTES: usize = 1024 * 1024;
+
 /// 抓取完成的子资源。
 pub struct Subresources {
     /// 作者样式表，按级联优先级排列（inline 与外链按文档出现顺序交错）。
@@ -556,6 +561,127 @@ fn is_skipped_font_format(hint: &str) -> bool {
     hint.eq_ignore_ascii_case("woff") || hint.eq_ignore_ascii_case("woff2")
 }
 
+// ---- favicon 编排（K13 T2）----
+
+/// 页面 favicon 地址（HTML §4.6.6.6 rel=icon 简化档）。
+///
+/// DOM 遍历收集 `link[rel~=icon]`（rel 为 ASCII 大小写不敏感的空格分隔
+/// token 表，含 `icon` token 即命中；按文档序首个带非空 href 者胜出），
+/// 回落站点根 `/favicon.ico`（HTTP 事实标准：link 图标缺席、href 为空或
+/// 解析失败时）。相对地址按文档 base 解析；两者皆不可得（base 不可解析）
+/// 返回 `None`。
+///
+/// 简化档偏差：`sizes` / `type` / `media` 不参与选择（不挑最大尺寸、不
+/// 按类型过滤；SVG 图标照常抓取，由解码侧静默降级）；`apple-touch-icon`
+/// 等复合 token 不命中（token 相等才算，与 `~=` 选择器语义一致）；回落
+/// 是 URL 级的——link 图标存在但抓取/解码失败时不重试回落 URL（页内
+/// 唯一候选，见 [`FaviconOrchestrator::favicon_for`]）。
+#[must_use]
+pub fn collect_favicon_url(document: &Document, base_url: &str) -> Option<String> {
+    find_favicon_href(document, document.root())
+        .and_then(|href| resolve(base_url, &href).ok())
+        .or_else(|| resolve(base_url, "/favicon.ico").ok())
+}
+
+/// 文档序首个 `link[rel~=icon]` 的非空 href（递归下钻，深度受 HTML 解析
+/// 入口的 [`nexty_dom::MAX_TREE_DEPTH`] 截断约束，与 `document_title`
+/// 同型）。
+fn find_favicon_href(document: &Document, node: NodeId) -> Option<String> {
+    use nexty_dom::{Namespace, NodeKind};
+    if let Some(NodeKind::Element(data)) = document.node(node)
+        && data.namespace == Namespace::Html
+        && data.name == "link"
+        && rel_contains_icon(&data.attributes)
+    {
+        let href = data
+            .attributes
+            .iter()
+            .find(|attribute| attribute.name == "href")
+            .map(|attribute| attribute.value.clone());
+        if let Some(href) = href
+            && !href.trim().is_empty()
+        {
+            return Some(href);
+        }
+        // rel=icon 但无 href：继续找下一个候选（回落语义在 collect 统一收口）
+    }
+    for child in document.children(node) {
+        if let Some(found) = find_favicon_href(document, child) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// rel 属性值是否含 `icon` token（ASCII 大小写不敏感，空格分隔 token 表）。
+fn rel_contains_icon(attributes: &[nexty_dom::Attribute]) -> bool {
+    attributes
+        .iter()
+        .filter(|attribute| attribute.name == "rel")
+        .any(|attribute| {
+            attribute
+                .value
+                .split_ascii_whitespace()
+                .any(|token| token.eq_ignore_ascii_case("icon"))
+        })
+}
+
+/// 抓取并解码 favicon（后台线程）：预算 [`MAX_FAVICON_BODY_BYTES`]，非 2xx /
+/// 传输错误 / 超预算 / 解码失败一律返回 `None`——favicon 是纯装饰资源，
+/// 任何失败都静默降级，不阻塞、不错误化页面加载（降级语义与子资源一致）。
+#[must_use]
+pub fn fetch_favicon(fetcher: &dyn NetworkFetcher, url: &str) -> Option<Arc<Image>> {
+    let request = Request {
+        url: url.to_owned(),
+        method: Method::Get,
+        headers: Vec::new(),
+    };
+    let bytes = fetch_ok(fetcher, &request, MAX_FAVICON_BODY_BYTES)?;
+    decode(&bytes).ok().map(Arc::new)
+}
+
+/// favicon 会话编排：会话级像素缓存 + 去重（K13 T2）。
+///
+/// 会话级 = 浏览器生命周期内持续有效：同一 URL 抓取成功后，后续导航直接
+/// 复用缓存像素，不再发请求（同站多页共享同一 favicon 的常规形态）。
+/// 负结果（404 / 解码失败 / 超预算）不入缓存，下次导航可重试——与字体
+/// 编排的会话去重语义一致。本类型不持 `Document`，跨线程边界只传
+/// `Option<Arc<Image>>` 数据面。
+#[derive(Default)]
+pub struct FaviconOrchestrator {
+    /// 已成功取到的 favicon（绝对 URL → 像素，`Arc` 共享给地址栏槽位）。
+    cache: HashMap<String, Arc<Image>>,
+}
+
+impl FaviconOrchestrator {
+    /// 空会话。
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 单次导航的 favicon 编排入口（后台线程，页面解析完成后调用）：
+    /// 解析 URL（link 优先 / favicon.ico 回落，[`collect_favicon_url`]）→
+    /// 会话缓存命中直接复用 → 抓取 + 解码（[`fetch_favicon`]）→ 成功入缓存。
+    ///
+    /// 返回 `None`（全部静默降级，不阻塞页面）：页面无 link 图标且 base
+    /// 不可解析、抓取失败 / 非 2xx / 超预算、字节解码失败。
+    pub fn favicon_for(
+        &mut self,
+        fetcher: &dyn NetworkFetcher,
+        document: &Document,
+        base_url: &str,
+    ) -> Option<Arc<Image>> {
+        let url = collect_favicon_url(document, base_url)?;
+        if let Some(image) = self.cache.get(&url) {
+            return Some(Arc::clone(image));
+        }
+        let image = fetch_favicon(fetcher, &url)?;
+        self.cache.insert(url, Arc::clone(&image));
+        Some(image)
+    }
+}
+
 /// 并发抓取一组 URL，返回与 `urls` 等长的结果槽（失败或超预算为 `None`）。
 fn fetch_many(
     fetcher: &dyn NetworkFetcher,
@@ -1048,6 +1174,164 @@ mod tests {
                 rejected: 0
             },
             "同 URL 重复载荷不重复注册"
+        );
+    }
+
+    // ---- K13 T2：favicon 编排（link 优先 / 回落 / 失败降级 / 会话去重）----
+
+    const FAVICON_PNG: &str = "https://page.test/favicon.png";
+    const FAVICON_ICO: &str = "https://page.test/favicon.ico";
+
+    #[test]
+    fn favicon_link_icon_takes_priority_over_favicon_ico() {
+        let fetcher = MockFetcher::new();
+        fetcher.serve(FAVICON_PNG, &tiny_png());
+        let page = document("<head><link rel=icon href=/favicon.png></head><body></body>");
+
+        let mut favicons = FaviconOrchestrator::new();
+        let image = favicons
+            .favicon_for(&fetcher, &page, BASE)
+            .expect("link 图标应抓取解码成功");
+        assert_eq!(image.width, 1, "link 图标像素已解码");
+        let hits = fetcher.hits.lock().unwrap();
+        assert!(hits.contains(&FAVICON_PNG.to_owned()), "抓取 link 图标");
+        assert!(
+            !hits.contains(&FAVICON_ICO.to_owned()),
+            "link 命中时不回落 /favicon.ico"
+        );
+    }
+
+    #[test]
+    fn favicon_rel_token_matching_follows_html_semantics() {
+        // token 相等才命中（ASCII 大小写不敏感）：shortcut icon / ICON 命中；
+        // apple-touch-icon、stylesheet 等其它 token 不命中
+        let fetcher = MockFetcher::new();
+        fetcher.serve(FAVICON_PNG, &tiny_png());
+        let page = document(
+            "<head>\
+             <link rel=stylesheet href=style.css>\
+             <link rel=apple-touch-icon href=/touch.png>\
+             <link rel=\"shortcut ICON\" href=/favicon.png>\
+             </head>",
+        );
+        assert_eq!(
+            collect_favicon_url(&page, BASE).as_deref(),
+            Some(FAVICON_PNG)
+        );
+        let mut favicons = FaviconOrchestrator::new();
+        assert!(favicons.favicon_for(&fetcher, &page, BASE).is_some());
+        let hits = fetcher.hits.lock().unwrap();
+        assert_eq!(hits.len(), 1, "只抓 token 命中的那个 URL");
+    }
+
+    #[test]
+    fn favicon_falls_back_to_site_root_favicon_ico() {
+        let fetcher = MockFetcher::new();
+        fetcher.serve(FAVICON_ICO, &tiny_png());
+        // 无 link 图标：回落站点根 /favicon.ico（相对地址按文档 base 解析）
+        let page = document("<head><title>no icon link</title></head><body></body>");
+
+        let mut favicons = FaviconOrchestrator::new();
+        assert!(
+            favicons.favicon_for(&fetcher, &page, BASE).is_some(),
+            "回落 /favicon.ico 应命中"
+        );
+        assert!(
+            fetcher
+                .hits
+                .lock()
+                .unwrap()
+                .contains(&FAVICON_ICO.to_owned()),
+            "请求发到站点根 /favicon.ico"
+        );
+
+        // link 存在但 href 为空：同样回落（root-absolute 落在 origin 根）
+        fetcher.serve("https://page.test/dir/favicon.ico", &tiny_png());
+        let page = document("<head><link rel=icon href=''></head>");
+        assert_eq!(
+            collect_favicon_url(&page, "https://page.test/dir/page.html").as_deref(),
+            Some("https://page.test/favicon.ico"),
+            "空 href 回落站点根 /favicon.ico（root-absolute 按 origin 解析）"
+        );
+    }
+
+    #[test]
+    fn favicon_failures_degrade_silently_without_blocking() {
+        // link 404：URL 级回落只在 link 缺席/不可解析时发生，link 图标
+        // 抓取失败不重试回落 URL（简化档，见 collect_favicon_url 偏差）——
+        // 静默降级为 None，不 panic、不阻塞（返回即代表页面照常装配）
+        let fetcher = MockFetcher::new();
+        fetcher.fail("https://page.test/lost.png", 404);
+        let page = document("<head><link rel=icon href=/lost.png></head><body>x</body>");
+
+        let mut favicons = FaviconOrchestrator::new();
+        assert!(
+            favicons.favicon_for(&fetcher, &page, BASE).is_none(),
+            "抓取失败静默降级"
+        );
+        {
+            let hits = fetcher.hits.lock().unwrap();
+            assert!(hits.contains(&"https://page.test/lost.png".to_owned()));
+            assert!(
+                !hits.contains(&FAVICON_ICO.to_owned()),
+                "link 图标抓取失败不重试回落 URL（URL 级回落）"
+            );
+        }
+
+        // 超预算（> MAX_FAVICON_BODY_BYTES）：按降级语义缺席
+        fetcher.serve(
+            "https://page.test/huge.png",
+            &vec![0u8; MAX_FAVICON_BODY_BYTES + 1],
+        );
+        let page = document("<head><link rel=icon href=/huge.png></head>");
+        assert!(
+            favicons.favicon_for(&fetcher, &page, BASE).is_none(),
+            "超预算 favicon 缺席"
+        );
+
+        // base 不可解析（about:blank）：URL 解析不出 → None
+        let page = document("<head></head>");
+        assert_eq!(collect_favicon_url(&page, "about:blank"), None);
+
+        // 回落 URL 解码失败（非图片字节）：同样静默降级
+        fetcher.serve(FAVICON_ICO, b"<html>not an image</html>");
+        assert!(
+            favicons.favicon_for(&fetcher, &page, BASE).is_none(),
+            "回落 URL 解码失败静默降级"
+        );
+    }
+
+    #[test]
+    fn favicon_session_dedup_reuses_pixels_without_refetch() {
+        let fetcher = MockFetcher::new();
+        fetcher.serve(FAVICON_PNG, &tiny_png());
+        let page = document("<head><link rel=icon href=/favicon.png></head>");
+
+        let mut favicons = FaviconOrchestrator::new();
+        let first = favicons.favicon_for(&fetcher, &page, BASE).expect("first");
+        // 同页再次导航（同文档同 URL）：命中会话缓存，不发请求，像素共享
+        let second = favicons.favicon_for(&fetcher, &page, BASE).expect("second");
+        assert!(Arc::ptr_eq(&first, &second), "缓存像素按 Arc 共享");
+        assert_eq!(
+            fetcher
+                .hits
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|url| *url == FAVICON_PNG)
+                .count(),
+            1,
+            "同 URL 二次导航命中会话缓存，网络只打一次"
+        );
+
+        // 负结果不入缓存：失败后服务端恢复，下次导航可重试成功
+        fetcher.fail(FAVICON_ICO, 404);
+        let page = document("<head></head>");
+        assert!(favicons.favicon_for(&fetcher, &page, BASE).is_none());
+        fetcher.serve(FAVICON_ICO, &tiny_png());
+        assert!(
+            favicons.favicon_for(&fetcher, &page, BASE).is_some(),
+            "负结果不入缓存，恢复后重试成功"
         );
     }
 }
