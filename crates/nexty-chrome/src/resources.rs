@@ -793,6 +793,22 @@ impl FaviconOrchestrator {
         self.cache.insert(url, Arc::clone(&image));
         Some(image)
     }
+
+    /// 会话缓存命中查询（K13 T2 拆分接线用）：URL 已由
+    /// [`collect_favicon_url`] 在主线程解析，命中返回共享像素、不发请求。
+    /// 与 [`Self::favicon_for`] 的去重语义一致：负结果不在缓存，返回
+    /// `None` 只代表「未命中」，调用方自行决定是否后台抓取。
+    #[must_use]
+    pub fn cached(&self, url: &str) -> Option<Arc<Image>> {
+        self.cache.get(url).cloned()
+    }
+
+    /// 抓取成功后写入会话缓存（主线程，后台抓取完成后调用）。负结果
+    /// 不入缓存——调用方只在 `image` 为 `Some` 时调用，语义与
+    /// [`Self::favicon_for`] 一致。
+    pub fn store(&mut self, url: &str, image: Arc<Image>) {
+        self.cache.insert(url.to_owned(), image);
+    }
 }
 
 /// 并发抓取一组 URL，返回与 `urls` 等长的结果槽（失败或超预算为 `None`）。

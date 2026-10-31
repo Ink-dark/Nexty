@@ -67,6 +67,9 @@ enum BackgroundEvent {
     /// 字体字节就绪（K4 T3）：注册进会话注册表，有新注册触发恰好一轮
     /// 重排 + 重绘。
     FontsReady(Box<FontsReadyPayload>),
+    /// favicon 就绪（K13 T2）：后台抓取 + 解码完成（或静默降级为
+    /// `None`）。`page_base` 用于跨页门控：页面已离开时不污染新页图标槽。
+    FaviconReady(Box<FaviconReadyPayload>),
     /// 渲染线程完成一份光栅作业（异步呈现：主线程发请求即返回，不阻塞
     /// 等待——巨页帧可达数十秒，阻塞会让窗口进入系统「无响应」状态并
     /// 触发 WM_PAINT/WM_SIZE 重绘风暴）。
@@ -79,6 +82,15 @@ enum BackgroundEvent {
 struct FontsReadyPayload {
     base_url: String,
     fonts: Vec<crate::resources::FetchedFont>,
+}
+
+/// [`BackgroundEvent::FaviconReady`] 的载荷（K13 T2）：favicon 抓取产物 +
+/// 发起页 base（跨页门控）。`image: None` 表示 link 缺席回落 / 抓取 /
+/// 解码失败的静默降级——门控通过后主线程直接清图标槽即可。
+struct FaviconReadyPayload {
+    page_base: String,
+    url: String,
+    image: Option<Arc<nexty_paint::Image>>,
 }
 
 /// [`BackgroundEvent::PageLoaded`] 的载荷。
@@ -155,6 +167,10 @@ struct BrowserApp {
     fetcher: Option<Arc<dyn NetworkFetcher>>,
     /// @font-face 字体编排会话（K4 T3）：会话级注册表 + 已注册 URL 集。
     fonts: crate::resources::FontOrchestrator,
+    /// favicon 会话编排（K13 T2）：会话级像素缓存 + 去重。
+    favicons: crate::resources::FaviconOrchestrator,
+    /// 当前显示页的 base（favicon 跨页门控：回包 `page_base` 不匹配即丢弃）。
+    page_base: String,
     shaper: nexty_text::ParleyTextShaper,
     bar: AddressBar,
     history: History,
@@ -227,6 +243,8 @@ impl BrowserApp {
             renderer: None,
             fetcher: None,
             fonts,
+            favicons: crate::resources::FaviconOrchestrator::new(),
+            page_base: String::new(),
             shaper,
             bar: AddressBar::new("about:blank"),
             history: History::new("about:blank"),
@@ -300,6 +318,8 @@ impl BrowserApp {
     fn show_blank(&mut self) {
         self.bar.set_url("about:blank");
         self.script = None;
+        self.bar.set_favicon(None);
+        self.page_base.clear();
         self.set_page(pipeline::load_page("", ""), true);
         // 内部页生命周期：主线程本地解析完成、零子资源编排 = 立即 settle
         self.dispatch_page_lifecycle(pipeline::PendingLifecycle {
@@ -710,6 +730,9 @@ impl BrowserApp {
     /// 抓取完成：重建页面与显示列表，并派发生命周期事件。
     fn page_loaded(&mut self, payload: PageLoadedPayload) {
         self.bar.set_loading(false);
+        // 新页先清旧图标（K13 T2）：新页 favicon 若无 / 未就绪，不残留
+        // 上一页图标；就绪后经 FaviconReady 再上槽。
+        self.bar.set_favicon(None);
         // 生命周期门控：后台编排同步完成（解析 + settle）后事件才到达；
         // 错误页在主线程本地合成解析——两条路径的 DOMContentLoaded 与 load
         // 门控均已满足，经 EventLoop post_task 按 FIFO 顺序派发。
@@ -757,12 +780,43 @@ impl BrowserApp {
                 }
                 let page = pipeline::build_page(document, resources.stylesheets, resources.images);
                 let title = pipeline::document_title(&page.document.borrow());
+                // favicon URL 解析（K13 T2）：主线程 DOM 遍历，page 移交
+                // set_page 前完成；缓存命中直接上槽，未命中起后台抓取线程。
+                self.page_base = payload.base_url.clone();
+                let favicon_url = crate::resources::collect_favicon_url(
+                    &page.document.borrow(),
+                    &payload.base_url,
+                );
                 self.set_page(page, true);
                 // 302 落点（WHATWG 会话历史）：条目与地址栏改为最终 URL——
                 // 页内相对链接的解析基准（history.current()）随之落在落点，
                 // 而非重定向前的请求 URL；无重定向时 base_url == url，不变。
                 if payload.base_url != payload.url {
                     self.history.replace_current(payload.base_url.clone());
+                }
+                // favicon 编排（K13 T2）：URL 已在移交前解析；缓存命中直接
+                // 上槽，未命中才起后台抓取线程，就绪后经 FaviconReady 回
+                // 主线程入缓存并上图标槽（当前页 base 已记录，供跨页门控）。
+                if let Some(url) = favicon_url {
+                    if let Some(image) = self.favicons.cached(&url) {
+                        self.bar.set_favicon(Some(image));
+                    } else if let Some(fetcher) = self.fetcher.clone() {
+                        let proxy = self.proxy.clone();
+                        let page_base = payload.base_url.clone();
+                        std::thread::Builder::new()
+                            .name("nexty-favicon".to_owned())
+                            .spawn(move || {
+                                let image = crate::resources::fetch_favicon(fetcher.as_ref(), &url);
+                                let _ = proxy.send_event(BackgroundEvent::FaviconReady(Box::new(
+                                    FaviconReadyPayload {
+                                        page_base,
+                                        url,
+                                        image,
+                                    },
+                                )));
+                            })
+                            .expect("spawn favicon fetch thread");
+                    }
                 }
                 self.bar.set_url(payload.base_url);
                 if let Some(window) = &self.window {
@@ -778,6 +832,9 @@ impl BrowserApp {
                 // 用户看不到任何反馈。
                 let html = error_page_html(&payload.url, &error);
                 self.set_page(pipeline::load_page(&html, ""), true);
+                // 错误页无 favicon：清图标槽并置空跨页门控基准。
+                self.bar.set_favicon(None);
+                self.page_base.clear();
                 if let Some(window) = &self.window {
                     window.set_title("加载失败 - Nexty");
                 }
@@ -1065,6 +1122,18 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
             BackgroundEvent::PageLoaded(payload) => self.page_loaded(*payload),
             // 字体字节就绪：注册 + 恰一轮重排（K4 T3）
             BackgroundEvent::FontsReady(payload) => self.fonts_ready(*payload),
+            // favicon 就绪（K13 T2）：跨页门控通过才入会话缓存并上图标槽。
+            BackgroundEvent::FaviconReady(payload) => {
+                if payload.page_base == self.page_base {
+                    if let Some(image) = payload.image {
+                        self.favicons.store(&payload.url, Arc::clone(&image));
+                        self.bar.set_favicon(Some(image));
+                    }
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
             // 渲染线程完成：上屏最新一帧，按需补排帧
             BackgroundEvent::FrameReady => self.present_finished_frames(),
         }
