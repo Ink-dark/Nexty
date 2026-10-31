@@ -60,6 +60,11 @@ impl Node {
 pub struct Document {
     nodes: Vec<Node>,
     quirks_mode: QuirksMode,
+    /// 事件监听器注册表（`event` feature）：节点 → 事件类型 → 注册序条目。
+    /// 容器挂在 Document 侧（arena 节点不挂堆结构）；读写接口在 `event` 模块
+    /// 的 `impl Document` 块内（add_listener / remove_listener / dispatch）。
+    #[cfg(feature = "event")]
+    pub(crate) listeners: crate::event::ListenerRegistry,
 }
 
 impl Default for Document {
@@ -75,6 +80,8 @@ impl Document {
         Self {
             nodes: vec![Node::detached(NodeKind::Document)],
             quirks_mode: QuirksMode::NoQuirks,
+            #[cfg(feature = "event")]
+            listeners: crate::event::ListenerRegistry::default(),
         }
     }
 
