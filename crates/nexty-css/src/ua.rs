@@ -2,7 +2,9 @@
 //!
 //! 内容取自 [HTML Standard §15 Rendering](https://html.spec.whatwg.org/multipage/rendering.html)
 //! 的期望渲染意图：块级元素的 `display: block`、头部的 `display: none`、
-//! 标题字号/字重、强调样式与常见默认 margin。本样式表由样式层持有，
+//! 标题字号/字重、强调样式、链接下划线与常见默认 margin。链接下划线按
+//! `a` 元素选择器近似规范的 `:link`/`:visited`（本层无伪类支持），无 href
+//! 的 `<a>` 也会命中，记偏差。本样式表由样式层持有，
 //! 经 [`crate::cascade`] 的 UA origin 参与级联（优先级低于 author 声明，
 //! UA `!important` 最高）。
 
@@ -41,6 +43,8 @@ h6 { font-size: 0.67em; margin: 1.33em 0; font-weight: bold }
 
 b, strong { font-weight: bold }
 i, em, cite, dfn, var { font-style: italic }
+
+a { text-decoration: underline }
 
 pre, code, kbd, samp, tt { font-family: monospace }
 

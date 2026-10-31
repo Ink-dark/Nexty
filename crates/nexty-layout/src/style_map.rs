@@ -37,16 +37,16 @@
 #[cfg(feature = "absolute")]
 use nexty_css::InsetValue;
 use nexty_css::{
-    AlignItemsValue, AlignSelfValue, BoxSizingValue, ComputedStyle, DisplayValue,
-    FlexDirectionValue, FlexWrapValue, GapValue, JustifyContentValue, MarginValue, OverflowValue,
-    PaddingValue, PositionValue, SizeValue,
+    AlignItemsValue, AlignSelfValue, BoxSizingValue, ClearValue, ComputedStyle, DisplayValue,
+    FlexDirectionValue, FlexWrapValue, FloatValue, GapValue, JustifyContentValue, MarginValue,
+    OverflowValue, PaddingValue, PositionValue, SizeValue,
 };
 #[cfg(feature = "grid")]
 use nexty_css::{GridAutoFlowValue, GridTrack, GridTrackList};
 use taffy::{
-    AlignItems, AlignSelf, BoxSizing, Dimension, Display, FlexDirection, FlexWrap, JustifyContent,
-    LengthPercentage, LengthPercentageAuto, Overflow, Point, Position, Rect, Size, Style,
-    style_helpers as sh,
+    AlignItems, AlignSelf, BoxSizing, Clear, Dimension, Display, FlexDirection, FlexWrap, Float,
+    JustifyContent, LengthPercentage, LengthPercentageAuto, Overflow, Point, Position, Rect, Size,
+    Style, style_helpers as sh,
 };
 #[cfg(feature = "grid")]
 use taffy::{
@@ -123,6 +123,26 @@ pub(crate) fn map_style(style: &ComputedStyle) -> Style {
     s.overflow = Point {
         x: overflow,
         y: overflow,
+    };
+
+    // float / clear（CSS 2.1 §9.5.1/§9.5.2）：blockify 拦截——绝对/固定定位的
+    // 元素 `float` 计算为 none（CSS 2.1 §9.7）。flex/grid item 上的 float 由
+    // taffy 的 flexbox/grid 算法忽略（其 Style 文档明确 float 只作用于 block
+    // 布局的子节点），行为与「计算为 none」一致。
+    s.float = if s.position == Position::Absolute {
+        Float::None
+    } else {
+        match style.float {
+            FloatValue::None => Float::None,
+            FloatValue::Left => Float::Left,
+            FloatValue::Right => Float::Right,
+        }
+    };
+    s.clear = match style.clear {
+        ClearValue::None => Clear::None,
+        ClearValue::Left => Clear::Left,
+        ClearValue::Right => Clear::Right,
+        ClearValue::Both => Clear::Both,
     };
 
     // Flexbox 容器/子项。

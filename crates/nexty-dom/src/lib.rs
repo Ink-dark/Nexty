@@ -9,18 +9,28 @@
 //! 节点类型见 `node` 模块，树变更算法见 `tree` 模块。
 //!
 //! 已落地：节点类型（含 doctype / fragment / 处理指令）与元素命名空间、
-//! 树变更算法（insert / remove / replace / clone / normalize）。JS 绑定层尚未接入。
+//! 树变更算法（insert / remove / replace / clone / normalize）、事件模型
+//! （Event / 监听器注册表 / 传播算法 / 事件数据面 / EventLoop——DOM §2.9
+//! 简化档，见 `event` 模块文档及其偏差清单）。JS 绑定层尚未接入。
 //!
-//! **Feature**：节点数据层（`node`）与树变更算法（`tree`）分别受feature 控制，
-//! 默认全开；`tree` 隐含 `node`。
+//! **Feature**：节点数据层（`node`）、树变更算法（`tree`）与事件模型
+//! （`event`）分别受 feature 控制，默认全开；`tree` 隐含 `node`，
+//! `event` 隐含 `tree`。
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "event")]
+mod event;
 #[cfg(feature = "node")]
 mod node;
 #[cfg(feature = "tree")]
 mod tree;
 
+#[cfg(feature = "event")]
+pub use event::{
+    DOM_CONTENT_LOADED, DeltaMode, Event, EventListener, EventLoop, EventPhase, FocusEvent,
+    KeyboardEvent, LOAD, ListenerId, MouseEvent, Task, TaskContext, UiEvent, WheelEvent,
+};
 #[cfg(feature = "node")]
 pub use node::{
     Attribute, DocumentTypeData, DomError, ElementData, Namespace, NodeId, NodeKind,

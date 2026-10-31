@@ -1,8 +1,9 @@
 //! winit + wgpu 呈现：窗口、输入转译与 Pixmap 上屏。
 //!
-//! 本模块是无法在无头环境自动化测试的薄胶水层：窗口创建、surface 配置、
-//! 纹理上传与 blit 呈现。所有可测试逻辑（管线、渲染线程、UI 状态机）
-//! 都在其余模块并有单测覆盖。
+//! 本模块的 winit/GPU 胶水是无法在无头环境自动化测试的薄层：窗口创建、
+//! surface 配置、纹理上传与 blit 呈现。所有可测试逻辑（管线、渲染线程、
+//! UI 状态机）都在其余模块并有单测覆盖；交互事件接线与生命周期派发集中在
+//! 子模块 [`events`]（纯函数部分有无头单测，K1 T3）。
 //!
 //! 呈现路径：页面 + 地址栏 → Scene → [`RenderThread`]（隔离线程 +
 //! `catch_unwind`）→ Pixmap → `wgpu` 纹理 → 全屏 `textureLoad` blit →
@@ -11,8 +12,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use nexty_dom::{DeltaMode, NodeId};
 use nexty_layout::{Fragment, TextMap};
-use nexty_network::{Method, NetworkError, NetworkFetcher, ReqwestFetcher};
+use nexty_network::{CachedFetcher, NetworkFetcher, ReqwestFetcher};
 use nexty_paint::{Pixmap, Scene, Size};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -26,6 +28,8 @@ use crate::render::{RenderError, RenderThread};
 use crate::scrollbar::{self, ScrollGeometry, Scrollbar, ScrollbarHit};
 use crate::selection::{self, Selection};
 use crate::ui::{self, AddressBar, BAR_HEIGHT, BarCommand, CaretDirection, UiEvent};
+
+mod events;
 
 /// 滚轮一格（LineDelta 1.0）对应的滚动距离，px。
 const WHEEL_LINE_PX: f32 = 40.0;
@@ -55,20 +59,39 @@ impl std::error::Error for AppError {}
 
 /// 后台抓取完成后经事件代理送回的载荷。
 enum BackgroundEvent {
-    /// 页面（含子资源：外链 CSS + 解码图片）就绪。载荷装箱（Page 较大，
-    /// 与单元变体并列时避免枚举整体膨胀）。
+    /// 抓取数据面（HTML + 子资源字节/像素）就绪。载荷装箱（与单元变体
+    /// 并列时避免枚举整体膨胀）。
     PageLoaded(Box<PageLoadedPayload>),
+    /// 字体字节就绪（K4 T3）：注册进会话注册表，有新注册触发恰好一轮
+    /// 重排 + 重绘。
+    FontsReady(Box<FontsReadyPayload>),
     /// 渲染线程完成一份光栅作业（异步呈现：主线程发请求即返回，不阻塞
     /// 等待——巨页帧可达数十秒，阻塞会让窗口进入系统「无响应」状态并
     /// 触发 WM_PAINT/WM_SIZE 重绘风暴）。
     FrameReady,
 }
 
+/// [`BackgroundEvent::FontsReady`] 的载荷（K4 T3）：抓取成功的字体字节 +
+/// 描述符。`url` 是发起抓取的导航 URL（跨页保护：页面已离开时只入库，
+/// 不重排当前页）。
+struct FontsReadyPayload {
+    url: String,
+    fonts: Vec<crate::resources::FetchedFont>,
+}
+
 /// [`BackgroundEvent::PageLoaded`] 的载荷。
+///
+/// K1 起载荷只携带全 `Send` 数据面（[`crate::resources::FetchedPageData`]）：
+/// `Document` 含监听器注册表（!Send）只能在主线程构建——后台线程只投
+/// 信号与字节，不触碰 Document。K3 T5 起后台编排同步完成（解析 + settle）
+/// 后事件才到达，生命周期门控在到达点即满足，不再携带中途信号字段。
 struct PageLoadedPayload {
     url: String,
-    /// 页面构建结果；错误携带用户可读信息。
-    result: Result<Page, String>,
+    /// 文档 base：响应最终 URL（重定向落点）；错误路径与请求 URL 同值
+    /// （错误页无子资源，不参与查表）。
+    base_url: String,
+    /// 抓取产物；错误携带用户可读信息。
+    result: Result<crate::resources::FetchedDocument, String>,
 }
 
 /// 启动浏览器窗口。阻塞直至窗口关闭。
@@ -102,11 +125,14 @@ struct Gpu {
     staging_cache: Option<((u32, u32, u32), Vec<u8>)>,
 }
 
-/// 页面左键按下手势（链接目标在按下时解析，释放且未拖动才导航）。
+/// 页面左键按下手势（链接目标在按下时解析，释放且未拖动才导航；
+/// 命中节点存入 `Press`，供 mousedown/mouseup/click 派发作目标）。
 struct Press {
     x: f32,
     y: f32,
     link: Option<String>,
+    /// mousedown 时命中测试的节点（无命中为 None，事件退回文档根）。
+    node: Option<NodeId>,
 }
 
 /// 浏览器应用状态。
@@ -117,9 +143,14 @@ struct BrowserApp {
     renderer: Option<RenderThread>,
     /// 网络接驳缝：后端可整体替换（reqwest 实现或其他 `NetworkFetcher`）。
     fetcher: Option<Arc<dyn NetworkFetcher>>,
+    /// @font-face 字体编排会话（K4 T3）：会话级注册表 + 已注册 URL 集。
+    fonts: crate::resources::FontOrchestrator,
     shaper: nexty_text::ParleyTextShaper,
     bar: AddressBar,
     history: History,
+    /// DOM 宏任务队列（K1）：生命周期事件经 post_task 派发、
+    /// `run_pending_tasks` 排空（FIFO，派发中 post 不重入）。
+    dom_loop: nexty_dom::EventLoop,
     /// 滚动条交互状态（悬停 / 拖拽）。
     scrollbar: Scrollbar,
     /// Alt 修饰键按住状态（后退/前进快捷键）。
@@ -168,15 +199,21 @@ struct BrowserApp {
 
 impl BrowserApp {
     fn new(proxy: EventLoopProxy<BackgroundEvent>) -> Self {
+        // 字体注册表先于整形器创建：整形器经 with_registry 接线（K4 T3），
+        // 此后 register 即生效、无需重建（nexty-text T2 语义）。
+        let fonts = crate::resources::FontOrchestrator::new();
+        let shaper = nexty_text::ParleyTextShaper::with_registry(fonts.registry());
         Self {
             proxy,
             window: None,
             gpu: None,
             renderer: None,
             fetcher: None,
-            shaper: nexty_text::ParleyTextShaper::new(),
+            fonts,
+            shaper,
             bar: AddressBar::new("about:blank"),
             history: History::new("about:blank"),
+            dom_loop: nexty_dom::EventLoop::new(),
             scrollbar: Scrollbar::new(),
             alt_down: false,
             ctrl_down: false,
@@ -230,9 +267,11 @@ impl BrowserApp {
         // 启动路径用 fail-fast：TLS 后端不可用时浏览器本就无法工作，
         // 带着半初始化的状态继续跑不如立刻退出（渲染路径才需要降级）。
         // 整请求超时 30s：真实站点挂起时不无限占住加载状态。
-        self.fetcher = Some(Arc::new(
+        // 抓取栈接 HTTP 内存缓存（K3 T4/T5）：主文档与子资源共用同一实例，
+        // 同 URL 二次导航 / 重复子资源直接命中缓存，不再打网络。
+        self.fetcher = Some(Arc::new(CachedFetcher::new(
             ReqwestFetcher::with_timeout(Duration::from_secs(30)).expect("network fetcher"),
-        ));
+        )));
         self.show_blank();
         window.request_redraw();
     }
@@ -241,6 +280,11 @@ impl BrowserApp {
     fn show_blank(&mut self) {
         self.bar.set_url("about:blank");
         self.set_page(pipeline::load_page("", ""), true);
+        // 内部页生命周期：主线程本地解析完成、零子资源编排 = 立即 settle
+        self.dispatch_page_lifecycle(pipeline::PendingLifecycle {
+            dom_content_loaded: true,
+            load: true,
+        });
     }
 
     /// 当前视口与内容对应的滚动几何；窗口未创建时为 `None`。
@@ -395,10 +439,27 @@ impl BrowserApp {
 
     /// 开始一次页面点击/选择手势。
     fn begin_page_gesture(&mut self, x: f32, y: f32) {
+        let page_y = y - BAR_HEIGHT + self.scroll_y;
+        // 单次命中测试同时供事件目标与链接解析（hit_test_ex 结果 → 事件节点）
+        let hit = self
+            .root
+            .as_ref()
+            .and_then(|root| pipeline::hit_test_ex(root, x, page_y));
+        let node = hit.map(|hit| hit.node);
+        let link = hit
+            .and_then(|hit| {
+                self.page
+                    .as_ref()
+                    .and_then(|page| pipeline::link_target(page, hit.node))
+            })
+            .and_then(|href| nexty_network::resolve(self.history.current(), &href).ok());
+        // mousedown 先派发后默认：默认动作 = 开始选择手势（含地址栏失焦，
+        // 同浏览器 preventDefault mousedown 阻止焦点转移）。取消则手势不开始。
+        if !self.dispatch_page_mouse(node, "mousedown", x, y, 1) {
+            return;
+        }
         // 页面点击让地址栏失焦：之后 Ctrl+A / Ctrl+C 作用于页面。
         self.bar.blur();
-        let page_y = y - BAR_HEIGHT + self.scroll_y;
-        let link = self.link_at(x, page_y);
         let position = self.text_map.as_ref().and_then(|map| map.hit(x, page_y));
         let now = Instant::now();
         let double_click = self.last_click.is_some_and(|(time, last_x, last_y)| {
@@ -422,30 +483,25 @@ impl BrowserApp {
             }
             None => self.selection.clear(),
         }
-        self.press = Some(Press { x, y, link });
+        self.press = Some(Press { x, y, link, node });
         if let Some(window) = &self.window {
             window.request_redraw();
         }
     }
 
-    /// 页面点命中的链接绝对地址（无链接或解析失败返回 `None`）。
-    fn link_at(&self, x: f32, page_y: f32) -> Option<String> {
-        self.root
-            .as_ref()
-            .and_then(|root| pipeline::hit_test(root, x, page_y))
-            .and_then(|node| {
-                self.page
-                    .as_ref()
-                    .and_then(|page| pipeline::link_target(page, node))
-            })
-            .and_then(|href| nexty_network::resolve(self.history.current(), &href).ok())
-    }
-
     /// 导航：入历史栈并加载。
+    ///
+    /// 地址栏输入与页面链接共用入口。地址栏输入在这里做 URL 规范化：无
+    /// scheme 补 `http://`（HTTP-first，决策见
+    /// `docs/decisions/2026-10-31-addressbar-url.md` 与
+    /// [`crate::resources::normalize_address_bar_input`]）；链接 href 已由
+    /// `resolve` 按文档 base 绝对化，规范化对其无操作。历史栈存规范化后
+    /// 的 URL：后退/前进重放的即实际导航目标。
     fn navigate(&mut self, url: &str) {
-        self.history.push(url.to_owned());
+        let url = crate::resources::normalize_address_bar_input(url);
+        self.history.push(url.clone());
         self.sync_history_flags();
-        self.load(url);
+        self.load(&url);
     }
 
     /// 后退/前进（历史栈搬运后按目标 URL 加载，不再入栈）。
@@ -485,9 +541,10 @@ impl BrowserApp {
         self.bar.set_url(url.to_owned());
         self.bar.set_loading(true);
 
-        // 内部 scheme（about:blank 等）不由网络抓取，直接生成本地空白页。
-        // 交给 NetworkFetcher 会被协议白名单判为 InvalidUrl，白屏。
-        if !url.starts_with("http://") && !url.starts_with("https://") {
+        // 内部 scheme（about:blank 等）不经网络，直接生成本地空白页。
+        // 其余 URL（含补全 scheme 后仍非法的输入）交给抓取路径：协议白名单
+        // 判 InvalidUrl → 错误页给出反馈，不再静默白屏。
+        if url.starts_with("about:") {
             self.bar.set_loading(false);
             self.show_blank();
             if let Some(window) = &self.window {
@@ -503,70 +560,62 @@ impl BrowserApp {
         let Some(proxy) = Some(self.proxy.clone()) else {
             return;
         };
-        let url = url.to_owned();
-        let target = url.clone();
+        let target = url.to_owned();
         std::thread::Builder::new()
             .name("nexty-fetch".to_owned())
             .spawn(move || {
-                let request = nexty_network::Request {
-                    url: target.clone(),
-                    method: Method::Get,
-                    // 不少真实站点对无 UA 请求直接 403/429
-                    headers: vec![(
-                        "User-Agent".to_owned(),
-                        format!("Nexty/{}", env!("CARGO_PKG_VERSION")),
-                    )],
-                };
-                // 全部加载在后台线程完成：文档抓取 → 解析 → 子资源并发抓取
-                // → 级联 → 页面就绪。主线程只做布局与呈现。
-                // 错误串收敛为「错误类别 + 状态码」：不回显上游原始错误
-                //（reqwest 的错误文本内含目标 URL），错误页只显示类别。
-                let result = match fetcher.fetch(&request) {
-                    Ok(response) if (200..300).contains(&response.status) => {
-                        if response.body.len() > crate::resources::MAX_DOCUMENT_BODY_BYTES {
-                            Err("响应体超出预算".to_owned())
-                        } else {
-                            match String::from_utf8(response.body) {
-                                Ok(html) => {
-                                    let document = nexty_html::parse_document(
-                                        &html,
-                                        nexty_html::ParseOptions::default(),
-                                    );
-                                    let resources = crate::resources::fetch_subresources(
-                                        fetcher.as_ref(),
-                                        &url,
-                                        &document,
-                                    );
-                                    Ok(pipeline::build_page(
-                                        document,
-                                        resources.stylesheets,
-                                        resources.images,
-                                    ))
-                                }
-                                Err(_) => Err("响应不是有效的文本".to_owned()),
-                            }
-                        }
-                    }
-                    Ok(response) => Err(format!("HTTP {}", response.status)),
-                    Err(error) => Err(load_error_text(&error).to_owned()),
+                // 全部抓取在后台线程完成：文档抓取 → 解码 → 规划解析 →
+                // 子资源并发抓取与解码（resources::fetch_document 同步编排），
+                // 产出全 Send 数据面（K1 起 Document 含监听器注册表 !Send，
+                // 只能在主线程构建——主线程按同一 HTML 重建正式文档）。
+                // 错误串收敛为「错误类别 + 状态码」（见 fetch_document）。
+                let result = crate::resources::fetch_document(fetcher.as_ref(), &target);
+                let base_url = match &result {
+                    Ok(fetched) => fetched.base_url.clone(),
+                    Err(_) => target.clone(),
                 };
                 let _ =
                     proxy.send_event(BackgroundEvent::PageLoaded(Box::new(PageLoadedPayload {
-                        url,
+                        url: target,
+                        base_url,
                         result,
                     })));
             })
             .expect("spawn fetch thread");
     }
 
-    /// 抓取完成：重建页面与显示列表。
-    fn page_loaded(&mut self, url: String, result: Result<Page, String>) {
+    /// 抓取完成：重建页面与显示列表，并派发生命周期事件。
+    fn page_loaded(&mut self, payload: PageLoadedPayload) {
         self.bar.set_loading(false);
-        match result {
-            Ok(page) => {
+        // 生命周期门控：后台编排同步完成（解析 + settle）后事件才到达；
+        // 错误页在主线程本地合成解析——两条路径的 DOMContentLoaded 与 load
+        // 门控均已满足，经 EventLoop post_task 按 FIFO 顺序派发。
+        let pending = pipeline::PendingLifecycle {
+            dom_content_loaded: true,
+            load: true,
+        };
+        match payload.result {
+            Ok(fetched) => {
+                // 正式文档在主线程构建（Document 含监听器注册表 !Send）：
+                // 按同一 HTML 重建，并装配后台线程抓取的子资源数据面。
+                // 查表 base 与后台抓取一致：响应最终 URL（重定向落点）。
+                let document = nexty_html::parse_document(
+                    &fetched.data.html,
+                    nexty_html::ParseOptions::default(),
+                );
+                let resources = crate::resources::assemble_page_data(
+                    &document,
+                    &payload.base_url,
+                    &fetched.data,
+                );
+                // @font-face 字体源收集与后台抓取（K4 T3）：不在 load 门控
+                // 内，首帧先用系统字体渲染；字节就绪注册后经 FontsReady
+                // 触发恰好一轮重排（font-display swap 简化）。
+                self.spawn_font_fetch(&resources.stylesheets, &payload.base_url, &payload.url);
+                let page = pipeline::build_page(document, resources.stylesheets, resources.images);
                 let title = pipeline::document_title(&page.document);
                 self.set_page(page, true);
-                self.bar.set_url(url);
+                self.bar.set_url(payload.url);
                 if let Some(window) = &self.window {
                     match title {
                         Some(title) => window.set_title(&format!("{title} - Nexty")),
@@ -575,14 +624,73 @@ impl BrowserApp {
                 }
             }
             Err(error) => {
-                eprintln!("load {url} failed: {error}");
+                eprintln!("load {} failed: {error}", payload.url);
                 // 失败也要出错误页：只打日志会让画面停在上一帧或空白，
                 // 用户看不到任何反馈。
-                let html = error_page_html(&url, &error);
+                let html = error_page_html(&payload.url, &error);
                 self.set_page(pipeline::load_page(&html, ""), true);
                 if let Some(window) = &self.window {
                     window.set_title("加载失败 - Nexty");
                 }
+            }
+        }
+        // 生命周期派发经 EventLoop post_task（DOMContentLoaded → load，FIFO）
+        self.dispatch_page_lifecycle(pending);
+    }
+
+    /// 收集 @font-face 源并在后台线程抓取字体字节（K4 T3）。
+    ///
+    /// 无待抓取源（无 @font-face / 全部会话已注册 / woff2 提示跳过）时
+    /// 不起线程：已注册字体的重复导航零抓取、零重排。
+    fn spawn_font_fetch(
+        &mut self,
+        stylesheets: &[nexty_css::Stylesheet],
+        base_url: &str,
+        url: &str,
+    ) {
+        let requests = self.fonts.collect(stylesheets, base_url);
+        if requests.is_empty() {
+            return;
+        }
+        let Some(fetcher) = self.fetcher.clone() else {
+            return;
+        };
+        let proxy = self.proxy.clone();
+        let url = url.to_owned();
+        std::thread::Builder::new()
+            .name("nexty-fonts".to_owned())
+            .spawn(move || {
+                // 抓取降级语义与主文档子资源一致（404 / 超预算 / 传输错误
+                // 缺席）；全空则无事可做，不回送事件。
+                let fonts = crate::resources::fetch_fonts(fetcher.as_ref(), &requests);
+                if fonts.is_empty() {
+                    return;
+                }
+                let _ =
+                    proxy.send_event(BackgroundEvent::FontsReady(Box::new(FontsReadyPayload {
+                        url,
+                        fonts,
+                    })));
+            })
+            .expect("spawn font fetch thread");
+    }
+
+    /// 字体字节就绪：注册进会话注册表；有新注册时重级联 + 重排 + 重绘
+    /// **恰好一轮**（K4 T3）。已接线的整形器自动命中注册字体（nexty-text
+    /// T2）；chunk 分析缓存随新片段树重建，场景缓存随代次推进失效。载荷
+    /// 属于已离开的页面时只入库（会话缓存跨页有效），不重排。
+    fn fonts_ready(&mut self, payload: FontsReadyPayload) {
+        let registration = self.fonts.register(payload.fonts);
+        if registration.rejected > 0 {
+            eprintln!(
+                "font registration rejected {} source(s); fallback to system fonts",
+                registration.rejected
+            );
+        }
+        if registration.registered > 0 && payload.url == self.history.current() {
+            self.relayout();
+            if let Some(window) = &self.window {
+                window.request_redraw();
             }
         }
     }
@@ -636,17 +744,10 @@ impl BrowserApp {
             Some(map) if !self.selection.is_empty() => self.selection.rects(map),
             _ => Vec::new(),
         };
-        // 画布底色：pipeline 的画布保持透明，直接 blit 会把透明像素交给
-        // surface（alpha_mode Auto），在部分后端表现为黑屏/花屏。先铺不透明白底。
-        let white_background = nexty_paint::Command::FillRect {
-            rect: nexty_paint::Rect {
-                x: 0.0,
-                y: 0.0,
-                width,
-                height,
-            },
-            color: nexty_paint::Color::opaque(0xff, 0xff, 0xff),
-        };
+        // 画布底色：CSS 2.2 §14.2 html/body 背景传播到画布——html 携带背景
+        // 用 html，否则 body，都无回落白；视口坐标系，不随滚动平移。画布
+        // 必须不透明：透明像素直接 blit 给 surface（alpha_mode Auto）在部分
+        // 后端表现为黑屏/花屏。被传播元素的自身背景由 emit 抑制（搬移语义）。
         let mut scene = match (&self.page, &self.root) {
             (Some(page), Some(root)) => {
                 let page_scene = self.scene_cache.scene_for(
@@ -657,12 +758,26 @@ impl BrowserApp {
                     &highlights,
                 );
                 let mut scene = page_scene.translated(0.0, BAR_HEIGHT - self.scroll_y);
-                scene.commands.insert(0, white_background);
+                for (index, command) in pipeline::canvas_background_commands(page, width, height)
+                    .into_iter()
+                    .enumerate()
+                {
+                    scene.commands.insert(index, command);
+                }
                 scene
             }
             _ => {
+                // 无页面（启动空窗）：无从传播，固定白底。
                 let mut scene = Scene::default();
-                scene.commands.push(white_background);
+                scene.commands.push(nexty_paint::Command::FillRect {
+                    rect: nexty_paint::Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width,
+                        height,
+                    },
+                    color: nexty_paint::Color::opaque(0xff, 0xff, 0xff),
+                });
                 scene
             }
         };
@@ -763,7 +878,9 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: BackgroundEvent) {
         match event {
-            BackgroundEvent::PageLoaded(payload) => self.page_loaded(payload.url, payload.result),
+            BackgroundEvent::PageLoaded(payload) => self.page_loaded(*payload),
+            // 字体字节就绪：注册 + 恰一轮重排（K4 T3）
+            BackgroundEvent::FontsReady(payload) => self.fonts_ready(*payload),
             // 渲染线程完成：上屏最新一帧，按需补排帧
             BackgroundEvent::FrameReady => self.present_finished_frames(),
         }
@@ -838,12 +955,23 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
                 self.update_cursor_icon();
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                // 滚轮向上（y > 0）→ 减小滚动量
-                let amount = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y * WHEEL_LINE_PX,
-                    MouseScrollDelta::PixelDelta(position) => position.y as f32,
+                // 滚轮先派发后默认：WheelEvent（正值 deltaY = 页面向下滚，
+                // 与 winit 相反号）未取消才滚动，滚动量换算沿用现语义。
+                let (mode, amount, wheel_delta) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (
+                        DeltaMode::Line,
+                        y * WHEEL_LINE_PX,
+                        (-f64::from(x), -f64::from(y)),
+                    ),
+                    MouseScrollDelta::PixelDelta(position) => (
+                        DeltaMode::Pixel,
+                        position.y as f32,
+                        (-position.x, -position.y),
+                    ),
                 };
-                self.scroll_by(-amount);
+                if self.dispatch_page_wheel(wheel_delta, mode) {
+                    self.scroll_by(-amount);
+                }
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -875,10 +1003,18 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
             } => {
                 self.scrollbar.on_release();
                 if let Some(press) = self.press.take() {
-                    self.selection.finish();
                     let dragged = !selection::is_click((press.x, press.y), self.cursor);
-                    // 释放且未拖动才算点击：链接此时导航，拖过链接文字只选择。
-                    if !dragged && let Some(url) = press.link {
+                    // mouseup 先派发后默认；selection.finish 与滚动条
+                    // on_release 一样是 chrome 侧手势状态卫生（无论取消都
+                    // 执行，避免状态机卡在拖拽态）。
+                    let _ = self.dispatch_page_mouse(press.node, "mouseup", press.x, press.y, 0);
+                    self.selection.finish();
+                    // 释放且未拖动才算点击：click 仅此时派发（现语义），
+                    // 默认动作 = 链接导航，被取消则跳过（先派发后默认）。
+                    if !dragged
+                        && self.dispatch_page_mouse(press.node, "click", press.x, press.y, 0)
+                        && let Some(url) = press.link
+                    {
                         self.navigate(&url);
                     }
                 }
@@ -893,21 +1029,28 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
                 self.shift_down = state.shift_key();
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                let modifiers = ui::Modifiers {
-                    ctrl: self.ctrl_down,
-                    shift: self.shift_down,
-                    alt: self.alt_down,
-                };
+                let modifiers = self.modifiers();
                 let key = ui_key(&event.logical_key);
-                // 浏览器级快捷键优先于一切（Alt+方向键、Ctrl+L/R/A、F5、Esc）
+                // 浏览器级快捷键优先于一切（Alt+方向键、Ctrl+L/R/A、F5、Esc）。
+                // 「先派发后默认」：地址栏聚焦时键属 chrome UI（不进页面），
+                // 直接执行；未聚焦时先派发可取消 keydown，未取消才执行。
                 if let Some(key) = key
                     && let Some(shortcut) = ui::shortcut(key, modifiers)
                 {
-                    self.apply_shortcut(shortcut);
+                    let allowed = if self.bar.is_focused() {
+                        true
+                    } else {
+                        let (key_name, code) = events::dom_key_names(key);
+                        self.dispatch_page_key(&key_name, &code, event.repeat)
+                    };
+                    if allowed {
+                        self.apply_shortcut(shortcut);
+                    }
                     return;
                 }
                 if self.bar.is_focused() {
                     // 地址栏聚焦：方向键/Home/End 作用于光标（Shift 扩选）
+                    // —— chrome UI 键，不派发到页面
                     if let Some(direction) = key.and_then(caret_direction) {
                         let _ = self.bar.handle(UiEvent::MoveCaret {
                             direction,
@@ -915,29 +1058,31 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
                         });
                     }
                 } else {
-                    // 未聚焦：翻页/滚动键作用于页面
+                    // 未聚焦：翻页/滚动键作用于页面——先派发后默认
                     let page_step = self
                         .geometry()
                         .map_or(0.0, |geometry| geometry.page_step() * 0.9);
                     match event.logical_key {
                         Key::Named(NamedKey::PageDown) => {
-                            self.scroll_by(page_step);
+                            self.dispatch_key_scroll("PageDown", page_step);
                         }
                         Key::Named(NamedKey::PageUp) => {
-                            self.scroll_by(-page_step);
+                            self.dispatch_key_scroll("PageUp", -page_step);
                         }
                         Key::Named(NamedKey::ArrowDown) => {
-                            self.scroll_by(WHEEL_LINE_PX);
+                            self.dispatch_key_scroll("ArrowDown", WHEEL_LINE_PX);
                         }
                         Key::Named(NamedKey::ArrowUp) => {
-                            self.scroll_by(-WHEEL_LINE_PX);
+                            self.dispatch_key_scroll("ArrowUp", -WHEEL_LINE_PX);
                         }
                         Key::Named(NamedKey::Home) => {
-                            self.scroll_by(-self.scroll_y);
+                            let delta = -self.scroll_y;
+                            self.dispatch_key_scroll("Home", delta);
                         }
                         Key::Named(NamedKey::End) => {
                             if let Some(geometry) = self.geometry() {
-                                self.scroll_by(geometry.max_scroll() - self.scroll_y);
+                                let delta = geometry.max_scroll() - self.scroll_y;
+                                self.dispatch_key_scroll("End", delta);
                             }
                         }
                         _ => {}
@@ -1392,18 +1537,6 @@ fn pad_rows_into(out: &mut Vec<u8>, data: &[u8], width: u32, height: u32, padded
         }
         // 行尾补到 256 对齐
         out.resize(y * padded as usize + padded as usize, 0);
-    }
-}
-
-/// 传输失败 → 错误类别文本。
-///
-/// 不回显上游原始错误串：reqwest 的错误文本内含目标 URL，而错误页是按
-/// 页面语义渲染的 HTML——错误信息只保留「类别」这一用户需要知道的内容。
-fn load_error_text(error: &NetworkError) -> &'static str {
-    match error {
-        NetworkError::InvalidUrl => "无效的地址",
-        NetworkError::Timeout => "请求超时",
-        NetworkError::Transport => "网络错误",
     }
 }
 

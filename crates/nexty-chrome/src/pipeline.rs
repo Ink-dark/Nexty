@@ -2,21 +2,38 @@
 //!
 //! 行为分工：解析归 nexty-html，级联归 nexty-css（UA + author 双 origin），
 //! 布局归 nexty-layout，本模块负责把片段树转译为 [`nexty_paint::Scene`]：
-//! 背景与 CSS 边框（四条填充带，宽 0 的边跳过）、行内文本 run
+//! 背景与渐变（css-images-3 渐变线端点在 emit 前换算）、CSS 边框（四边等宽
+//! 有圆角时一条圆角描边，否则四条填充带）、行内文本 run 与装饰带
 //! （坐标换算到绝对坐标系）、行内/块级图片（`DrawImage`，像素从页面图片池
-//! 按节点索引）。匿名片段不产生背景与边框。
+//! 按节点索引）。匿名片段不产生背景与边框；背景绘制次序遵循
+//! z-index 基础定序（普通流先、定位元素后，定位兄弟按整数排序）。
 //!
-//! 已知偏差：`<html>`/`<body>` 背景不向画布传播（画布保持透明，由呈现层
-//! 决定底色）；片段树不做滚动裁剪。
+//! 画布底色（CSS 2.2 §14.2）：html/body 背景传播到画布——html 携带背景
+//! 用 html，否则用 body，都无回落白（[`canvas_background_commands`]）；
+//! 传播是搬移语义，被传播的元素不再自绘背景。
+//!
+//! 已知偏差：z-index 为基础定序档，不做完整 stacking context——定位元素
+//! 统一画在普通流之上（负 z-index 不回落普通流之下），命中测试也不镜像
+//! 定位层序（K7 补）；border-radius 百分比按边框盒对应轴折算后取两轴
+//! 较小分量（paint 只有圆形角，椭圆 `/` 语法 css 层已整条拒收）；四边
+//! border-width 不等时圆角边框降级直角填充带；text-decoration 按文本 run
+//! 自身元素的 computed style 绘制（规范的祖先「传播」未实现，css 层偏差；
+//! 跨行内元素边界按 run 分段断线）、非 solid 不画、度量用经验值
+//! （0.06em 厚 / underline 基线下 0.08em，无字体 underline 数据）；
+//! 片段树不做滚动裁剪。
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use nexty_css::{ComputedStyle, MediaViewport, Rgba, Stylesheet, html_ua_stylesheet};
-use nexty_dom::{Document, NodeId};
+use nexty_css::{
+    BackgroundImageValue, BorderRadiusValue, ComputedStyle, GradientColorStop, MediaViewport,
+    PositionValue, Rgba, Stylesheet, TextDecorationLineValue, TextDecorationStyleValue,
+    ZIndexValue, html_ua_stylesheet,
+};
+use nexty_dom::{Document, Event, EventLoop, NodeId, Task, TaskContext};
 use nexty_html::ParseOptions;
-use nexty_layout::{Fragment, Rect as LayoutRect};
-use nexty_paint::{Color, Command, Image, Rect as PaintRect, Scene, Size, TextGlyph};
+use nexty_layout::{Fragment, Rect as LayoutRect, TextRun};
+use nexty_paint::{Color, Command, GradientStop, Image, Rect as PaintRect, Scene, Size, TextGlyph};
 use nexty_text::TextShaper;
 
 /// 一个已解析、已级联的页面。
@@ -87,6 +104,57 @@ pub fn load_page(html: &str, author_css: &str) -> Page {
     build_page(document, vec![sheet], HashMap::new())
 }
 
+/// 页面待派发的生命周期事件信号集（K1 T3）。
+///
+/// 信号在后台线程于真实完成点捕获（HTML 解析返回 / 首轮子资源编排
+/// settle——含失败/超时/预算降级路径），随页面载荷送回主线程；主线程经
+/// [`Page::post_lifecycle_tasks`] post 进 EventLoop 再排空派发。后台线程
+/// 只投信号，不得跨线程触碰 [`Document`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PendingLifecycle {
+    /// HTML 解析完成 → `DOMContentLoaded`（bubbles=true、cancelable=false，
+    /// 文档根上派发）。
+    pub dom_content_loaded: bool,
+    /// 首轮子资源编排 settle（含失败/超时/预算降级）→ `load`（bubbles=false）。
+    pub load: bool,
+}
+
+impl PendingLifecycle {
+    /// 两个信号都未到。
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.dom_content_loaded && !self.load
+    }
+}
+
+impl Page {
+    /// 导航/解析完成点的**单处** EventLoop 钩子（K1 T3）：把信号了的生命
+    /// 周期事件按 `DOMContentLoaded` → `load` 顺序 post 进 EventLoop
+    /// （FIFO 保序）；任务执行时在文档根上派发（根无祖先链 → 仅 target
+    /// 阶段，恰好一次）。
+    ///
+    /// 本方法不存状态：同一信号重复 post 会重复派发——每页只 post 一次
+    /// 由调用方（页面安装点）保证。
+    pub fn post_lifecycle_tasks(&mut self, event_loop: &mut EventLoop, pending: PendingLifecycle) {
+        if pending.dom_content_loaded {
+            event_loop.post_task(Task::new(|ctx: &mut TaskContext| {
+                let document = ctx.document();
+                let root = document.root();
+                let mut event = Event::dom_content_loaded();
+                document.dispatch(root, &mut event);
+            }));
+        }
+        if pending.load {
+            event_loop.post_task(Task::new(|ctx: &mut TaskContext| {
+                let document = ctx.document();
+                let root = document.root();
+                let mut event = Event::load();
+                document.dispatch(root, &mut event);
+            }));
+        }
+    }
+}
+
 /// 对页面做布局，返回根元素片段。
 #[must_use]
 pub fn layout_page(page: &Page, shaper: &dyn TextShaper, viewport_width: f32) -> Option<Fragment> {
@@ -143,6 +211,9 @@ pub fn build_scene_at_with_highlights(
 ) -> Scene {
     let mut scene = Scene::default();
     let mut pool: HashMap<NodeId, usize> = HashMap::new();
+    // §14.2 传播源（html 优先、body 回落）：emit 内被传播的元素不再自绘
+    // 背景（搬移语义）；全树只查一次，递归透传。
+    let canvas_source = canvas_background_source(page);
     // 高亮矩形相对根片段；先平移到场景坐标，递归 emit 里不再叠加 origin
     //（emit 的 origin 是父链累积位置，不是场景原点）。
     let highlights: Vec<LayoutRect> = highlights
@@ -161,10 +232,22 @@ pub fn build_scene_at_with_highlights(
         &mut scene,
         &mut pool,
         &highlights,
+        canvas_source,
     );
     scene
 }
 
+/// 文本装饰带的经验度量（em 单位；无字体 underline 度量可用——T0 报告
+/// F11，记偏差）：厚度一律 `0.06em`；underline 带顶在基线下 `0.08em`；
+/// overline 近似 em 盒顶（基线上方 `0.88em` ≈ 0.8em ascent + 0.08em）；
+/// line-through 穿过 x 高中部近似（基线上方 `0.30em`）。
+const DECORATION_THICKNESS_EM: f32 = 0.06;
+const UNDERLINE_OFFSET_EM: f32 = 0.08;
+const OVERLINE_OFFSET_EM: f32 = 0.88;
+const LINE_THROUGH_OFFSET_EM: f32 = 0.30;
+
+/// 递归 emit 的固定形态参数较多；八参均在用，重签名不值当（针对性抑制）。
+#[allow(clippy::too_many_arguments)]
 fn emit(
     page: &Page,
     fragment: &Fragment,
@@ -173,61 +256,114 @@ fn emit(
     scene: &mut Scene,
     pool: &mut HashMap<NodeId, usize>,
     highlights: &[LayoutRect],
+    canvas_source: Option<NodeId>,
 ) {
     let x = origin_x + fragment.border_box.x;
     let y = origin_y + fragment.border_box.y;
     let width = fragment.border_box.width;
     let height = fragment.border_box.height;
     let style = &fragment.style;
+    // 四角圆角解析为 px（CSS Backgrounds §5.5；全 0 保持直角旧路径）
+    let radii = resolve_corner_radii(style, width, height);
+    let rounded = radii != [0.0; 4];
+    // §14.2 传播是搬移：被传播的元素不再自绘背景（颜色与渐变）
+    let background_propagated = !fragment.anonymous && Some(fragment.node) == canvas_source;
 
     if !fragment.anonymous {
-        // 背景（透明跳过）
-        if style.background_color.a > 0 {
-            scene.commands.push(Command::FillRect {
+        // 背景色（透明跳过；有圆角走 FillRoundedRect，全 0 保持 FillRect）
+        if style.background_color.a > 0 && !background_propagated {
+            let rect = PaintRect {
+                x,
+                y,
+                width,
+                height,
+            };
+            let color = to_color(style.background_color);
+            if rounded {
+                scene
+                    .commands
+                    .push(Command::FillRoundedRect { rect, radii, color });
+            } else {
+                scene.commands.push(Command::FillRect { rect, color });
+            }
+        }
+        // 渐变背景（CSS Images §3.4，画在背景色之上）：渐变线端点按
+        // css-images-3 公式在 emit 前换算，radii 随 border_radius——单条
+        // 指令完成渐变 × 圆角。
+        if !background_propagated
+            && let BackgroundImageValue::LinearGradient(gradient) = &style.background_image
+        {
+            let (start, end) = linear_gradient_endpoints(gradient.angle, x, y, width, height);
+            let stops = gradient_stops(&gradient.stops);
+            if !stops.is_empty() {
+                scene.commands.push(Command::FillGradient {
+                    rect: PaintRect {
+                        x,
+                        y,
+                        width,
+                        height,
+                    },
+                    radii,
+                    start,
+                    end,
+                    stops,
+                });
+            }
+        }
+        // CSS 边框：画在边框盒内侧。四边宽度相等且有圆角 → 一条圆角描边
+        //（facade 内缩 `width/2`，带恰落在 [0, width]，颜色取 top——四边
+        // 异色记偏差）；否则四条填充带精确表达（宽 0 跳过；宽不等时圆角
+        // 降级直角——偏差）。
+        let border = fragment.border;
+        let colors = &style.border_color;
+        let uniform_border =
+            border.top == border.bottom && border.left == border.right && border.top == border.left;
+        if border.top > 0.0 && rounded && uniform_border {
+            scene.commands.push(Command::StrokeRoundedRect {
                 rect: PaintRect {
                     x,
                     y,
                     width,
                     height,
                 },
-                color: to_color(style.background_color),
+                radii,
+                color: to_color(colors.top),
+                width: border.top,
             });
-        }
-        // CSS 边框：画在边框盒内侧，用四条填充带精确表达（宽 0 跳过）
-        let border = fragment.border;
-        let colors = &style.border_color;
-        if border.top > 0.0 {
-            push_strip(scene, x, y, width, border.top, colors.top);
-        }
-        if border.bottom > 0.0 {
-            push_strip(
-                scene,
-                x,
-                y + height - border.bottom,
-                width,
-                border.bottom,
-                colors.bottom,
-            );
-        }
-        if border.left > 0.0 {
-            push_strip(
-                scene,
-                x,
-                y + border.top,
-                border.left,
-                height - border.top - border.bottom,
-                colors.left,
-            );
-        }
-        if border.right > 0.0 {
-            push_strip(
-                scene,
-                x + width - border.right,
-                y + border.top,
-                border.right,
-                height - border.top - border.bottom,
-                colors.right,
-            );
+        } else {
+            if border.top > 0.0 {
+                push_strip(scene, x, y, width, border.top, colors.top);
+            }
+            if border.bottom > 0.0 {
+                push_strip(
+                    scene,
+                    x,
+                    y + height - border.bottom,
+                    width,
+                    border.bottom,
+                    colors.bottom,
+                );
+            }
+            if border.left > 0.0 {
+                push_strip(
+                    scene,
+                    x,
+                    y + border.top,
+                    border.left,
+                    height - border.top - border.bottom,
+                    colors.left,
+                );
+            }
+            if border.right > 0.0 {
+                push_strip(
+                    scene,
+                    x + width - border.right,
+                    y + border.top,
+                    border.right,
+                    height - border.top - border.bottom,
+                    colors.right,
+                );
+            }
         }
     }
 
@@ -293,6 +429,10 @@ fn emit(
             if run.glyphs.is_empty() {
                 continue;
             }
+            // 文本装饰带（CSS Text Decor 3）：按 run 自身元素的 computed
+            // style（装饰不继承、规范的祖先「传播」未实现——css 层偏差；
+            // 跨行内元素边界按 run 分段断线），垫在本 run 文字之下。
+            push_text_decoration(page, run, content_x, baseline, scene);
             scene.commands.push(Command::DrawText {
                 glyphs: run
                     .glyphs
@@ -326,16 +466,321 @@ fn emit(
             );
         }
         // 行内原子盒（inline-block 等）：完整子片段树，x/y 已相对行顶定位，
-        // 按子片段递归（原点 = 本行顶）
-        for atomic in &line.boxes {
-            emit(page, atomic, content_x, line_y, scene, pool, highlights);
+        // 按子片段递归（原点 = 本行顶）；定位原子盒后画并按 z-index 排序
+        //（基础定序，同块级子盒）。
+        let (normal_atomic, positioned_atomic) = split_positioned(&line.boxes);
+        for atomic in normal_atomic {
+            emit(
+                page,
+                atomic,
+                content_x,
+                line_y,
+                scene,
+                pool,
+                highlights,
+                canvas_source,
+            );
+        }
+        for atomic in positioned_atomic {
+            emit(
+                page,
+                atomic,
+                content_x,
+                line_y,
+                scene,
+                pool,
+                highlights,
+                canvas_source,
+            );
         }
         line_offset += line.height;
     }
 
-    for child in &fragment.children {
-        emit(page, child, content_x, content_y, scene, pool, highlights);
+    // z-index 基础定序（CSS Position 3 §5 简化档）：普通流子片段先按文档
+    // 序 emit，定位子片段（position ≠ static）后按 z-index 整数升序 emit
+    //（auto 视作 0、相等保持文档序；完整 stacking context 留 K7）。
+    let (normal, positioned) = split_positioned(&fragment.children);
+    for child in normal {
+        emit(
+            page,
+            child,
+            content_x,
+            content_y,
+            scene,
+            pool,
+            highlights,
+            canvas_source,
+        );
     }
+    for child in positioned {
+        emit(
+            page,
+            child,
+            content_x,
+            content_y,
+            scene,
+            pool,
+            highlights,
+            canvas_source,
+        );
+    }
+}
+
+/// 把子片段分拣为（普通流，定位）：普通流保持文档序；定位元素（position
+/// ≠ static）按 `z-index` 整数升序**稳定**排序（auto 视作 0，相等保持
+/// 文档序）。
+fn split_positioned(children: &[Fragment]) -> (Vec<&Fragment>, Vec<&Fragment>) {
+    let mut normal = Vec::new();
+    let mut positioned: Vec<(&Fragment, i32)> = Vec::new();
+    for child in children {
+        if child.style.position == PositionValue::Static {
+            normal.push(child);
+        } else {
+            positioned.push((child, z_index_key(&child.style)));
+        }
+    }
+    positioned.sort_by_key(|&(_, z)| z);
+    let positioned = positioned
+        .into_iter()
+        .map(|(fragment, _)| fragment)
+        .collect();
+    (normal, positioned)
+}
+
+/// `z-index` 的定序键：`auto` 与 `0` 同序（基础定序档，无 stacking context）。
+fn z_index_key(style: &ComputedStyle) -> i32 {
+    match style.z_index {
+        ZIndexValue::Auto => 0,
+        ZIndexValue::Integer(z) => z,
+    }
+}
+
+/// 为一个文本 run 下发装饰带（`FillRect`，垫在文字下）。
+///
+/// 装饰属性取 run 自身元素的 computed style：非 solid 不画（偏差）；颜色
+/// 透明不画；带顶相对基线按 [`UNDERLINE_OFFSET_EM`] 等经验度量；带 x 范围
+/// 为该 run 字形的实际横向覆盖（与命中测试同一口径）。度量为经验值、无
+/// 字体 underline 数据（T0 报告 F11，记偏差）。
+fn push_text_decoration(
+    page: &Page,
+    run: &TextRun,
+    content_x: f32,
+    baseline: f32,
+    scene: &mut Scene,
+) {
+    let Some(style) = page.styles.get(&run.node) else {
+        return;
+    };
+    if style.text_decoration_style != TextDecorationStyleValue::Solid {
+        return;
+    }
+    let offset_em = match style.text_decoration_line {
+        TextDecorationLineValue::None => return,
+        TextDecorationLineValue::Underline => UNDERLINE_OFFSET_EM,
+        TextDecorationLineValue::Overline => -OVERLINE_OFFSET_EM,
+        TextDecorationLineValue::LineThrough => -LINE_THROUGH_OFFSET_EM,
+    };
+    if style.text_decoration_color.a == 0 {
+        return;
+    }
+    let size = run.style.size;
+    let thickness = size * DECORATION_THICKNESS_EM;
+    if !(thickness.is_finite() && thickness > 0.0) {
+        return;
+    }
+    let Some(first) = run.glyphs.first() else {
+        return;
+    };
+    let Some(last) = run.glyphs.last() else {
+        return;
+    };
+    let start = content_x + first.x;
+    let width = (last.x + last.advance) - first.x;
+    if !(width.is_finite() && width > 0.0) {
+        return;
+    }
+    scene.commands.push(Command::FillRect {
+        rect: PaintRect {
+            x: start,
+            y: baseline + size * offset_em,
+            width,
+            height: thickness,
+        },
+        color: to_color(style.text_decoration_color),
+    });
+}
+
+/// 把 computed 的四角圆角解析为 px 半径 `[左上, 右上, 右下, 左下]`。
+///
+/// - `Length(px)` 直取；`Percent` 按边框盒对应轴折算（水平÷宽、垂直÷高）后
+///   取两轴**较小**分量——paint 只有圆形角，取较小分量保证角不出盒
+///   （50% 在任意盒上退化为药丸半高；椭圆角记偏差）；
+/// - `Viewport` 仅在调用方未以视口 recascade 时残留，按 0 降级（直角）；
+/// - 负值与非有限按 0 处理（渲染为直角，与 paint 层防御一致）。
+fn resolve_corner_radii(style: &ComputedStyle, width: f32, height: f32) -> [f32; 4] {
+    fn one(value: BorderRadiusValue, width: f32, height: f32) -> f32 {
+        let radius = match value {
+            BorderRadiusValue::Length(px) => px,
+            BorderRadiusValue::Percent(p) => (p * width).min(p * height),
+            BorderRadiusValue::Viewport(..) => 0.0,
+        };
+        if radius.is_finite() && radius > 0.0 {
+            radius
+        } else {
+            0.0
+        }
+    }
+    let corners = &style.border_radius;
+    [
+        one(corners.top_left, width, height),
+        one(corners.top_right, width, height),
+        one(corners.bottom_right, width, height),
+        one(corners.bottom_left, width, height),
+    ]
+}
+
+/// css-images-3 线性渐变线端点：角度自北顺时针（0 = to top），渐变线过盒
+/// 中心、长度 `|W·sinα| + |H·cosα|`（CSS Images 3 §3.3.4 图式），两端关于
+/// 中心对称。返回 `(start, end)` 场景坐标；`angle_deg` 非有限按 180
+///（to bottom）降级。
+fn linear_gradient_endpoints(
+    angle_deg: f32,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+) -> ([f32; 2], [f32; 2]) {
+    let angle = if angle_deg.is_finite() {
+        angle_deg
+    } else {
+        180.0
+    };
+    let center_x = x + width / 2.0;
+    let center_y = y + height / 2.0;
+    // 渐变方向单位向量：0° 向上（y 轴向下为正的屏幕坐标系）。四正向
+    // （rem_euclid 后恰为 0/90/180/270）走精确轴向量与精确线长——f32
+    // 三角函数在 90° 带 ~4e-6 噪声，最常用方向的渐变线必须严格水平
+    // /垂直，端点才确定。
+    let (dx, dy, length) = match angle.rem_euclid(360.0) {
+        0.0 => (0.0, -1.0, height.abs()),
+        90.0 => (1.0, 0.0, width.abs()),
+        180.0 => (0.0, 1.0, height.abs()),
+        270.0 => (-1.0, 0.0, width.abs()),
+        _ => {
+            let alpha = angle.to_radians();
+            let (sin, cos) = alpha.sin_cos();
+            (sin, -cos, (width * sin).abs() + (height * cos).abs())
+        }
+    };
+    (
+        [center_x - dx * length / 2.0, center_y - dy * length / 2.0],
+        [center_x + dx * length / 2.0, center_y + dy * length / 2.0],
+    )
+}
+
+/// css 色标 → paint 色标（offset 透传，颜色经非预乘 RGBA 转换）。
+fn gradient_stops(stops: &[GradientColorStop]) -> Vec<GradientStop> {
+    stops
+        .iter()
+        .map(|stop| GradientStop {
+            offset: stop.position,
+            color: to_color(stop.color),
+        })
+        .collect()
+}
+
+/// 元素是否携带可见背景（颜色不透明度 > 0 或渐变）——§14.2 传播判定用。
+fn has_background(style: &ComputedStyle) -> bool {
+    style.background_color.a > 0
+        || matches!(
+            style.background_image,
+            BackgroundImageValue::LinearGradient(_)
+        )
+}
+
+/// 按 HTML 命名空间的标签名找文档中首个元素（html5ever 强制存在 html/body）。
+fn find_html_element(page: &Page, name: &str) -> Option<NodeId> {
+    use nexty_dom::{Namespace, NodeKind};
+    fn walk(page: &Page, node: NodeId, name: &str) -> Option<NodeId> {
+        if let Some(NodeKind::Element(data)) = page.document.node(node)
+            && data.namespace == Namespace::Html
+            && data.name == name
+        {
+            return Some(node);
+        }
+        page.document
+            .children(node)
+            .find_map(|child| walk(page, child, name))
+    }
+    walk(page, page.document.root(), name)
+}
+
+/// CSS 2.2 §14.2 的画布背景传播源：html 携带背景用 html，否则 body，
+/// 都无返回 `None`（画布回落白）。
+#[must_use]
+pub fn canvas_background_source(page: &Page) -> Option<NodeId> {
+    if let Some(html) = find_html_element(page, "html")
+        && page.styles.get(&html).is_some_and(has_background)
+    {
+        return Some(html);
+    }
+    if let Some(body) = find_html_element(page, "body")
+        && page.styles.get(&body).is_some_and(has_background)
+    {
+        return Some(body);
+    }
+    None
+}
+
+/// 画布底色指令（CSS 2.2 §14.2 背景传播），供呈现层插到场景**底部**。
+///
+/// - html/body 均无背景 → 一条白色 `FillRect`（画布必须不透明：透明像素
+///   直接 blit 给 surface 在部分后端表现为黑屏/花屏）；
+/// - 传播源只有纯色 → 一条该色 `FillRect`；
+/// - 传播源带渐变 → 先垫一条底色（传播色不透明时用它，否则白——保证
+///   渐变透明色标不露出未初始化画布），再一条铺满视口的 `FillGradient`
+///   （渐变线按**视口矩形**解析：传播到画布的背景按画布尺寸取值）。
+///
+/// 被传播元素的自身背景由 emit 抑制（搬移语义，见 [`emit`]）。
+#[must_use]
+pub fn canvas_background_commands(
+    page: &Page,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> Vec<Command> {
+    let rect = PaintRect {
+        x: 0.0,
+        y: 0.0,
+        width: viewport_width,
+        height: viewport_height,
+    };
+    let white = Color::opaque(0xff, 0xff, 0xff);
+    let Some(source) = canvas_background_source(page) else {
+        return vec![Command::FillRect { rect, color: white }];
+    };
+    // 传播源必有 computed style（级联覆盖全部元素）
+    let style = &page.styles[&source];
+    let base = if style.background_color.a > 0 {
+        to_color(style.background_color)
+    } else {
+        white
+    };
+    let mut commands = vec![Command::FillRect { rect, color: base }];
+    if let BackgroundImageValue::LinearGradient(gradient) = &style.background_image {
+        let (start, end) =
+            linear_gradient_endpoints(gradient.angle, 0.0, 0.0, viewport_width, viewport_height);
+        let stops = gradient_stops(&gradient.stops);
+        if !stops.is_empty() {
+            commands.push(Command::FillGradient {
+                rect,
+                radii: [0.0; 4],
+                start,
+                end,
+                stops,
+            });
+        }
+    }
+    commands
 }
 
 /// `node` 是否为 HTML 命名空间的 `<img>`（块级替换路径的判定）。
@@ -796,5 +1241,456 @@ mod tests {
         assert!(!coalescer.take(), "take 后标志复位");
         coalescer.on_resized();
         assert!(coalescer.take());
+    }
+
+    // ---- K2 T3：圆角 / 渐变 / 装饰带 / z-index / 背景传播 ----
+
+    use nexty_css::{Corners, ViewportUnit};
+
+    /// 渐变线端点：css-images-3 公式 `|W·sinα| + |H·cosα|`，四正向端点
+    /// 方向、对角 45° 线长与非有限角度降级。
+    #[test]
+    fn linear_gradient_endpoints_follow_css_images_formula() {
+        // 0°（to top）：线长 = H，起点在下、终点在上
+        let (start, end) = linear_gradient_endpoints(0.0, 10.0, 20.0, 100.0, 50.0);
+        assert_eq!(start, [60.0, 70.0]);
+        assert_eq!(end, [60.0, 20.0]);
+        // 90°（to right）：线长 = W，起点在左、终点在右
+        let (start, end) = linear_gradient_endpoints(90.0, 10.0, 20.0, 100.0, 50.0);
+        assert_eq!(start, [10.0, 45.0]);
+        assert_eq!(end, [110.0, 45.0]);
+        // 180°（to bottom，缺省角）：起点在上、终点在下
+        let (start, end) = linear_gradient_endpoints(180.0, 10.0, 20.0, 100.0, 50.0);
+        assert_eq!(start, [60.0, 20.0]);
+        assert_eq!(end, [60.0, 70.0]);
+        // 270°（to left）：起点在右、终点在左
+        let (start, end) = linear_gradient_endpoints(270.0, 10.0, 20.0, 100.0, 50.0);
+        assert_eq!(start, [110.0, 45.0]);
+        assert_eq!(end, [10.0, 45.0]);
+        // 45°：L = W·sin45 + H·cos45；方形盒端点落在对角上
+        let (start, end) = linear_gradient_endpoints(45.0, 0.0, 0.0, 100.0, 100.0);
+        assert!((start[0] - 0.0).abs() < 1e-4 && (start[1] - 100.0).abs() < 1e-4);
+        assert!((end[0] - 100.0).abs() < 1e-4 && (end[1] - 0.0).abs() < 1e-4);
+        // 非有限角度降级 180（to bottom）
+        let (start, end) = linear_gradient_endpoints(f32::NAN, 0.0, 0.0, 100.0, 50.0);
+        assert_eq!(start, [50.0, 0.0]);
+        assert_eq!(end, [50.0, 50.0]);
+    }
+
+    /// 圆角解析：Length 直取、Percent 两轴取小、Viewport 残留降级 0、
+    /// 负值与非有限钳 0。
+    #[test]
+    fn corner_radii_resolve_length_percent_and_viewport_fallback() {
+        let mut style = ComputedStyle::initial();
+        style.border_radius = Corners::splat(BorderRadiusValue::Length(10.0));
+        assert_eq!(resolve_corner_radii(&style, 800.0, 200.0), [10.0; 4]);
+
+        // 50% @800×200：水平 400、垂直 100 → 取较小分量（药丸半高）
+        style.border_radius = Corners::splat(BorderRadiusValue::Percent(0.5));
+        assert_eq!(resolve_corner_radii(&style, 800.0, 200.0), [100.0; 4]);
+
+        // 视口单位残留（未 recascade）→ 0 降级直角
+        style.border_radius = Corners::splat(BorderRadiusValue::Viewport(2.0, ViewportUnit::Vw));
+        assert_eq!(resolve_corner_radii(&style, 800.0, 200.0), [0.0; 4]);
+
+        style.border_radius = Corners::splat(BorderRadiusValue::Length(f32::NAN));
+        assert_eq!(resolve_corner_radii(&style, 800.0, 200.0), [0.0; 4]);
+        style.border_radius = Corners::splat(BorderRadiusValue::Length(-5.0));
+        assert_eq!(resolve_corner_radii(&style, 800.0, 200.0), [0.0; 4]);
+    }
+
+    /// 布局一页并构建场景的测试辅助。
+    fn scene_of(html: &str) -> Scene {
+        let page = load_page(html, "");
+        let shaper = nexty_text::ParleyTextShaper::new();
+        let root = layout_page(&page, &shaper, 400.0).expect("root");
+        build_scene(&page, &root)
+    }
+
+    /// 渐变背景发 FillGradient：to right 端点从左到右、色标映射正确、
+    /// 渐变线过盒中心。
+    #[test]
+    fn gradient_background_emits_fill_gradient_with_stops() {
+        let scene = scene_of(
+            "<body><div style=\"background-image: linear-gradient(to right, red, blue); height: 40px\"></div></body>",
+        );
+        let gradients: Vec<_> = scene
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::FillGradient {
+                    rect,
+                    start,
+                    end,
+                    stops,
+                    ..
+                } => Some((*rect, *start, *end, stops.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gradients.len(), 1, "恰一条 FillGradient");
+        let (rect, start, end, stops) = &gradients[0];
+        assert!(start[0] < end[0], "to right 起点在左终点在右");
+        assert_eq!(start[1], end[1], "to right 渐变线水平");
+        assert_eq!(stops.len(), 2);
+        assert_eq!(stops[0].offset, 0.0);
+        assert_eq!(stops[0].color, Color::opaque(255, 0, 0));
+        assert_eq!(stops[1].offset, 1.0);
+        assert_eq!(stops[1].color, Color::opaque(0, 0, 255));
+        let center_x = rect.x + rect.width / 2.0;
+        assert_eq!((start[0] + end[0]) / 2.0, center_x, "渐变线过盒中心");
+    }
+
+    /// 渐变 × 圆角单指令：radii 随 border_radius，不另发圆角纯色背景。
+    #[test]
+    fn gradient_with_radius_is_single_command() {
+        let scene = scene_of(
+            "<body><div style=\"background-image: linear-gradient(45deg, red, blue); border-radius: 12px; height: 40px\"></div></body>",
+        );
+        assert!(
+            !scene
+                .commands
+                .iter()
+                .any(|command| matches!(command, Command::FillRoundedRect { .. })),
+            "背景色透明时不发纯色圆角指令"
+        );
+        let gradients: Vec<_> = scene
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::FillGradient { radii, .. } => Some(*radii),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gradients, vec![[12.0; 4]], "渐变 radii 随 border_radius");
+    }
+
+    /// 有圆角背景走 FillRoundedRect；全 0 半径保持 FillRect 旧路径。
+    #[test]
+    fn rounded_background_uses_fill_rounded_rect_zero_radius_keeps_fill_rect() {
+        let scene = scene_of(
+            "<body>\
+             <div style=\"background-color: red; border-radius: 10px; height: 30px\"></div>\
+             <div style=\"background-color: blue; height: 30px\"></div>\
+             </body>",
+        );
+        let rounded: Vec<_> = scene
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::FillRoundedRect { radii, color, .. } => Some((*radii, *color)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rounded, vec![([10.0; 4], Color::opaque(255, 0, 0))]);
+        assert!(
+            scene.commands.iter().any(|command| matches!(
+                command,
+                Command::FillRect { color, .. } if *color == Color::opaque(0, 0, 255)
+            )),
+            "无圆角 div 保持 FillRect 旧路径"
+        );
+    }
+
+    /// 四边等宽 + 圆角 → 一条圆角描边；宽不等维持四条填充带（直角降级）。
+    #[test]
+    fn uniform_borders_use_stroke_rounded_rect_unequal_keep_strips() {
+        let scene = scene_of(
+            "<body>\
+             <div style=\"border: 4px solid black; border-radius: 8px; height: 30px\"></div>\
+             <div style=\"border-style: solid; border-width: 2px 4px; border-radius: 8px; height: 30px\"></div>\
+             </body>",
+        );
+        let strokes: Vec<_> = scene
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::StrokeRoundedRect { radii, width, .. } => Some((*radii, *width)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(strokes, vec![([8.0; 4], 4.0)], "等宽圆角边框一条描边");
+        let black_strips = scene
+            .commands
+            .iter()
+            .filter(|command| {
+                matches!(
+                    command,
+                    Command::FillRect { color, .. } if *color == Color::opaque(0, 0, 0)
+                )
+            })
+            .count();
+        assert_eq!(black_strips, 4, "宽不等时四条直角填充带");
+    }
+
+    /// 场景中某色首个 `FillRect` 的下标。
+    fn fill_index(scene: &Scene, color: Color) -> Option<usize> {
+        scene.commands.iter().position(
+            |command| matches!(command, Command::FillRect { color: c, .. } if *c == color),
+        )
+    }
+
+    /// z-index 基础定序：定位元素画在普通流之后、定位兄弟按整数升序。
+    #[test]
+    fn z_index_orders_positioned_after_static_sorted_by_integer() {
+        let scene = scene_of(
+            "<body style=\"margin: 0\">\
+             <div style=\"background-color: red; height: 20px\"></div>\
+             <div style=\"position: absolute; z-index: 2; background-color: green; height: 20px\"></div>\
+             <div style=\"position: absolute; z-index: 1; background-color: blue; height: 20px\"></div>\
+             <div style=\"position: absolute; z-index: -1; background-color: yellow; height: 20px\"></div>\
+             <div style=\"background-color: white; height: 20px\"></div>\
+             </body>",
+        );
+        let red = fill_index(&scene, Color::opaque(255, 0, 0)).expect("普通流红");
+        let white = fill_index(&scene, Color::opaque(255, 255, 255)).expect("普通流白");
+        let green = fill_index(&scene, Color::opaque(0, 128, 0)).expect("z=2 绿");
+        let blue = fill_index(&scene, Color::opaque(0, 0, 255)).expect("z=1 蓝");
+        let yellow = fill_index(&scene, Color::opaque(255, 255, 0)).expect("z=-1 黄");
+        assert!(red < yellow && white < yellow, "定位元素画在普通流之后");
+        assert!(yellow < blue && blue < green, "定位兄弟按 z-index 升序");
+    }
+
+    /// 选区高亮插入次序回归：高亮在背景之上、文字之下。
+    #[test]
+    fn selection_highlight_stays_between_background_and_text() {
+        let page = load_page(
+            "<body style=\"margin: 0\"><div style=\"background-color: rgb(0, 0, 255); min-height: 100px\"><p style=\"margin: 0\">hello</p></div></body>",
+            "",
+        );
+        let shaper = nexty_text::ParleyTextShaper::new();
+        let root = layout_page(&page, &shaper, 400.0).expect("root");
+        let highlights = [LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 400.0,
+            height: 300.0,
+        }];
+        let scene = build_scene_at_with_highlights(&page, &root, 0.0, 0.0, &highlights);
+        let background = fill_index(&scene, Color::opaque(0, 0, 255)).expect("div 背景");
+        let highlight = scene
+            .commands
+            .iter()
+            .position(|command| matches!(command, Command::FillRect { color, .. } if *color == SELECTION_COLOR))
+            .expect("选区高亮");
+        let text = scene
+            .commands
+            .iter()
+            .position(|command| matches!(command, Command::DrawText { .. }))
+            .expect("文本命令");
+        assert!(background < highlight, "高亮在背景之上");
+        assert!(highlight < text, "高亮在文字之下");
+    }
+
+    /// 画布背景传播源：html 优先、body 回落、都无回落白。
+    #[test]
+    fn canvas_background_prefers_html_then_body_falls_back_to_white() {
+        let page = load_page(
+            "<html style=\"background-color: blue\"><body style=\"background-color: green\"></body></html>",
+            "",
+        );
+        let canvas = canvas_background_commands(&page, 400.0, 300.0);
+        assert!(
+            matches!(
+                &canvas[..],
+                [Command::FillRect { color, .. }] if *color == Color::opaque(0, 0, 255)
+            ),
+            "html 背景优先传播"
+        );
+
+        let page = load_page("<body style=\"background-color: green\"></body>", "");
+        let canvas = canvas_background_commands(&page, 400.0, 300.0);
+        assert!(
+            matches!(
+                &canvas[..],
+                [Command::FillRect { color, .. }] if *color == Color::opaque(0, 128, 0)
+            ),
+            "html 无背景时 body 回落"
+        );
+
+        let page = load_page("<body></body>", "");
+        let canvas = canvas_background_commands(&page, 400.0, 300.0);
+        assert!(
+            matches!(
+                &canvas[..],
+                [Command::FillRect { color, .. }] if *color == Color::opaque(255, 255, 255)
+            ),
+            "都无背景回落白"
+        );
+    }
+
+    /// 渐变背景传播：垫底色 + 铺满视口的 FillGradient（渐变线按视口矩形）。
+    #[test]
+    fn canvas_gradient_propagates_as_viewport_fill_gradient() {
+        let page = load_page(
+            "<body style=\"background-image: linear-gradient(to right, red, blue)\"></body>",
+            "",
+        );
+        let canvas = canvas_background_commands(&page, 400.0, 300.0);
+        assert_eq!(canvas.len(), 2, "垫底色 + 渐变两条指令");
+        assert!(
+            matches!(
+                &canvas[0],
+                Command::FillRect { color, .. } if *color == Color::opaque(255, 255, 255)
+            ),
+            "传播色透明时垫白"
+        );
+        let Command::FillGradient {
+            rect,
+            start,
+            end,
+            stops,
+            ..
+        } = &canvas[1]
+        else {
+            panic!("第二条应是渐变");
+        };
+        assert_eq!(rect.width, 400.0);
+        assert_eq!(rect.height, 300.0);
+        assert!(start[0] < end[0]);
+        assert_eq!(stops.len(), 2);
+    }
+
+    /// 传播是搬移：body 背景被传播后场景中不再自绘；html 携带背景时
+    /// body 背景不被传播、仍自绘。
+    #[test]
+    fn propagated_background_is_suppressed_on_fragment() {
+        let page = load_page(
+            "<body style=\"background-color: green\"><p style=\"margin: 0\">x</p></body>",
+            "",
+        );
+        let shaper = nexty_text::ParleyTextShaper::new();
+        let root = layout_page(&page, &shaper, 400.0).expect("root");
+        let scene = build_scene(&page, &root);
+        assert!(
+            scene.commands.iter().all(|command| !matches!(
+                command,
+                Command::FillRect { color, .. } if *color == Color::opaque(0, 128, 0)
+            )),
+            "被传播的 body 背景不再自绘"
+        );
+
+        let page = load_page(
+            "<html style=\"background-color: blue\"><body style=\"background-color: green\"><p style=\"margin: 0\">x</p></body></html>",
+            "",
+        );
+        let root = layout_page(&page, &shaper, 400.0).expect("root");
+        let scene = build_scene(&page, &root);
+        assert!(
+            scene.commands.iter().any(|command| matches!(
+                command,
+                Command::FillRect { color, .. } if *color == Color::opaque(0, 128, 0)
+            )),
+            "body 背景未被传播时仍自绘"
+        );
+        assert!(
+            scene.commands.iter().all(|command| !matches!(
+                command,
+                Command::FillRect { color, .. } if *color == Color::opaque(0, 0, 255)
+            )),
+            "html 背景被传播后不再自绘"
+        );
+    }
+
+    /// 场景中某色首个非黑装饰带（带高 = 0.06em）的下标与几何。
+    fn decoration_band(scene: &Scene) -> Option<PaintRect> {
+        scene.commands.iter().find_map(|command| match command {
+            Command::FillRect { rect, color }
+                if *color == Color::opaque(0, 0, 0) && (rect.height - 0.96).abs() < 1e-3 =>
+            {
+                Some(*rect)
+            }
+            _ => None,
+        })
+    }
+
+    /// 装饰带几何：厚度 0.06em、underline 带顶 = 基线 + 0.08em、x 覆盖
+    /// run 字形横向范围；overline / line-through 按经验偏移。
+    #[test]
+    fn decoration_band_geometry_follows_run_baseline() {
+        let scene = scene_of(
+            "<body style=\"margin: 0\"><p style=\"margin: 0; text-decoration: underline\">hello</p></body>",
+        );
+        let band = decoration_band(&scene).expect("underline 装饰带");
+        assert!(
+            (band.height - 16.0 * 0.06).abs() < 1e-3,
+            "厚度 0.06em @16px"
+        );
+        let baseline = scene
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::DrawText { baseline, .. } => Some(*baseline),
+                _ => None,
+            })
+            .expect("文本命令");
+        assert!(
+            (band.y - (baseline + 16.0 * 0.08)).abs() < 1e-3,
+            "带顶 = 基线 + 0.08em"
+        );
+        // 装饰带垫在文字下：带下标早于本 run 的 DrawText
+        let band_index = scene
+            .commands
+            .iter()
+            .position(|command| matches!(command, Command::FillRect { rect, .. } if *rect == band))
+            .expect("带下标");
+        let text_index = scene
+            .commands
+            .iter()
+            .position(|command| matches!(command, Command::DrawText { .. }))
+            .expect("文本下标");
+        assert!(band_index < text_index, "装饰带垫在文字下");
+
+        for (decoration, offset_em) in [("overline", -0.88), ("line-through", -0.30)] {
+            let scene = scene_of(&format!(
+                "<body style=\"margin: 0\"><p style=\"margin: 0; text-decoration: {decoration}\">hello</p></body>"
+            ));
+            let band = decoration_band(&scene).unwrap_or_else(|| panic!("{decoration} 装饰带"));
+            let baseline = scene
+                .commands
+                .iter()
+                .find_map(|command| match command {
+                    Command::DrawText { baseline, .. } => Some(*baseline),
+                    _ => None,
+                })
+                .expect("文本命令");
+            assert!(
+                (band.y - (baseline + 16.0 * offset_em)).abs() < 1e-3,
+                "{decoration} 带顶 = 基线 {offset_em}em"
+            );
+        }
+    }
+
+    /// 非 solid（wavy）与透明装饰色不画（渲染仅 solid——偏差）。
+    #[test]
+    fn decoration_skipped_for_non_solid_and_transparent() {
+        let scene = scene_of(
+            "<body style=\"margin: 0\"><p style=\"margin: 0; text-decoration: underline wavy\">hello</p></body>",
+        );
+        assert!(decoration_band(&scene).is_none(), "wavy 不按 solid 画");
+        let scene = scene_of(
+            "<body style=\"margin: 0\"><p style=\"margin: 0; text-decoration: underline; text-decoration-color: transparent\">hello</p></body>",
+        );
+        assert!(decoration_band(&scene).is_none(), "透明装饰色不画");
+    }
+
+    /// M6 回归（新指令）：缓存场景经 `translated` 与直接以该 origin 构建
+    /// 的场景逐字节一致（渐变端点 / 圆角 / 装饰带全部随平移）。
+    #[test]
+    fn translated_matches_direct_build_with_new_commands() {
+        let page = load_page(
+            "<body style=\"margin: 0\">\
+             <div style=\"background-image: linear-gradient(45deg, red, blue); border-radius: 12px; border: 3px solid black; height: 40px\">\
+             <p style=\"margin: 0; text-decoration: underline\">hello</p>\
+             </div></body>",
+            "",
+        );
+        let shaper = nexty_text::ParleyTextShaper::new();
+        let root = layout_page(&page, &shaper, 400.0).expect("root");
+        let mut cache = SceneCache::new();
+        let page_scene = cache.scene_for(1, &page, &root, 400.0, &[]);
+        let translated = page_scene.translated(0.0, 48.0);
+        let direct = build_scene_at_with_highlights(&page, &root, 0.0, 48.0, &[]);
+        assert_eq!(format!("{translated:?}"), format!("{direct:?}"));
     }
 }

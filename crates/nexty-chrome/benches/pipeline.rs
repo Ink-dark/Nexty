@@ -44,6 +44,15 @@ const RESIZE_COUNT: usize = 20;
 const RESIZE_EVENTS_PER_FRAME: usize = 4;
 const SCROLL_FRAMES: usize = 50;
 
+/// CI 可用 `BENCH_SCROLL_FRAMES` 覆盖滚动风暴帧数（全页光栅每帧 10s+，
+/// CI 用小帧数控成本；0 = 跳过滚动风暴）。缺省 50（本地基线口径）。
+fn scroll_frames() -> usize {
+    std::env::var("BENCH_SCROLL_FRAMES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SCROLL_FRAMES)
+}
+
 /// 首屏各阶段耗时（ms）。
 #[derive(Debug, Default, Clone, Copy)]
 struct StageMs {
@@ -196,11 +205,11 @@ impl Corpus {
         )
     }
 
-    /// 滚动风暴（M6 场景缓存后语义）：同一布局下 `SCROLL_FRAMES` 个滚动
+    /// 滚动风暴（M6 场景缓存后语义）：同一布局下 `frames` 个滚动
     /// 偏移经 [`pipeline::SceneCache`] 取页面坐标系场景（首帧后零 emit），
     /// emit 阶段 = 缓存命中 + [`nexty_paint::Scene::translated`] origin
     /// 平移。返回（平移中位数 ms，rasterize 中位数 ms，emit 次数）。
-    fn scroll_storm(&self, shaper: &CountingShaper) -> (f64, f64, usize) {
+    fn scroll_storm(&self, shaper: &CountingShaper, frames: usize) -> (f64, f64, usize) {
         let document = nexty_html::parse_document(&self.html, ParseOptions::default());
         let sheet = Stylesheet::parse(&self.css);
         let mut page = pipeline::build_page(document, vec![sheet], self.images.clone());
@@ -217,7 +226,7 @@ impl Corpus {
         let rasterizer = VelloCpuRasterizer::new();
         let mut emit_samples = Vec::new();
         let mut raster_samples = Vec::new();
-        for frame in 0..SCROLL_FRAMES {
+        for frame in 0..frames {
             // 确定性偏移：137 步长在典型页高上打满全程
             let scroll = if max_scroll > 0.0 {
                 ((frame as u64) * 137) % (max_scroll as u64) + 1
@@ -259,6 +268,7 @@ fn run() {
         Corpus::new("image-heavy", image_heavy_html(), ""),
     ];
 
+    let frames = scroll_frames();
     for corpus in &corpora {
         // 首屏：阶段计时 + 单次布局的整形调用数（独立计数窗口）
         let stages = corpus.first_load(&shaper);
@@ -274,12 +284,26 @@ fn run() {
         pipeline::recascade(&mut page, VIEWPORT);
         shaper.reset();
         let _ = pipeline::layout_page(&page, &shaper, VIEWPORT.width).expect("layout");
+        let (single_shapes, single_metrics) = (shaper.shape_calls(), shaper.metrics_calls());
         println!(
             "[{}] single layout shaping: shape {} calls / {chunks} chunks = {:.2}x, metrics {} calls",
             corpus.name,
-            shaper.shape_calls(),
-            shaper.shape_calls() as f64 / chunks.max(1) as f64,
-            shaper.metrics_calls(),
+            single_shapes,
+            single_shapes as f64 / chunks.max(1) as f64,
+            single_metrics,
+        );
+        // 机器无关断言（回归陷阱，破坏即 bench 非零退出——CI 据此翻红）：
+        // 单次布局整形 ≈1×chunks（H4 逐 chunk 缓存）、metrics 探针 ≤10
+        // （布局级 MetricsCache——基线 text-heavy 10 / rules 1 / image 1）。
+        assert!(
+            single_shapes <= chunks + 1,
+            "[{}] shaping cache regression: {single_shapes} shape calls for {chunks} chunks (expect ≈1.0x)",
+            corpus.name
+        );
+        assert!(
+            single_metrics <= 10,
+            "[{}] metrics cache regression: {single_metrics} probe calls (expect ≤10)",
+            corpus.name
         );
 
         let (per_frame, runs, _events, shapes, metricses, total_events) =
@@ -290,12 +314,32 @@ fn run() {
             RESIZE_EVENTS_PER_FRAME,
             shapes as f64 / chunks.max(1) as f64,
         );
-
-        let (emit, raster, emits) = corpus.scroll_storm(&shaper);
-        println!(
-            "[{}] scroll storm: {SCROLL_FRAMES} frames, emit count {emits} (must be 0 after initial build), translate median {emit:.3} ms, rasterize median {raster:.1} ms",
-            corpus.name,
+        // resize 合帧断言（M6）：管线执行数 = 事件数 / 每帧事件比。
+        assert_eq!(
+            runs,
+            RESIZE_COUNT / RESIZE_EVENTS_PER_FRAME,
+            "[{}] resize coalescing regression: {runs} pipeline runs for {total_events} events",
+            corpus.name
         );
+
+        if frames == 0 {
+            println!(
+                "[{}] scroll storm: skipped (BENCH_SCROLL_FRAMES=0)",
+                corpus.name
+            );
+        } else {
+            let (emit, raster, emits) = corpus.scroll_storm(&shaper, frames);
+            println!(
+                "[{}] scroll storm: {frames} frames, emit count {emits} (must be 0 after initial build), translate median {emit:.3} ms, rasterize median {raster:.1} ms",
+                corpus.name,
+            );
+            // 场景缓存断言（M6）：首帧构建后统计窗口内 emit 必须为 0。
+            assert_eq!(
+                emits, 0,
+                "[{}] scene cache regression: {emits} emits after initial build",
+                corpus.name
+            );
+        }
     }
 }
 

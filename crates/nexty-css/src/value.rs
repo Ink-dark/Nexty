@@ -14,8 +14,19 @@
 //! 相对单位、`currentcolor`、`color-mix()` 等函数色、`display` 的多关键字
 //! 语法与 ruby 内部盒、`var()` 均视为无效声明（浏览器会接受其中的合法值）。
 //! 视口单位（`vw`/`vh`/`vmin`/`vmax`）只在盒级长度属性（width/height/min/max、
-//! inset、margin、padding、gap）上接受；`font-size` / `border-width` /
-//! `line-height` 上的视口单位视为无效声明。
+//! inset、margin、padding、gap、border-radius）上接受；`font-size` /
+//! `border-width` / `line-height` 上的视口单位视为无效声明。
+//!
+//! K2 绘制扩展基础档（记偏差）：`text-decoration-line` 只认单关键字
+//! （多关键字空格列表与 `blink` 不识别）；`text-decoration-style` 解析存储、
+//! 渲染只画 solid；`text-decoration` 简写不识别 thickness 成分；
+//! `border-radius` 的 `/` 椭圆语法不识别；`linear-gradient` 只认角度
+//! （deg/grad/rad/turn）与 `to left/right/top/bottom`（对角 corner 不识别），
+//! 色标位置仅百分比（长度位置、双位置不识别），位置按简化档解析——显式
+//! 位置 clamp 到 [0,1] 且保证非递减、未指定位置在两侧已定值间均匀分布
+//! （完整 gradient-line fixup 记偏差）；`background-image` 不认 url() 与
+//! 多重背景；`background` 简写只认 image + color 成分（position/size/
+//! repeat/attachment/origin/clip 成分整条无效）。
 //! `font` 简写里无对应 longhand 的成分——`<font-variant-css2>`（`small-caps`）
 //! 与 `<font-width-css3>`（宽度关键字/百分比）——按语法接受后丢弃（无渲染
 //! 效果但声明不整体失效）；系统字体关键字（`caption` / `menu` 等）整条无效。
@@ -124,6 +135,10 @@ pub enum PropertyId {
     FlexBasis,
     /// `position`。
     Position,
+    /// `float`。
+    Float,
+    /// `clear`。
+    Clear,
     /// `top`。
     Top,
     /// `right`。
@@ -194,6 +209,24 @@ pub enum PropertyId {
     BorderBottomColor,
     /// `border-left-color`。
     BorderLeftColor,
+    /// `text-decoration-line`。
+    TextDecorationLine,
+    /// `text-decoration-style`。
+    TextDecorationStyle,
+    /// `text-decoration-color`。
+    TextDecorationColor,
+    /// `z-index`。
+    ZIndex,
+    /// `background-image`。
+    BackgroundImage,
+    /// `border-top-left-radius`。
+    BorderTopLeftRadius,
+    /// `border-top-right-radius`。
+    BorderTopRightRadius,
+    /// `border-bottom-right-radius`。
+    BorderBottomRightRadius,
+    /// `border-bottom-left-radius`。
+    BorderBottomLeftRadius,
 }
 
 impl PropertyId {
@@ -228,6 +261,8 @@ impl PropertyId {
             PropertyId::FlexGrow => "flex-grow",
             PropertyId::FlexBasis => "flex-basis",
             PropertyId::Position => "position",
+            PropertyId::Float => "float",
+            PropertyId::Clear => "clear",
             PropertyId::Top => "top",
             PropertyId::Right => "right",
             PropertyId::Bottom => "bottom",
@@ -263,6 +298,15 @@ impl PropertyId {
             PropertyId::BorderRightColor => "border-right-color",
             PropertyId::BorderBottomColor => "border-bottom-color",
             PropertyId::BorderLeftColor => "border-left-color",
+            PropertyId::TextDecorationLine => "text-decoration-line",
+            PropertyId::TextDecorationStyle => "text-decoration-style",
+            PropertyId::TextDecorationColor => "text-decoration-color",
+            PropertyId::ZIndex => "z-index",
+            PropertyId::BackgroundImage => "background-image",
+            PropertyId::BorderTopLeftRadius => "border-top-left-radius",
+            PropertyId::BorderTopRightRadius => "border-top-right-radius",
+            PropertyId::BorderBottomRightRadius => "border-bottom-right-radius",
+            PropertyId::BorderBottomLeftRadius => "border-bottom-left-radius",
         }
     }
 
@@ -270,7 +314,7 @@ impl PropertyId {
     /// （CSS Syntax：声明名匹配大小写不敏感）。
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
-        const ALL: [PropertyId; 62] = [
+        const ALL: [PropertyId; 73] = [
             PropertyId::Display,
             PropertyId::Color,
             PropertyId::BackgroundColor,
@@ -298,6 +342,8 @@ impl PropertyId {
             PropertyId::FlexGrow,
             PropertyId::FlexBasis,
             PropertyId::Position,
+            PropertyId::Float,
+            PropertyId::Clear,
             PropertyId::Top,
             PropertyId::Right,
             PropertyId::Bottom,
@@ -333,6 +379,15 @@ impl PropertyId {
             PropertyId::BorderRightColor,
             PropertyId::BorderBottomColor,
             PropertyId::BorderLeftColor,
+            PropertyId::TextDecorationLine,
+            PropertyId::TextDecorationStyle,
+            PropertyId::TextDecorationColor,
+            PropertyId::ZIndex,
+            PropertyId::BackgroundImage,
+            PropertyId::BorderTopLeftRadius,
+            PropertyId::BorderTopRightRadius,
+            PropertyId::BorderBottomRightRadius,
+            PropertyId::BorderBottomLeftRadius,
         ];
         ALL.into_iter()
             .find(|id| id.as_str().eq_ignore_ascii_case(name))
@@ -413,6 +468,10 @@ pub enum PropertyValue {
     FlexBasis(SizeValue),
     /// `position` 关键字。
     Position(PositionValue),
+    /// `float` 关键字。
+    Float(FloatValue),
+    /// `clear` 关键字。
+    Clear(ClearValue),
     /// `top` / `right` / `bottom` / `left` 值。
     Inset(InsetValue),
     /// `flex-direction` 关键字。
@@ -443,6 +502,18 @@ pub enum PropertyValue {
     BorderStyle(BorderStyle),
     /// border-*-color 值。
     BorderColor(BorderColorValue),
+    /// `text-decoration-line` 关键字。
+    TextDecorationLine(TextDecorationLineValue),
+    /// `text-decoration-style` 关键字。
+    TextDecorationStyle(TextDecorationStyleValue),
+    /// `text-decoration-color` 值。
+    TextDecorationColor(TextDecorationColorValue),
+    /// `z-index` 值。
+    ZIndex(ZIndexValue),
+    /// `background-image` 值。
+    BackgroundImage(BackgroundImageValue),
+    /// border-*-radius 值（四角共用）。
+    BorderRadius(BorderRadiusValue),
 }
 
 /// `display` 的单关键字值
@@ -810,6 +881,34 @@ pub enum PositionValue {
     Fixed,
 }
 
+/// `float` 值
+/// （[CSS 2.1 §9.5.1](https://www.w3.org/TR/CSS21/visuren.html#float-position)）。
+///
+/// 逻辑值 `inline-start` / `inline-end` 不做，记偏差（本层仅 LTR）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatValue {
+    /// `none`（initial）：不浮动。
+    None,
+    /// `left`：左浮动。
+    Left,
+    /// `right`：右浮动。
+    Right,
+}
+
+/// `clear` 值
+/// （[CSS 2.1 §9.5.2](https://www.w3.org/TR/CSS21/visuren.html#flow-control)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearValue {
+    /// `none`（initial）：允许两侧有浮动。
+    None,
+    /// `left`：下移到左侧浮动之下。
+    Left,
+    /// `right`：下移到右侧浮动之下。
+    Right,
+    /// `both`：下移到任一侧浮动之下。
+    Both,
+}
+
 /// `top` / `right` / `bottom` / `left` 值（inset）
 /// （[CSS Position 3 §3](https://drafts.csswg.org/css-position-3/#insets)）。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1064,6 +1163,112 @@ pub enum BorderColorValue {
     CurrentColor,
 }
 
+/// `text-decoration-line` 值
+/// （[CSS Text Decoration 3 §3](https://drafts.csswg.org/css-text-decor-3/#text-decoration-line-property)）。
+///
+/// 基础档：单关键字（规范的多关键字空格列表与 `blink` 不识别，记偏差）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextDecorationLineValue {
+    /// `none`（initial）。
+    None,
+    /// `underline`。
+    Underline,
+    /// `overline`。
+    Overline,
+    /// `line-through`。
+    LineThrough,
+}
+
+/// `text-decoration-style` 值
+/// （[CSS Text Decoration 3 §5](https://drafts.csswg.org/css-text-decor-3/#text-decoration-style-property)）。
+///
+/// 解析存储；本渲染管线只画 solid——其余取值记偏差。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextDecorationStyleValue {
+    /// `solid`（initial）。
+    Solid,
+    /// `double`。
+    Double,
+    /// `dotted`。
+    Dotted,
+    /// `dashed`。
+    Dashed,
+    /// `wavy`。
+    Wavy,
+}
+
+/// `text-decoration-color` 值
+/// （[CSS Text Decoration 3 §4](https://drafts.csswg.org/css-text-decor-3/#text-decoration-color-property)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextDecorationColorValue {
+    /// 具体颜色。
+    Rgba(Rgba),
+    /// `currentcolor`（computed 阶段按本元素 color 解析）。
+    CurrentColor,
+}
+
+/// `z-index` 值
+/// （[CSS Position 3 §5](https://drafts.csswg.org/css-position-3/#z-index)）。
+///
+/// 完整 stacking context 留 K7；基础定序（定位元素绘制在普通流之上、
+/// 定位兄弟按整数排序）由 chrome pipeline 消费。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZIndexValue {
+    /// `auto`（initial）。
+    Auto,
+    /// 整数（可为负）。
+    Integer(i32),
+}
+
+/// `border-radius` 单角值
+/// （[CSS Backgrounds 3 §5.1](https://drafts.csswg.org/css-backgrounds-3/#border-radius)）。
+///
+/// 非负；百分比相对边框盒对应轴尺寸（水平半径相对宽、垂直半径相对高），
+/// 由消费方（paint / pipeline）解析；视口单位 computed 阶段折算。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BorderRadiusValue {
+    /// 绝对长度（CSS px）。
+    Length(f32),
+    /// 百分比（以小数存储）。
+    Percent(f32),
+    /// 视口单位；cascade 在 computed 阶段折算（同 [`SizeValue::Viewport`]）。
+    Viewport(f32, ViewportUnit),
+}
+
+/// linear-gradient 的一个色标
+/// （[CSS Images 4 §3.1.1](https://drafts.csswg.org/css-images-4/#linear-gradients)，
+/// 基础档：位置仅百分比）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GradientColorStop {
+    /// 色标颜色。
+    pub color: Rgba,
+    /// 渐变线上的位置（0..=1）。解析期已归一：显式位置 clamp 到 [0,1]
+    /// 且保证非递减，未指定位置在两侧已定值间均匀分布（简化档 fixup）。
+    pub position: f32,
+}
+
+/// `background-image` 的 linear-gradient 值（基础档）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinearGradientValue {
+    /// 渐变线角度（度；0 = to top，顺时针增加；缺省 180 = to bottom）。
+    /// 负值与超过 360 的原值保留，由消费方归一。
+    pub angle: f32,
+    /// 色标列表（≥2，源顺序，位置非递减）。
+    pub stops: Vec<GradientColorStop>,
+}
+
+/// `background-image` 值
+/// （[CSS Backgrounds 3 §2](https://drafts.csswg.org/css-backgrounds-3/#background-image)）。
+///
+/// 基础档：`none` | 单个 linear-gradient；url() 与多重背景记偏差。
+#[derive(Debug, Clone, PartialEq)]
+pub enum BackgroundImageValue {
+    /// `none`（initial）。
+    None,
+    /// 线性渐变。
+    LinearGradient(LinearGradientValue),
+}
+
 /// 把声明值解析为 [`DeclaredValue`]：先识别 CSS-wide 关键字，再按属性语法解析。
 ///
 /// `input` 已由调用方限定在本条声明的值范围内（分号 / 块尾之前）。
@@ -1138,6 +1343,8 @@ fn parse_property_value(property: PropertyId, input: &mut Parser<'_>) -> Result<
         PropertyId::FlexGrow => parse_flex_grow(input).map(PropertyValue::FlexGrow),
         PropertyId::FlexBasis => parse_size(input).map(PropertyValue::FlexBasis),
         PropertyId::Position => parse_position(input).map(PropertyValue::Position),
+        PropertyId::Float => parse_float(input).map(PropertyValue::Float),
+        PropertyId::Clear => parse_clear(input).map(PropertyValue::Clear),
         PropertyId::Top | PropertyId::Right | PropertyId::Bottom | PropertyId::Left => {
             parse_inset(input).map(PropertyValue::Inset)
         }
@@ -1174,6 +1381,25 @@ fn parse_property_value(property: PropertyId, input: &mut Parser<'_>) -> Result<
         | PropertyId::BorderRightColor
         | PropertyId::BorderBottomColor
         | PropertyId::BorderLeftColor => parse_border_color(input).map(PropertyValue::BorderColor),
+        PropertyId::TextDecorationLine => {
+            parse_text_decoration_line(input).map(PropertyValue::TextDecorationLine)
+        }
+        PropertyId::TextDecorationStyle => {
+            parse_text_decoration_style(input).map(PropertyValue::TextDecorationStyle)
+        }
+        PropertyId::TextDecorationColor => {
+            parse_text_decoration_color(input).map(PropertyValue::TextDecorationColor)
+        }
+        PropertyId::ZIndex => parse_z_index(input).map(PropertyValue::ZIndex),
+        PropertyId::BackgroundImage => {
+            parse_background_image(input).map(PropertyValue::BackgroundImage)
+        }
+        PropertyId::BorderTopLeftRadius
+        | PropertyId::BorderTopRightRadius
+        | PropertyId::BorderBottomRightRadius
+        | PropertyId::BorderBottomLeftRadius => {
+            parse_border_radius(input).map(PropertyValue::BorderRadius)
+        }
     }
 }
 
@@ -1396,7 +1622,39 @@ fn parse_position(input: &mut Parser<'_>) -> Result<PositionValue, ()> {
     }
 }
 
-/// `top` / `right` / `bottom` / `left`：<length> | <percentage> | auto。
+/// `float`：none | left | right（ASCII case-insensitive，CSS 2.1 §9.5.1）。
+fn parse_float(input: &mut Parser<'_>) -> Result<FloatValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("none") {
+        Ok(FloatValue::None)
+    } else if name.eq_ignore_ascii_case("left") {
+        Ok(FloatValue::Left)
+    } else if name.eq_ignore_ascii_case("right") {
+        Ok(FloatValue::Right)
+    } else {
+        Err(())
+    }
+}
+
+/// `clear`：none | left | right | both（ASCII case-insensitive，CSS 2.1 §9.5.2）。
+fn parse_clear(input: &mut Parser<'_>) -> Result<ClearValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("none") {
+        Ok(ClearValue::None)
+    } else if name.eq_ignore_ascii_case("left") {
+        Ok(ClearValue::Left)
+    } else if name.eq_ignore_ascii_case("right") {
+        Ok(ClearValue::Right)
+    } else if name.eq_ignore_ascii_case("both") {
+        Ok(ClearValue::Both)
+    } else {
+        Err(())
+    }
+}
 fn parse_inset(input: &mut Parser<'_>) -> Result<InsetValue, ()> {
     match input.next().map_err(|_| ())? {
         Token::Ident(name) if name.eq_ignore_ascii_case("auto") => Ok(InsetValue::Auto),
@@ -1731,6 +1989,212 @@ fn parse_border_color(input: &mut Parser<'_>) -> Result<BorderColorValue, ()> {
     }
 }
 
+/// `text-decoration-line`：none | underline | overline | line-through
+/// （CSS Text Decoration 3 §3；基础档单关键字，多关键字列表记偏差）。
+fn parse_text_decoration_line(input: &mut Parser<'_>) -> Result<TextDecorationLineValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("none") {
+        Ok(TextDecorationLineValue::None)
+    } else if name.eq_ignore_ascii_case("underline") {
+        Ok(TextDecorationLineValue::Underline)
+    } else if name.eq_ignore_ascii_case("overline") {
+        Ok(TextDecorationLineValue::Overline)
+    } else if name.eq_ignore_ascii_case("line-through") {
+        Ok(TextDecorationLineValue::LineThrough)
+    } else {
+        Err(())
+    }
+}
+
+/// `text-decoration-style`：solid | double | dotted | dashed | wavy
+/// （CSS Text Decoration 3 §5；解析存储，渲染仅 solid——偏差）。
+fn parse_text_decoration_style(input: &mut Parser<'_>) -> Result<TextDecorationStyleValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    const STYLES: [(&str, TextDecorationStyleValue); 5] = [
+        ("solid", TextDecorationStyleValue::Solid),
+        ("double", TextDecorationStyleValue::Double),
+        ("dotted", TextDecorationStyleValue::Dotted),
+        ("dashed", TextDecorationStyleValue::Dashed),
+        ("wavy", TextDecorationStyleValue::Wavy),
+    ];
+    STYLES
+        .into_iter()
+        .find(|(keyword, _)| keyword.eq_ignore_ascii_case(name))
+        .map(|(_, style)| style)
+        .ok_or(())
+}
+
+/// `text-decoration-color`：<color> | currentcolor。
+fn parse_text_decoration_color(input: &mut Parser<'_>) -> Result<TextDecorationColorValue, ()> {
+    if let Ok(rgba) = input.try_parse(parse_color) {
+        return Ok(TextDecorationColorValue::Rgba(rgba));
+    }
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("currentcolor") => {
+            Ok(TextDecorationColorValue::CurrentColor)
+        }
+        _ => Err(()),
+    }
+}
+
+/// `z-index`：auto | <integer>（CSS Position 3 §5；整数 token 之外的 Number
+/// （小数）按无效处理，与 `tab-size` 同一口径）。超出 i32 的整数 token 被
+/// tokenizer 饱和到 i32::MAX/MIN，与浏览器 z-index 钳制行为一致。
+fn parse_z_index(input: &mut Parser<'_>) -> Result<ZIndexValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("auto") => Ok(ZIndexValue::Auto),
+        Token::Number {
+            int_value: Some(int),
+            ..
+        } => Ok(ZIndexValue::Integer(*int)),
+        _ => Err(()),
+    }
+}
+
+/// border-*-radius：<length-percentage [0,∞]>；视口单位按盒级长度属性接受，
+/// computed 阶段折算。
+fn parse_border_radius(input: &mut Parser<'_>) -> Result<BorderRadiusValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Number { value: 0.0, .. } => Ok(BorderRadiusValue::Length(0.0)),
+        Token::Percentage { unit_value, .. } => sanitize_number(*unit_value)
+            .filter(|value| *value >= 0.0)
+            .map(BorderRadiusValue::Percent)
+            .ok_or(()),
+        Token::Dimension { value, unit, .. } => {
+            if *value < 0.0 {
+                return Err(());
+            }
+            if let Some((amount, unit)) = viewport_length(*value, unit) {
+                return sanitize_number(amount)
+                    .map(|amount| BorderRadiusValue::Viewport(amount, unit))
+                    .ok_or(());
+            }
+            length_to_px(*value, unit)
+                .map(BorderRadiusValue::Length)
+                .ok_or(())
+        }
+        _ => Err(()),
+    }
+}
+
+/// `background-image`：none | linear-gradient(...)（基础档；url() 与多重
+/// 背景记偏差，整条声明无效）。
+fn parse_background_image(input: &mut Parser<'_>) -> Result<BackgroundImageValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("none") => Ok(BackgroundImageValue::None),
+        Token::Function(name) if name.eq_ignore_ascii_case("linear-gradient") => input
+            .parse_nested_block(|input| {
+                parse_linear_gradient_arguments(input)
+                    .map_err(|_| ParseError::<()>::unexpected_token())
+            })
+            .map(BackgroundImageValue::LinearGradient)
+            .map_err(|_| ()),
+        _ => Err(()),
+    }
+}
+
+/// `linear-gradient(...)` 实参：
+/// `[ <angle> | to left | to right | to top | to bottom ]? , <color-stop>#{2,}`。
+/// 角度缺省 180deg（to bottom，CSS Images 4 §3.1.1）；对角 corner 与长度/
+/// 双位置色标不识别。
+fn parse_linear_gradient_arguments(input: &mut Parser<'_>) -> Result<LinearGradientValue, ()> {
+    let mut angle = 180.0;
+    let mut has_direction = false;
+    if let Ok(value) = input.try_parse(parse_angle) {
+        angle = value;
+        has_direction = true;
+    } else if try_parse_ident(input, "to") {
+        let Token::Ident(side) = input.next().map_err(|_| ())? else {
+            return Err(());
+        };
+        angle = if side.eq_ignore_ascii_case("left") {
+            270.0
+        } else if side.eq_ignore_ascii_case("right") {
+            90.0
+        } else if side.eq_ignore_ascii_case("top") {
+            0.0
+        } else if side.eq_ignore_ascii_case("bottom") {
+            180.0
+        } else {
+            return Err(());
+        };
+        has_direction = true;
+    }
+    // 角度成分可省略；省略时首个色标直接开始（无前导逗号）
+    if has_direction {
+        input.expect_comma().map_err(|_| ())?;
+    }
+
+    let mut raw: Vec<(Rgba, Option<f32>)> = Vec::new();
+    loop {
+        let color = parse_color(input)?;
+        let position = input
+            .try_parse(|i| match i.next().map_err(|_| ())? {
+                Token::Percentage { unit_value, .. } => sanitize_number(*unit_value).ok_or(()),
+                _ => Err(()),
+            })
+            .ok();
+        raw.push((color, position));
+        if input.try_parse(|i| i.expect_comma()).is_err() {
+            break;
+        }
+    }
+    if raw.len() < 2 {
+        return Err(());
+    }
+    let positions = resolve_stop_positions(&raw);
+    let stops = raw
+        .into_iter()
+        .zip(positions)
+        .map(|((color, _), position)| GradientColorStop { color, position })
+        .collect();
+    Ok(LinearGradientValue { angle, stops })
+}
+
+/// 色标位置的基础档解析（CSS Images 4 §3.1.1 color-stop fixup 简化档）：
+/// 显式位置 clamp 到 [0,1] 且保证非递减（后标不超前标）；首尾未指定补
+/// 0 / 1；其余未指定色标在两侧已定位置间均匀分布。
+fn resolve_stop_positions(raw: &[(Rgba, Option<f32>)]) -> Vec<f32> {
+    let count = raw.len();
+    let mut resolved: Vec<Option<f32>> = raw.iter().map(|(_, position)| *position).collect();
+    if resolved[0].is_none() {
+        resolved[0] = Some(0.0);
+    }
+    if resolved[count - 1].is_none() {
+        resolved[count - 1] = Some(1.0);
+    }
+    let mut running = 0.0;
+    for position in resolved.iter_mut().flatten() {
+        *position = (*position).clamp(0.0, 1.0).max(running);
+        running = *position;
+    }
+    // 未指定色标：两侧端点必有已定值（首尾已补），按序均匀插入
+    let mut positions = vec![0.0; count];
+    let mut index = 0;
+    while index < count {
+        if let Some(position) = resolved[index] {
+            positions[index] = position;
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < count && resolved[index].is_none() {
+            index += 1;
+        }
+        let lo = positions[start - 1];
+        let hi = resolved[index].unwrap_or(1.0);
+        let steps = (index - start + 1) as f32;
+        for (step, slot) in positions[start..index].iter_mut().enumerate() {
+            *slot = lo + (hi - lo) * (step + 1) as f32 / steps;
+        }
+    }
+    positions
+}
+
 /// 以下为简写展开（parser 模块）复用的单值解析入口。
 pub(crate) fn parse_margin_value(input: &mut Parser<'_>) -> Result<MarginValue, ()> {
     parse_margin(input)
@@ -1760,6 +2224,37 @@ pub(crate) fn parse_inset_value(input: &mut Parser<'_>) -> Result<InsetValue, ()
 /// `gap` 简写复用单值解析入口。
 pub(crate) fn parse_gap_value(input: &mut Parser<'_>) -> Result<GapValue, ()> {
     parse_gap(input)
+}
+
+/// `text-decoration` 简写复用的三个 longhand 入口。
+pub(crate) fn parse_text_decoration_line_value(
+    input: &mut Parser<'_>,
+) -> Result<TextDecorationLineValue, ()> {
+    parse_text_decoration_line(input)
+}
+
+pub(crate) fn parse_text_decoration_style_value(
+    input: &mut Parser<'_>,
+) -> Result<TextDecorationStyleValue, ()> {
+    parse_text_decoration_style(input)
+}
+
+pub(crate) fn parse_text_decoration_color_value(
+    input: &mut Parser<'_>,
+) -> Result<TextDecorationColorValue, ()> {
+    parse_text_decoration_color(input)
+}
+
+/// `background` 简写复用的 image 成分入口（color 成分直接用 [`parse_color`]）。
+pub(crate) fn parse_background_image_value(
+    input: &mut Parser<'_>,
+) -> Result<BackgroundImageValue, ()> {
+    parse_background_image(input)
+}
+
+/// `border-radius` 简写复用的单角入口。
+pub(crate) fn parse_border_radius_value(input: &mut Parser<'_>) -> Result<BorderRadiusValue, ()> {
+    parse_border_radius(input)
 }
 
 fn parse_display(input: &mut Parser<'_>) -> Result<DisplayValue, ()> {
@@ -2729,8 +3224,8 @@ mod tests {
     #[test]
     fn position_inset_flex_grid_properties_parse() {
         use PropertyValue::{
-            AlignItems, AlignSelf, FlexDirection, FlexShrink, FlexWrap, Gap, GridAutoFlow,
-            GridTrack as GridTrackValue, Inset, JustifyContent, Position,
+            AlignItems, AlignSelf, Clear, FlexDirection, FlexShrink, FlexWrap, Float, Gap,
+            GridAutoFlow, GridTrack as GridTrackValue, Inset, JustifyContent, Position,
         };
         // position
         assert_eq!(
@@ -2742,6 +3237,30 @@ mod tests {
             Position(PositionValue::Fixed)
         );
         parse_err(PropertyId::Position, "sticky");
+
+        // float / clear（CSS 2.1 §9.5.1/§9.5.2）
+        assert_eq!(
+            parse_one(PropertyId::Float, "left"),
+            Float(FloatValue::Left)
+        );
+        assert_eq!(
+            parse_one(PropertyId::Float, "RIGHT"),
+            Float(FloatValue::Right)
+        );
+        assert_eq!(
+            parse_one(PropertyId::Float, "none"),
+            Float(FloatValue::None)
+        );
+        parse_err(PropertyId::Float, "inline-start");
+        assert_eq!(
+            parse_one(PropertyId::Clear, "both"),
+            Clear(ClearValue::Both)
+        );
+        assert_eq!(
+            parse_one(PropertyId::Clear, "Left"),
+            Clear(ClearValue::Left)
+        );
+        parse_err(PropertyId::Clear, "inline-end");
 
         // inset（四边 longhand 共用 InsetValue）
         assert_eq!(
@@ -3455,6 +3974,245 @@ mod tests {
         assert_eq!(
             parse_one(PropertyId::LineHeight, "1e30"),
             PropertyValue::LineHeight(LineHeightValue::Number(MAX_CSS_LENGTH))
+        );
+    }
+
+    // ---- K2 绘制扩展：text-decoration / z-index / border-radius / background-image ----
+
+    #[test]
+    fn text_decoration_longhands_parse() {
+        use PropertyValue::{TextDecorationColor, TextDecorationLine, TextDecorationStyle};
+        // line：四关键字 + 大小写不敏感；多关键字列表与 blink 非法（基础档）
+        for (text, expected) in [
+            ("none", TextDecorationLineValue::None),
+            ("underline", TextDecorationLineValue::Underline),
+            ("OVERLINE", TextDecorationLineValue::Overline),
+            ("line-through", TextDecorationLineValue::LineThrough),
+        ] {
+            assert_eq!(
+                parse_one(PropertyId::TextDecorationLine, text),
+                TextDecorationLine(expected)
+            );
+        }
+        parse_err(PropertyId::TextDecorationLine, "underline overline");
+        parse_err(PropertyId::TextDecorationLine, "blink");
+
+        // style：五关键字（解析存储；渲染仅 solid——偏差）
+        for (text, expected) in [
+            ("solid", TextDecorationStyleValue::Solid),
+            ("double", TextDecorationStyleValue::Double),
+            ("dotted", TextDecorationStyleValue::Dotted),
+            ("DASHED", TextDecorationStyleValue::Dashed),
+            ("wavy", TextDecorationStyleValue::Wavy),
+        ] {
+            assert_eq!(
+                parse_one(PropertyId::TextDecorationStyle, text),
+                TextDecorationStyle(expected)
+            );
+        }
+        parse_err(PropertyId::TextDecorationStyle, "none");
+        parse_err(PropertyId::TextDecorationStyle, "wave");
+
+        // color：<color> | currentcolor
+        assert_eq!(
+            parse_one(PropertyId::TextDecorationColor, "red"),
+            TextDecorationColor(TextDecorationColorValue::Rgba(Rgba::opaque(255, 0, 0)))
+        );
+        assert_eq!(
+            parse_one(PropertyId::TextDecorationColor, "#0f0"),
+            TextDecorationColor(TextDecorationColorValue::Rgba(Rgba::opaque(0, 255, 0)))
+        );
+        assert_eq!(
+            parse_one(PropertyId::TextDecorationColor, "CURRENTCOLOR"),
+            TextDecorationColor(TextDecorationColorValue::CurrentColor)
+        );
+        parse_err(PropertyId::TextDecorationColor, "1px");
+    }
+
+    #[test]
+    fn z_index_parses_integer_and_auto() {
+        use PropertyValue::ZIndex;
+        assert_eq!(
+            parse_one(PropertyId::ZIndex, "auto"),
+            ZIndex(ZIndexValue::Auto)
+        );
+        assert_eq!(
+            parse_one(PropertyId::ZIndex, "0"),
+            ZIndex(ZIndexValue::Integer(0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::ZIndex, "-3"),
+            ZIndex(ZIndexValue::Integer(-3))
+        );
+        assert_eq!(
+            parse_one(PropertyId::ZIndex, "+7"),
+            ZIndex(ZIndexValue::Integer(7))
+        );
+        // 小数、单位、非关键字非法；超出 i32 的整数 token 被 cssparser 饱和到
+        // i32::MAX（与浏览器 z-index 钳制行为一致，非拒绝）
+        parse_err(PropertyId::ZIndex, "3.5");
+        parse_err(PropertyId::ZIndex, "3px");
+        parse_err(PropertyId::ZIndex, "none");
+        assert_eq!(
+            parse_one(PropertyId::ZIndex, "2147483648"),
+            ZIndex(ZIndexValue::Integer(i32::MAX))
+        );
+    }
+
+    #[test]
+    fn border_radius_corner_parses() {
+        use PropertyValue::BorderRadius;
+        assert_eq!(
+            parse_one(PropertyId::BorderTopLeftRadius, "10px"),
+            BorderRadius(BorderRadiusValue::Length(10.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::BorderBottomRightRadius, "50%"),
+            BorderRadius(BorderRadiusValue::Percent(0.5))
+        );
+        assert_eq!(
+            parse_one(PropertyId::BorderTopLeftRadius, "2vw"),
+            BorderRadius(BorderRadiusValue::Viewport(2.0, ViewportUnit::Vw))
+        );
+        assert_eq!(
+            parse_one(PropertyId::BorderTopLeftRadius, "0"),
+            BorderRadius(BorderRadiusValue::Length(0.0))
+        );
+        parse_err(PropertyId::BorderTopLeftRadius, "-5px");
+        parse_err(PropertyId::BorderTopLeftRadius, "-5%");
+        parse_err(PropertyId::BorderTopLeftRadius, "auto");
+        parse_err(PropertyId::BorderTopLeftRadius, "5");
+    }
+
+    /// 渐变解析辅助：取 LinearGradient 值。
+    fn gradient_of(text: &str) -> LinearGradientValue {
+        match parse_one(PropertyId::BackgroundImage, text) {
+            PropertyValue::BackgroundImage(BackgroundImageValue::LinearGradient(gradient)) => {
+                gradient
+            }
+            other => panic!("expected linear gradient, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn background_image_parses_none_and_rejects_unsupported() {
+        assert_eq!(
+            parse_one(PropertyId::BackgroundImage, "none"),
+            PropertyValue::BackgroundImage(BackgroundImageValue::None)
+        );
+        assert_eq!(
+            parse_one(PropertyId::BackgroundImage, "NONE"),
+            PropertyValue::BackgroundImage(BackgroundImageValue::None)
+        );
+        // url()、多重背景、径向渐变不识别（基础档偏差）
+        parse_err(PropertyId::BackgroundImage, "url(x.png)");
+        parse_err(
+            PropertyId::BackgroundImage,
+            "linear-gradient(red, blue), linear-gradient(blue, green)",
+        );
+        parse_err(PropertyId::BackgroundImage, "radial-gradient(red, blue)");
+    }
+
+    #[test]
+    fn linear_gradient_angle_forms() {
+        // 缺省角度 = 180deg（to bottom，CSS Images 4 §3.1.1）
+        assert_eq!(gradient_of("linear-gradient(red, blue)").angle, 180.0);
+        assert_eq!(gradient_of("linear-gradient(0deg, red, blue)").angle, 0.0);
+        assert_eq!(gradient_of("linear-gradient(90deg, red, blue)").angle, 90.0);
+        assert_eq!(
+            gradient_of("linear-gradient(-45deg, red, blue)").angle,
+            -45.0
+        );
+        assert_eq!(
+            gradient_of("linear-gradient(0.5turn, red, blue)").angle,
+            180.0
+        );
+        assert_eq!(gradient_of("linear-gradient(to top, red, blue)").angle, 0.0);
+        assert_eq!(
+            gradient_of("linear-gradient(to right, red, blue)").angle,
+            90.0
+        );
+        assert_eq!(
+            gradient_of("linear-gradient(TO LEFT, red, blue)").angle,
+            270.0
+        );
+        assert_eq!(
+            gradient_of("linear-gradient(to bottom, red, blue)").angle,
+            180.0
+        );
+        // 函数名大小写不敏感
+        assert_eq!(gradient_of("LINEAR-GRADIENT(to top, red, blue)").angle, 0.0);
+        // 对角 corner、多余逗号、无逗号非法
+        parse_err(
+            PropertyId::BackgroundImage,
+            "linear-gradient(to top right, red, blue)",
+        );
+        parse_err(PropertyId::BackgroundImage, "linear-gradient(red blue)");
+        parse_err(PropertyId::BackgroundImage, "linear-gradient(, red, blue)");
+    }
+
+    #[test]
+    fn linear_gradient_stops_and_positions() {
+        // 无位置色标：首尾 0/1，中间均匀
+        let gradient = gradient_of("linear-gradient(90deg, red, yellow, blue)");
+        assert_eq!(
+            gradient.stops,
+            vec![
+                GradientColorStop {
+                    color: Rgba::opaque(255, 0, 0),
+                    position: 0.0,
+                },
+                GradientColorStop {
+                    color: Rgba::opaque(255, 255, 0),
+                    position: 0.5,
+                },
+                GradientColorStop {
+                    color: Rgba::opaque(0, 0, 255),
+                    position: 1.0,
+                },
+            ]
+        );
+        // 显式位置 + 中间未指定：在两侧已定位置间均匀分布
+        let gradient = gradient_of("linear-gradient(90deg, red, blue 50%, green)");
+        assert_eq!(gradient.stops[0].position, 0.0);
+        assert_eq!(gradient.stops[1].position, 0.5);
+        assert_eq!(gradient.stops[2].position, 1.0);
+        assert_eq!(gradient.stops[1].color, Rgba::opaque(0, 0, 255));
+        // 显式位置保留（20% → 0.2）
+        let gradient = gradient_of("linear-gradient(90deg, red 20%, blue)");
+        assert_eq!(gradient.stops[0].position, 0.2);
+        assert_eq!(gradient.stops[1].position, 1.0);
+        // 超出 [0,1] clamp（简化档 fixup）
+        let gradient = gradient_of("linear-gradient(90deg, red 120%, blue)");
+        assert_eq!(gradient.stops[0].position, 1.0);
+        assert_eq!(gradient.stops[1].position, 1.0);
+        // 非递减（后标不超前标，CSS Images 4 §3.1.1）
+        let gradient = gradient_of("linear-gradient(90deg, red 80%, blue 20%)");
+        assert_eq!(gradient.stops[0].position, 0.8);
+        assert_eq!(gradient.stops[1].position, 0.8);
+        // rgb() 函数色标与连续位置逗号
+        let gradient = gradient_of("linear-gradient(90deg, rgb(255, 0, 0), rgba(0, 0, 255, 0.5))");
+        assert_eq!(gradient.stops[1].color.a, 128);
+    }
+
+    #[test]
+    fn linear_gradient_requires_two_stops_and_percent_positions_only() {
+        // 单色标非法（CSS Images 4 §3.1.1：至少两个色标）
+        parse_err(PropertyId::BackgroundImage, "linear-gradient(red)");
+        parse_err(PropertyId::BackgroundImage, "linear-gradient(red,)");
+        // 长度位置、双位置色标不识别（基础档偏差）
+        parse_err(
+            PropertyId::BackgroundImage,
+            "linear-gradient(red 10px, blue)",
+        );
+        parse_err(
+            PropertyId::BackgroundImage,
+            "linear-gradient(red 20% 40%, blue)",
+        );
+        // 未知颜色非法
+        parse_err(
+            PropertyId::BackgroundImage,
+            "linear-gradient(red, notacolor)",
         );
     }
 }

@@ -1,7 +1,7 @@
 [package]
 name = "nexty-text"
 description = "Nexty 文本整形与字体 facade"
-version = "0.1.8"
+version = "0.1.9"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -14,7 +14,9 @@ default = ["shaping", "font-resolution"]
 # 单行文本整形：TextShaper trait 与 parley（fontique + harfrust）实现。
 # ParleyTextShaper 的字体解析复用 FontResolver，故隐含 font-resolution。
 shaping = ["dep:parley", "font-resolution"]
-# 字体文件解析：FontResolver / ResolvedFont，供 paint 取字体字节。
+# 字体文件解析：FontResolver / ResolvedFont 与 @font-face 注册表
+# （FontRegistry / FontFaceDescriptor），供 paint 取字体字节、chrome 注册
+# Web 字体。
 font-resolution = ["dep:parley"]
 
 [dependencies]

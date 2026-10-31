@@ -48,6 +48,14 @@
 //!    定位（relative/absolute）时与 CSS 一致——这是常见用法；父盒 static 时
 //!    偏差，列为已知限制。`position: fixed` 同样映射为 taffy `Absolute`
 //!    （视口锚定未建模）。
+//! 9. **浮动环绕**：浮动放置 / `clear` / BFC 避让 / 高度贡献由 taffy
+//!    `float_layout` 完成（CSS 2.2 §9.5），但 taffy 不收缩 measure 叶的可用宽
+//!    （run 叶无子内容可下钻）——本模块的 [`apply_float_wrapping`] 在后处理
+//!    pass 里按 taffy 已放置的浮动矩形逐行收缩重排文本行盒并回写叶定高（再解算
+//!    一轮收敛）。偏差：行按行顶 y 取可用区间（行跨入更窄区间不细分）、浮动
+//!    只按文档序判定「前置」（纹理式堆叠以 taffy 放置为准）。
+//! 10. **浮动影响后代行盒**：浮动属于祖先 BFC 的浮动，收缩传播到后代块的
+//!     run 叶（跨块边界），遇建立新 BFC 的盒子截断继承。
 
 use nexty_css::{ComputedStyle, MarginValue, TextAlignValue};
 use nexty_dom::NodeId;
@@ -76,14 +84,19 @@ pub(crate) fn layout_root(ctx: &Context<'_>, root: NodeId, viewport_width: f32) 
         return empty_fragment(root, &style);
     };
 
-    compute_tree(
-        &mut boxes,
-        root_taffy,
-        TaffySize {
-            width: AvailableSpace::Definite(viewport_width),
-            height: AvailableSpace::MaxContent,
-        },
-    );
+    let available = TaffySize {
+        width: AvailableSpace::Definite(viewport_width),
+        height: AvailableSpace::MaxContent,
+    };
+    compute_tree(&mut boxes, root_taffy, available);
+    // 浮动环绕修正：taffy 的 float_layout 不收缩 measure 叶的可用宽（叶无子
+    // 内容可下钻），文本会与浮动重叠。首轮解算后浮动已就位，按真实浮动矩形
+    // 重排 run 叶行盒；行数变化时把修正高度回写 taffy 再解算一轮，使容器
+    // 高度、clear 与后续兄弟位置按实际行数收敛（浮动自身尺寸与文本无关，
+    // 第二轮浮动位置不变，一次迭代即固定点）。
+    if apply_float_wrapping(&mut boxes, root_taffy) {
+        compute_tree(&mut boxes, root_taffy, available);
+    }
 
     let (margin_left, margin_top) = if boxes.root_is_element_box {
         (
@@ -116,14 +129,15 @@ pub(crate) fn layout_atomic_subtree(
     let Some(taffy_root) = boxes.root else {
         return empty_fragment(node, style);
     };
-    compute_tree(
-        &mut boxes,
-        taffy_root,
-        TaffySize {
-            width: available_width,
-            height: AvailableSpace::MaxContent,
-        },
-    );
+    let available = TaffySize {
+        width: available_width,
+        height: AvailableSpace::MaxContent,
+    };
+    compute_tree(&mut boxes, taffy_root, available);
+    // 原子盒（inline-block 等）是独立 BFC：内部浮动同样需要环绕修正
+    if apply_float_wrapping(&mut boxes, taffy_root) {
+        compute_tree(&mut boxes, taffy_root, available);
+    }
     let layout = *boxes.tree.layout(taffy_root).expect("atomic layout");
     let mut fragment = assemble_element(&boxes, ctx, taffy_root, node, (0.0, 0.0));
     fragment.border_box.width = layout.size.width;
@@ -131,6 +145,127 @@ pub(crate) fn layout_atomic_subtree(
     fragment.border_box.x = layout.margin.left;
     fragment.border_box.y = 0.0;
     fragment
+}
+
+/// 浮动环绕修正 pass：为含浮动子盒的容器重排 run 叶行盒。
+///
+/// taffy 的 `float_layout` 完成浮动放置、块盒/BFC 避让、`clear` 与容器高度
+/// 贡献，但 measure 叶（run 叶）没有子内容可下钻，拿不到浮动区间——行盒不
+/// 收缩会与浮动重叠。这里按首轮解算的真实浮动矩形逐行收缩重排，并把修正
+/// 高度回写上层的叶样式（返回 `true` 表示需要再解算一轮）。
+///
+/// 浮动的 BFC 是**祖先容器**（如 `body`），受影响的行盒可在任意后代块里
+/// （如 `<p>` 的 run 叶）——因此递归携带两样东西：已放置浮动的**绝对矩形
+/// 表**（换算到当前叶的坐标再收缩行盒）与绝对原点。浮动只影响其后的内容
+/// （CSS 2.2 §9.5），按子节点文档序过滤；遇到建立新 BFC 的盒子（浮动自身、
+/// `overflow` 非 visible、绝对/固定定位、`flow-root`）截断继承——那些盒子
+/// 的边框盒避让已由 taffy 完成，其内部行盒相对自身内容盒排布。
+fn apply_float_wrapping(boxes: &mut BoxTree<'_>, root: TaffyNode) -> bool {
+    let mut changed = false;
+    wrap_recursive(boxes, root, (0.0, 0.0), &[], &mut changed);
+    changed
+}
+
+/// 绝对坐标下的浮动矩形（相对文档原点）。
+type AbsFloat = (usize, crate::inline::FloatRect);
+
+fn wrap_recursive(
+    boxes: &mut BoxTree<'_>,
+    container: TaffyNode,
+    container_border_abs: (f32, f32),
+    inherited: &[AbsFloat],
+    changed: &mut bool,
+) {
+    let children = boxes.tree.children(container).unwrap_or_default();
+    if children.is_empty() {
+        return;
+    }
+    let container_layout = *boxes.tree.layout(container).expect("layout");
+    let inset = content_inset(&container_layout);
+    let content_abs = (
+        container_border_abs.0 + inset.0,
+        container_border_abs.1 + inset.1,
+    );
+    // 本容器的浮动子节点：绝对矩形 + 文档序（taffy location 相对父边框盒）
+    let own: Vec<AbsFloat> = children
+        .iter()
+        .enumerate()
+        .filter_map(|(order, &child)| {
+            let style = boxes.tree.style(child).ok()?;
+            if style.float == taffy::Float::None {
+                return None;
+            }
+            let layout = boxes.tree.layout(child).ok()?;
+            Some((
+                order,
+                crate::inline::FloatRect {
+                    x: content_abs.0 + layout.location.x - inset.0,
+                    y: content_abs.1 + layout.location.y - inset.1,
+                    width: layout.size.width,
+                    height: layout.size.height,
+                },
+            ))
+        })
+        .collect();
+
+    for (order, &child) in children.iter().enumerate() {
+        // 该子节点可见的浮动：继承（祖先 BFC）+ 本容器中排在它之前的
+        let visible: Vec<AbsFloat> = inherited
+            .iter()
+            .copied()
+            .chain(
+                own.iter()
+                    .filter(|(float_order, _)| *float_order < order)
+                    .copied(),
+            )
+            .collect();
+
+        let child_layout = *boxes.tree.layout(child).expect("child layout");
+        let child_abs = (
+            container_border_abs.0 + child_layout.location.x,
+            container_border_abs.1 + child_layout.location.y,
+        );
+
+        if let Some(run) = boxes.runs.get(&child) {
+            // run 叶内容盒 = 边框盒（无 margin/padding/border）
+            let run_floats: Vec<crate::inline::FloatRect> = visible
+                .iter()
+                .map(|(_, float)| crate::inline::FloatRect {
+                    x: float.x - child_abs.0,
+                    y: float.y - child_abs.1,
+                    ..*float
+                })
+                .collect();
+            if run_floats.is_empty() {
+                continue;
+            }
+            let height = run.wrap_against(child_layout.size.width, &run_floats);
+            if (height - child_layout.size.height).abs() > 0.01 {
+                let mut style = boxes.tree.style(child).expect("run style").clone();
+                style.size.height = taffy::style_helpers::length(height);
+                if boxes.tree.set_style(child, style).is_ok() {
+                    *changed = true;
+                }
+            }
+        } else {
+            let child_style = boxes.tree.style(child).ok().cloned();
+            let establishes_bfc = child_style.is_none_or(|style| {
+                style.float != taffy::Float::None
+                    || style.position == taffy::Position::Absolute
+                    || style.display == taffy::Display::FlowRoot
+                    || style.display == taffy::Display::None
+                    || style.overflow.x != taffy::Overflow::Visible
+                    || style.overflow.y != taffy::Overflow::Visible
+                    || style.contain.establishes_independent_formatting_context()
+            });
+            if establishes_bfc {
+                // 新 BFC：祖先浮动不影响其内部行盒
+                wrap_recursive(boxes, child, child_abs, &[], changed);
+            } else {
+                wrap_recursive(boxes, child, child_abs, &visible, changed);
+            }
+        }
+    }
 }
 
 /// 对一棵盒树执行 taffy 布局（禁用取整，保持与旧自研一致的小数几何）。
@@ -200,7 +335,10 @@ fn assemble_element(
                 child_layout.location.x - inset.0,
                 child_layout.location.y - inset.1,
             );
-            let run_lines = run.lines_at(child_layout.size.width, false);
+            // 浮动环绕修正过的行盒优先（装配是 wrapped 缓存的唯一消费者）
+            let run_lines = run
+                .wrapped_lines()
+                .unwrap_or_else(|| run.lines_at(child_layout.size.width, false));
             if merge_lines {
                 for line in run_lines {
                     // text-align 在行盒并入容器时施加：整行相对内容盒平移

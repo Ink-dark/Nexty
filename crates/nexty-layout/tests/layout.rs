@@ -1704,3 +1704,240 @@ fn display_none_and_contents_in_inline_subtree_unchanged() {
     let text: String = line.runs.iter().map(|run| run.text.as_ref()).collect();
     assert_eq!(text, "aCb", "none 丢弃、contents 穿透、其余连续");
 }
+
+// ---------------------------------------------------------------------------
+// 浮动布局（CSS 2.1 §9.5）：taffy float_layout 接线的探针测试
+// ---------------------------------------------------------------------------
+
+/// 左浮动盒脱离常规流，后续文本逐行环绕：浮动旁边的行起点右移，
+/// 浮动底缘之下的行回到左缘；多出行数体现在匿名块高度上。
+#[test]
+fn float_left_wraps_subsequent_text() {
+    let words = "word ".repeat(60);
+    let (document, root) = layout(
+        &format!(
+            "<body><div style=\"float: left; width: 100px; height: 60px\">F</div>\
+             {words}</body>"
+        ),
+        "",
+        400.0,
+    );
+    let floated = find(&document, &root, "div").expect("floated fragment");
+    // 浮动盒在左上：x = 0，且脱离流（后续文本从其右侧开始）
+    assert!(approx(floated.border_box.x, 0.0), "左浮动贴左缘");
+    assert!(approx(floated.border_box.width, 100.0));
+    let body_fragment = body(&document, &root);
+    // 块级浮动子元素使文本 run 成匿名块片段（CSS 2.2 §9.2.1.1 混排语义），
+    // 行盒在匿名片段里
+    let anonymous = body_fragment
+        .children
+        .iter()
+        .find(|c| c.anonymous && !c.lines.is_empty())
+        .expect("anonymous block holding wrapped text");
+    // glyph.x 已是 run 内绝对坐标（含行左缩进）；匿名块无 border/padding，
+    // 加上其 border_box.x 即容器内容盒坐标
+    let line_x = |line: &LineFragment| {
+        line.runs
+            .first()
+            .and_then(|run| run.glyphs.first())
+            .map(|glyph| glyph.x + anonymous.border_box.x)
+            .unwrap_or(f32::MAX)
+    };
+    // 逐行累计高度推 y：行顶 < 浮动底缘（60px）的行收缩，之后的行回全宽
+    let mut y = anonymous.border_box.y;
+    let mut beside = 0usize;
+    let mut below = 0usize;
+    for line in &anonymous.lines {
+        let x = line_x(line);
+        if y < 60.0 - 0.01 {
+            assert!(
+                x >= 100.0 - 0.01,
+                "浮动旁的行不得与浮动重叠（y={y}, x={x}）"
+            );
+            beside += 1;
+        } else {
+            assert!(x <= 0.01, "浮动下方的行回到左缘（y={y}, x={x}）");
+            below += 1;
+        }
+        y += line.height;
+    }
+    assert!(beside >= 2, "浮动旁至少两行（实际 {beside}）");
+    assert!(below >= 1, "浮动下方至少一行（实际 {below}）");
+    assert!(
+        anonymous.border_box.height >= y - anonymous.border_box.y - 0.01,
+        "匿名块高度覆盖全部行（高 {} 行底 {}）",
+        anonymous.border_box.height,
+        y - anonymous.border_box.y
+    );
+}
+
+/// 浮动在祖先容器、文本在后代块（`<p>`）内：祖先 BFC 的浮动同样收缩后代
+/// 行盒（CSS 2.2 §9.5 的行盒规则不分块边界）。
+#[test]
+fn ancestor_float_wraps_descendant_paragraph() {
+    let words = "word ".repeat(40);
+    let (document, root) = layout(
+        &format!(
+            "<body><div style=\"float: left; width: 100px; height: 60px\">F</div>\
+             <p>{words}</p></body>"
+        ),
+        "p { margin: 0 }",
+        400.0,
+    );
+    let paragraph = find(&document, &root, "p").expect("paragraph fragment");
+    let mut y = paragraph.border_box.y;
+    let mut beside = 0usize;
+    for line in &paragraph.lines {
+        if y < 60.0 - 0.01 {
+            let x = line
+                .runs
+                .first()
+                .and_then(|run| run.glyphs.first())
+                .map(|glyph| glyph.x + paragraph.border_box.x)
+                .unwrap_or(f32::MAX);
+            assert!(x >= 100.0 - 0.01, "段内行让出浮动（y={y}, x={x}）");
+            beside += 1;
+        }
+        y += line.height;
+    }
+    assert!(beside >= 1, "浮动旁至少一行（实际 {beside}）");
+}
+
+/// 右浮动：浮动旁的行右缘收缩到浮动左缘之前。
+#[test]
+fn float_right_shrinks_line_right_edge() {
+    let words = "word ".repeat(12);
+    let (document, root) = layout(
+        &format!(
+            "<body><div style=\"float: right; width: 120px; height: 60px\">F</div>\
+             {words}</body>"
+        ),
+        "",
+        400.0,
+    );
+    let anonymous = body(&document, &root)
+        .children
+        .iter()
+        .find(|c| c.anonymous && !c.lines.is_empty())
+        .expect("anonymous block holding wrapped text");
+    let mut y = anonymous.border_box.y;
+    for line in &anonymous.lines {
+        if y < 60.0 - 0.01 {
+            let right = line
+                .runs
+                .iter()
+                .filter_map(|run| run.glyphs.last().map(|g| g.x + g.advance))
+                .fold(0.0_f32, f32::max)
+                + anonymous.border_box.x;
+            assert!(
+                right <= 400.0 - 120.0 + 0.01,
+                "右浮动旁的行不越过浮动左缘（y={y}, 行右缘={right}）"
+            );
+        }
+        y += line.height;
+    }
+}
+
+/// 图片浮动（`<img style="float:left">`）：行环绕图片，图片不参与行内流。
+#[test]
+fn floated_image_wraps_text() {
+    let (document, root) = layout(
+        "<body><img src=a.png width=80 height=80 style=\"float: left\">\
+         word word word word word word word word word word</body>",
+        "",
+        400.0,
+    );
+    let image = find(&document, &root, "img").expect("image fragment child");
+    assert!(approx(image.border_box.x, 0.0), "图片浮动贴左缘");
+    assert!(approx(image.border_box.width, 80.0));
+}
+
+/// 右浮动盒贴包含块右缘。
+#[test]
+fn float_right_hugs_right_edge() {
+    let (document, root) = layout(
+        "<body><div style=\"float: right; width: 120px; height: 40px\">F</div>\
+         word word word</body>",
+        "",
+        400.0,
+    );
+    let floated = find(&document, &root, "div").expect("floated fragment");
+    assert!(
+        approx(floated.border_box.x + floated.border_box.width, 400.0),
+        "右浮动贴右缘（实际右缘={}）",
+        floated.border_box.x + floated.border_box.width
+    );
+}
+
+/// `clear: both` 把后续块推到两侧浮动之下。
+#[test]
+fn clear_both_pushes_below_floats() {
+    let (document, root) = layout(
+        "<body>\
+         <div id=\"l\" style=\"float: left; width: 50px; height: 100px\">L</div>\
+         <div id=\"r\" style=\"float: right; width: 50px; height: 100px\">R</div>\
+         <p id=\"c\" style=\"clear: both\">after</p>\
+         </body>",
+        "p { margin: 0 }",
+        400.0,
+    );
+    let cleared = find(&document, &root, "p").expect("cleared fragment");
+    assert!(
+        cleared.border_box.y >= 100.0 - 0.01,
+        "clear 后块在浮动底缘之下（实际 y={}）",
+        cleared.border_box.y
+    );
+}
+
+/// 浮动盒参与父块高度（float_content_contribution，CSS 2.1 §9.5 常见依赖：
+/// `overflow: hidden` 建立 BFC 后高度收缩包含浮动）。
+#[test]
+fn float_contributes_to_parent_height() {
+    let (document, root) = layout(
+        "<body><div id=\"outer\" style=\"overflow: hidden\">\
+         <div style=\"float: left; width: 100px; height: 90px\">F</div>\
+         </div></body>",
+        "",
+        400.0,
+    );
+    // body 的第一个子片段即 outer（find 会先命中嵌套的内层 div）
+    let outer = body(&document, &root)
+        .children
+        .first()
+        .expect("outer div fragment");
+    assert!(
+        outer.border_box.height >= 90.0 - 0.01,
+        "BFC（overflow:hidden）父块高度包含浮动（实际高度={}）",
+        outer.border_box.height
+    );
+}
+
+/// 双左浮动横向并排放置（CSS 2.1 §9.5 规则 4：先尽量靠左上）。
+#[test]
+fn two_left_floats_side_by_side() {
+    let (document, root) = layout(
+        "<body>\
+         <div style=\"float: left; width: 60px; height: 40px\">A</div>\
+         <div style=\"float: left; width: 60px; height: 40px\">B</div>\
+         </body>",
+        "",
+        400.0,
+    );
+    let b = body(&document, &root);
+    let floats: Vec<_> = b
+        .children
+        .iter()
+        .filter(|c| !c.anonymous && c.border_box.width > 0.0)
+        .collect();
+    assert_eq!(floats.len(), 2, "两个浮动子片段");
+    assert!(approx(floats[0].border_box.x, 0.0));
+    assert!(
+        approx(floats[1].border_box.x, 60.0),
+        "第二个左浮动贴第一个右缘（实际 x={}）",
+        floats[1].border_box.x
+    );
+    assert!(
+        approx(floats[0].border_box.y, floats[1].border_box.y),
+        "同一行放置"
+    );
+}

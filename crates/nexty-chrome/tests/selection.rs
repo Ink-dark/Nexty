@@ -116,8 +116,8 @@ fn click_and_drag_are_distinguished_for_link_navigation() {
 #[test]
 fn highlight_is_emitted_between_background_and_text() {
     let page = pipeline::load_page(
-        "<p>abc</p>",
-        "body { background-color: #ffffff; margin: 0 }",
+        "<div style=\"background-color: #ffffff\"><p>abc</p></div>",
+        "body { margin: 0 }",
     );
     let shaper = ParleyTextShaper::new();
     let root = pipeline::layout_page(&page, &shaper, 400.0).expect("root");

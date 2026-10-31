@@ -1,0 +1,3181 @@
+//! 属性值模型与逐属性解析。
+//!
+//! 行为 ground truth：
+//! - CSS-wide 关键字：[CSS Cascading and Inheritance Level 5 §6](https://drafts.csswg.org/css-cascade-5/#defaulting-keywords)
+//! - 颜色：[CSS Color Module Level 4](https://drafts.csswg.org/css-color-4/)（hex / rgb() / hsl() / 命名色）
+//! - 字号：[CSS Fonts Module Level 4 §2.5](https://drafts.csswg.org/css-fonts-4/#font-size-prop)
+//! - 字重：[CSS Fonts Module Level 4 §2.2](https://drafts.csswg.org/css-fonts-4/#font-weight-numeric)
+//! - 字体族：[CSS Fonts Module Level 4 §2.3](https://drafts.csswg.org/css-fonts-4/#font-family-prop)
+//! - font 简写：[CSS Fonts Module Level 4 §3.3](https://drafts.csswg.org/css-fonts-4/#font-prop)
+//! - display：[CSS Display Module Level 3](https://drafts.csswg.org/css-display-3/#the-display-properties)
+//! - text-align：[CSS Text Module Level 4](https://drafts.csswg.org/css-text-4/#text-align-property)
+//!
+//! 已知偏差（按需再补，见本轮 goal.md 非目标）：`rem` / `ex` / `ch` 等
+//! 相对单位、`currentcolor`、`color-mix()` 等函数色、`display` 的多关键字
+//! 语法与 ruby 内部盒、`var()` 均视为无效声明（浏览器会接受其中的合法值）。
+//! 视口单位（`vw`/`vh`/`vmin`/`vmax`）只在盒级长度属性（width/height/min/max、
+//! inset、margin、padding、gap）上接受；`font-size` / `border-width` /
+//! `line-height` 上的视口单位视为无效声明。
+//! `font` 简写里无对应 longhand 的成分——`<font-variant-css2>`（`small-caps`）
+//! 与 `<font-width-css3>`（宽度关键字/百分比）——按语法接受后丢弃（无渲染
+//! 效果但声明不整体失效）；系统字体关键字（`caption` / `menu` 等）整条无效。
+//!
+//! **Feature**：本模块受 `values` feature 控制（由 lib.rs 装配）。其中的
+//! `parse_*` 逐属性解析函数供 `parser` / `cascade` 模块消费，故当上层 feature
+//! 关闭时这些内部函数没有调用方——此时按模块整体抑制 dead_code。
+
+#![cfg_attr(not(feature = "stylesheets"), allow(dead_code))]
+
+use cssparser::{ParseError, Parser, Token, parse_important};
+
+/// 非预乘 sRGB 颜色。
+///
+/// 对应 CSS Color 4 的 [`<color>`](https://drafts.csswg.org/css-color-4/#color-syntax)
+/// 解析结果；alpha 与各通道均量化到 8bit。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rgba {
+    /// 红通道。
+    pub r: u8,
+    /// 绿通道。
+    pub g: u8,
+    /// 蓝通道。
+    pub b: u8,
+    /// alpha 通道。
+    pub a: u8,
+}
+
+impl Rgba {
+    /// 不透明颜色。
+    #[must_use]
+    pub const fn opaque(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b, a: 0xff }
+    }
+
+    /// 全透明黑，即 CSS 关键字 `transparent`
+    /// （[CSS Color 4 §5.5](https://drafts.csswg.org/css-color-4/#transparent-color)）。
+    #[must_use]
+    pub const fn transparent() -> Self {
+        Self {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0,
+        }
+    }
+}
+
+/// 级联引擎认识的最小属性集合。
+///
+/// 只覆盖当前管线需要的属性；新属性随消费方（layout / text / paint）落地时加入，
+/// 不预先铺满。属性元数据（inherited / initial）见 `cascade` 模块。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PropertyId {
+    /// `display`。
+    Display,
+    /// `color`。
+    Color,
+    /// `background-color`。
+    BackgroundColor,
+    /// `font-size`。
+    FontSize,
+    /// `font-weight`。
+    FontWeight,
+    /// `font-style`。
+    FontStyle,
+    /// `font-family`。
+    FontFamily,
+    /// `text-align`。
+    TextAlign,
+    /// `line-height`。
+    LineHeight,
+    /// `white-space`。
+    WhiteSpace,
+    /// `overflow-wrap`。
+    OverflowWrap,
+    /// `word-break`。
+    WordBreak,
+    /// `width`。
+    Width,
+    /// `height`。
+    Height,
+    /// `min-width`。
+    MinWidth,
+    /// `max-width`。
+    MaxWidth,
+    /// `min-height`。
+    MinHeight,
+    /// `max-height`。
+    MaxHeight,
+    /// `box-sizing`。
+    BoxSizing,
+    /// `overflow`。
+    Overflow,
+    /// `flex-grow`。
+    FlexGrow,
+    /// `flex-basis`。
+    FlexBasis,
+    /// `position`。
+    Position,
+    /// `top`。
+    Top,
+    /// `right`。
+    Right,
+    /// `bottom`。
+    Bottom,
+    /// `left`。
+    Left,
+    /// `flex-direction`。
+    FlexDirection,
+    /// `flex-wrap`。
+    FlexWrap,
+    /// `flex-shrink`。
+    FlexShrink,
+    /// `align-items`。
+    AlignItems,
+    /// `justify-content`。
+    JustifyContent,
+    /// `align-self`。
+    AlignSelf,
+    /// `grid-template-columns`。
+    GridTemplateColumns,
+    /// `grid-template-rows`。
+    GridTemplateRows,
+    /// `row-gap`。
+    RowGap,
+    /// `column-gap`。
+    ColumnGap,
+    /// `grid-auto-flow`。
+    GridAutoFlow,
+    /// `margin-top`。
+    MarginTop,
+    /// `margin-right`。
+    MarginRight,
+    /// `margin-bottom`。
+    MarginBottom,
+    /// `margin-left`。
+    MarginLeft,
+    /// `padding-top`。
+    PaddingTop,
+    /// `padding-right`。
+    PaddingRight,
+    /// `padding-bottom`。
+    PaddingBottom,
+    /// `padding-left`。
+    PaddingLeft,
+    /// `border-top-style`。
+    BorderTopStyle,
+    /// `border-right-style`。
+    BorderRightStyle,
+    /// `border-bottom-style`。
+    BorderBottomStyle,
+    /// `border-left-style`。
+    BorderLeftStyle,
+    /// `border-top-width`。
+    BorderTopWidth,
+    /// `border-right-width`。
+    BorderRightWidth,
+    /// `border-bottom-width`。
+    BorderBottomWidth,
+    /// `border-left-width`。
+    BorderLeftWidth,
+    /// `border-top-color`。
+    BorderTopColor,
+    /// `border-right-color`。
+    BorderRightColor,
+    /// `border-bottom-color`。
+    BorderBottomColor,
+    /// `border-left-color`。
+    BorderLeftColor,
+}
+
+impl PropertyId {
+    /// 属性的规范名（小写）。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PropertyId::Display => "display",
+            PropertyId::Color => "color",
+            PropertyId::BackgroundColor => "background-color",
+            PropertyId::FontSize => "font-size",
+            PropertyId::FontWeight => "font-weight",
+            PropertyId::FontStyle => "font-style",
+            PropertyId::FontFamily => "font-family",
+            PropertyId::TextAlign => "text-align",
+            PropertyId::LineHeight => "line-height",
+            PropertyId::WhiteSpace => "white-space",
+            PropertyId::OverflowWrap => "overflow-wrap",
+            PropertyId::WordBreak => "word-break",
+            PropertyId::Width => "width",
+            PropertyId::Height => "height",
+            PropertyId::MinWidth => "min-width",
+            PropertyId::MaxWidth => "max-width",
+            PropertyId::MinHeight => "min-height",
+            PropertyId::MaxHeight => "max-height",
+            PropertyId::BoxSizing => "box-sizing",
+            PropertyId::Overflow => "overflow",
+            PropertyId::FlexGrow => "flex-grow",
+            PropertyId::FlexBasis => "flex-basis",
+            PropertyId::Position => "position",
+            PropertyId::Top => "top",
+            PropertyId::Right => "right",
+            PropertyId::Bottom => "bottom",
+            PropertyId::Left => "left",
+            PropertyId::FlexDirection => "flex-direction",
+            PropertyId::FlexWrap => "flex-wrap",
+            PropertyId::FlexShrink => "flex-shrink",
+            PropertyId::AlignItems => "align-items",
+            PropertyId::JustifyContent => "justify-content",
+            PropertyId::AlignSelf => "align-self",
+            PropertyId::GridTemplateColumns => "grid-template-columns",
+            PropertyId::GridTemplateRows => "grid-template-rows",
+            PropertyId::RowGap => "row-gap",
+            PropertyId::ColumnGap => "column-gap",
+            PropertyId::GridAutoFlow => "grid-auto-flow",
+            PropertyId::MarginTop => "margin-top",
+            PropertyId::MarginRight => "margin-right",
+            PropertyId::MarginBottom => "margin-bottom",
+            PropertyId::MarginLeft => "margin-left",
+            PropertyId::PaddingTop => "padding-top",
+            PropertyId::PaddingRight => "padding-right",
+            PropertyId::PaddingBottom => "padding-bottom",
+            PropertyId::PaddingLeft => "padding-left",
+            PropertyId::BorderTopStyle => "border-top-style",
+            PropertyId::BorderRightStyle => "border-right-style",
+            PropertyId::BorderBottomStyle => "border-bottom-style",
+            PropertyId::BorderLeftStyle => "border-left-style",
+            PropertyId::BorderTopWidth => "border-top-width",
+            PropertyId::BorderRightWidth => "border-right-width",
+            PropertyId::BorderBottomWidth => "border-bottom-width",
+            PropertyId::BorderLeftWidth => "border-left-width",
+            PropertyId::BorderTopColor => "border-top-color",
+            PropertyId::BorderRightColor => "border-right-color",
+            PropertyId::BorderBottomColor => "border-bottom-color",
+            PropertyId::BorderLeftColor => "border-left-color",
+        }
+    }
+
+    /// 按属性名查 [`PropertyId`]，ASCII case-insensitive
+    /// （CSS Syntax：声明名匹配大小写不敏感）。
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        const ALL: [PropertyId; 58] = [
+            PropertyId::Display,
+            PropertyId::Color,
+            PropertyId::BackgroundColor,
+            PropertyId::FontSize,
+            PropertyId::FontWeight,
+            PropertyId::FontStyle,
+            PropertyId::FontFamily,
+            PropertyId::TextAlign,
+            PropertyId::LineHeight,
+            PropertyId::WhiteSpace,
+            PropertyId::OverflowWrap,
+            PropertyId::WordBreak,
+            PropertyId::Width,
+            PropertyId::Height,
+            PropertyId::MinWidth,
+            PropertyId::MaxWidth,
+            PropertyId::MinHeight,
+            PropertyId::MaxHeight,
+            PropertyId::BoxSizing,
+            PropertyId::Overflow,
+            PropertyId::FlexGrow,
+            PropertyId::FlexBasis,
+            PropertyId::Position,
+            PropertyId::Top,
+            PropertyId::Right,
+            PropertyId::Bottom,
+            PropertyId::Left,
+            PropertyId::FlexDirection,
+            PropertyId::FlexWrap,
+            PropertyId::FlexShrink,
+            PropertyId::AlignItems,
+            PropertyId::JustifyContent,
+            PropertyId::AlignSelf,
+            PropertyId::GridTemplateColumns,
+            PropertyId::GridTemplateRows,
+            PropertyId::RowGap,
+            PropertyId::ColumnGap,
+            PropertyId::GridAutoFlow,
+            PropertyId::MarginTop,
+            PropertyId::MarginRight,
+            PropertyId::MarginBottom,
+            PropertyId::MarginLeft,
+            PropertyId::PaddingTop,
+            PropertyId::PaddingRight,
+            PropertyId::PaddingBottom,
+            PropertyId::PaddingLeft,
+            PropertyId::BorderTopStyle,
+            PropertyId::BorderRightStyle,
+            PropertyId::BorderBottomStyle,
+            PropertyId::BorderLeftStyle,
+            PropertyId::BorderTopWidth,
+            PropertyId::BorderRightWidth,
+            PropertyId::BorderBottomWidth,
+            PropertyId::BorderLeftWidth,
+            PropertyId::BorderTopColor,
+            PropertyId::BorderRightColor,
+            PropertyId::BorderBottomColor,
+            PropertyId::BorderLeftColor,
+        ];
+        ALL.into_iter()
+            .find(|id| id.as_str().eq_ignore_ascii_case(name))
+    }
+}
+
+/// CSS-wide 关键字
+/// （[CSS Cascade 5 §6.1](https://drafts.csswg.org/css-cascade-5/#defaulting-keywords)）。
+///
+/// 对任何属性都合法，求值语义由 cascade 模块实现。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CssWideKeyword {
+    /// `initial`。
+    Initial,
+    /// `inherit`。
+    Inherit,
+    /// `unset`。
+    Unset,
+    /// `revert`。
+    Revert,
+}
+
+/// 一条声明按属性解析后的值。
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeclaredValue {
+    /// CSS-wide 关键字（对任意属性合法）。
+    CssWide(CssWideKeyword),
+    /// 按属性语法解析出的值。
+    Typed(PropertyValue),
+}
+
+/// 各属性解析后的值。
+///
+/// 每个变体对应 [`PropertyId`] 中一个属性的可接受语法；不在集合内的值按
+/// 无效声明处理（整体丢弃，声明级恢复，见 CSS Syntax §5.5）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum PropertyValue {
+    /// `display` 关键字。
+    Display(DisplayValue),
+    /// `text-align` 关键字。
+    TextAlign(TextAlignValue),
+    /// `font-style` 关键字。
+    FontStyle(FontStyleValue),
+    /// 颜色值。
+    Color(Rgba),
+    /// `font-size` 值。
+    FontSize(FontSizeValue),
+    /// `font-weight` 值。
+    FontWeight(FontWeightValue),
+    /// `font-family` 字体族列表。
+    FontFamily(Vec<FontFamilyValue>),
+    /// `line-height` 值。
+    LineHeight(LineHeightValue),
+    /// `white-space` 关键字。
+    WhiteSpace(WhiteSpaceValue),
+    /// `overflow-wrap` 关键字。
+    OverflowWrap(OverflowWrapValue),
+    /// `word-break` 关键字。
+    WordBreak(WordBreakValue),
+    /// `width` / `height` 值（min-width / max-width / min-height / max-height
+    /// 复用同一语法）。
+    Size(SizeValue),
+    /// `box-sizing` 关键字。
+    BoxSizing(BoxSizingValue),
+    /// `overflow` 关键字。
+    Overflow(OverflowValue),
+    /// `flex-grow` 数值。
+    FlexGrow(f32),
+    /// `flex-basis` 值（auto | <length-percentage>）。
+    FlexBasis(SizeValue),
+    /// `position` 关键字。
+    Position(PositionValue),
+    /// `top` / `right` / `bottom` / `left` 值。
+    Inset(InsetValue),
+    /// `flex-direction` 关键字。
+    FlexDirection(FlexDirectionValue),
+    /// `flex-wrap` 关键字。
+    FlexWrap(FlexWrapValue),
+    /// `flex-shrink` 数值。
+    FlexShrink(f32),
+    /// `align-items` 关键字。
+    AlignItems(AlignItemsValue),
+    /// `justify-content` 关键字。
+    JustifyContent(JustifyContentValue),
+    /// `align-self` 关键字。
+    AlignSelf(AlignSelfValue),
+    /// `grid-template-columns` / `grid-template-rows` 轨道列表。
+    GridTrack(GridTrackList),
+    /// `row-gap` / `column-gap` 值。
+    Gap(GapValue),
+    /// `grid-auto-flow` 关键字。
+    GridAutoFlow(GridAutoFlowValue),
+    /// margin 值（四边共用）。
+    Margin(MarginValue),
+    /// padding 值（四边共用）。
+    Padding(PaddingValue),
+    /// border-*-width 值。
+    BorderWidth(BorderWidthValue),
+    /// border-*-style 关键字。
+    BorderStyle(BorderStyle),
+    /// border-*-color 值。
+    BorderColor(BorderColorValue),
+}
+
+/// `display` 的单关键字值
+/// （[CSS Display 3 §2](https://drafts.csswg.org/css-display-3/#the-display-properties)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayValue {
+    /// `inline`（initial）。
+    Inline,
+    /// `block`。
+    Block,
+    /// `list-item`。
+    ListItem,
+    /// `inline-block`。
+    InlineBlock,
+    /// `flow-root`。
+    FlowRoot,
+    /// `flex`。
+    Flex,
+    /// `inline-flex`。
+    InlineFlex,
+    /// `grid`。
+    Grid,
+    /// `inline-grid`。
+    InlineGrid,
+    /// `table`。
+    Table,
+    /// `inline-table`。
+    InlineTable,
+    /// 表格内部盒（`table-row-group` / `table-header-group` /
+    /// `table-footer-group` / `table-row` / `table-cell` /
+    /// `table-column-group` / `table-column` / `table-caption`）。
+    TableInternal(&'static str),
+    /// `contents`。
+    Contents,
+    /// `none`。
+    None,
+}
+
+/// `text-align` 值
+/// （[CSS Text 4](https://drafts.csswg.org/css-text-4/#text-align-property)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextAlignValue {
+    /// `start`（initial）。
+    Start,
+    /// `end`。
+    End,
+    /// `left`。
+    Left,
+    /// `right`。
+    Right,
+    /// `center`。
+    Center,
+    /// `justify`。
+    Justify,
+    /// `match-parent`。
+    MatchParent,
+    /// `justify-all`。
+    JustifyAll,
+}
+
+/// `white-space` 值
+/// （[CSS Text 3 §3.1](https://drafts.csswg.org/css-text-3/#white-space-property)）。
+///
+/// 本层按单属性实现（CSS Text 4 的 `white-space-collapse` + `text-wrap-mode`
+/// 拆分记为偏差）。语义：
+///
+/// | 值 | 空白 | 软换行 |
+/// | --- | --- | --- |
+/// | `normal`（initial） | 折叠 | 允许 |
+/// | `nowrap` | 折叠 | 禁止 |
+/// | `pre` | 保留（`\n` 强断） | 禁止 |
+/// | `pre-wrap` | 保留（`\n` 强断） | 允许 |
+/// | `pre-line` | 折叠空格、保留 `\n`（强断） | 允许 |
+/// | `break-spaces` | 保留（含行尾，`\n` 强断） | 允许（每个空格后） |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WhiteSpaceValue {
+    /// `normal`（initial）。
+    #[default]
+    Normal,
+    /// `nowrap`。
+    Nowrap,
+    /// `pre`。
+    Pre,
+    /// `pre-wrap`。
+    PreWrap,
+    /// `pre-line`。
+    PreLine,
+    /// `break-spaces`。
+    BreakSpaces,
+}
+
+impl WhiteSpaceValue {
+    /// 是否折叠可折叠空白（空格 / 制表 / 段内换行）。
+    #[must_use]
+    pub fn collapses(self) -> bool {
+        matches!(self, Self::Normal | Self::Nowrap | Self::PreLine)
+    }
+
+    /// 是否保留段内换行（`\n` 作为强断行）。
+    #[must_use]
+    pub fn preserves_newlines(self) -> bool {
+        !matches!(self, Self::Normal | Self::Nowrap)
+    }
+
+    /// 是否允许软换行（UAX#14 断点）。
+    #[must_use]
+    pub fn wraps(self) -> bool {
+        !matches!(self, Self::Nowrap | Self::Pre)
+    }
+}
+
+/// `overflow-wrap` 值
+/// （[CSS Text 3 §5.4](https://drafts.csswg.org/css-text-3/#overflow-wrap-property)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverflowWrapValue {
+    /// `normal`（initial）：只在 UAX#14 允许的位置断行。
+    #[default]
+    Normal,
+    /// `break-word`：溢出时可在任意字形簇之间断行；不参与 min-content。
+    BreakWord,
+    /// `anywhere`：溢出时可断，且断点参与 min-content。
+    Anywhere,
+}
+
+/// `word-break` 值
+/// （[CSS Text 3 §5.1](https://drafts.csswg.org/css-text-3/#word-break-property)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WordBreakValue {
+    /// `normal`（initial）。
+    #[default]
+    Normal,
+    /// `break-all`：在相邻 typographic letter unit 之间允许断行
+    /// （不切开字形簇）。
+    BreakAll,
+    /// `keep-all`：禁止 CJK 等词内部断行。
+    KeepAll,
+}
+
+/// `font-style` 值
+/// （[CSS Fonts 4 §2.1](https://drafts.csswg.org/css-fonts-4/#font-style-prop)）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FontStyleValue {
+    /// `normal`（initial）。
+    Normal,
+    /// `italic`。
+    Italic,
+    /// `oblique`，可选倾斜角（角度制；`oblique none` 为 `None`）。
+    Oblique(Option<f32>),
+}
+
+/// `font-size` 的绝对尺寸关键字及其缩放系数
+/// （[CSS Fonts 4 §2.5.1](https://drafts.csswg.org/css-fonts-4/#absolute-size-mapping)：
+/// medium 为基准 1，其余为规范给出的 scaling factor）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AbsoluteSize {
+    /// `xx-small`（3/5）。
+    XxSmall,
+    /// `x-small`（3/4）。
+    XSmall,
+    /// `small`（8/9）。
+    Small,
+    /// `medium`（1）。
+    Medium,
+    /// `large`（6/5）。
+    Large,
+    /// `x-large`（3/2）。
+    XLarge,
+    /// `xx-large`（2/1）。
+    XxLarge,
+    /// `xxx-large`（3/1）。
+    XxxLarge,
+}
+
+impl AbsoluteSize {
+    /// 相对 medium 的缩放系数。
+    #[must_use]
+    pub fn factor(self) -> f32 {
+        match self {
+            AbsoluteSize::XxSmall => 3.0 / 5.0,
+            AbsoluteSize::XSmall => 3.0 / 4.0,
+            AbsoluteSize::Small => 8.0 / 9.0,
+            AbsoluteSize::Medium => 1.0,
+            AbsoluteSize::Large => 6.0 / 5.0,
+            AbsoluteSize::XLarge => 1.5,
+            AbsoluteSize::XxLarge => 2.0,
+            AbsoluteSize::XxxLarge => 3.0,
+        }
+    }
+
+    /// 绝对尺寸关键字的有序表，供 `larger` / `smaller` 取相邻项。
+    pub const ORDERED: [AbsoluteSize; 8] = [
+        AbsoluteSize::XxSmall,
+        AbsoluteSize::XSmall,
+        AbsoluteSize::Small,
+        AbsoluteSize::Medium,
+        AbsoluteSize::Large,
+        AbsoluteSize::XLarge,
+        AbsoluteSize::XxLarge,
+        AbsoluteSize::XxxLarge,
+    ];
+}
+
+/// `font-size` 值
+/// （[CSS Fonts 4 §2.5](https://drafts.csswg.org/css-fonts-4/#font-size-prop)）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FontSizeValue {
+    /// 绝对长度（已折算为 CSS px）。
+    Px(f32),
+    /// 相对父元素计算字号的 em。
+    Em(f32),
+    /// 相对父元素计算字号的百分比，以小数存储（`120%` → `1.2`）。
+    Percent(f32),
+    /// 绝对尺寸关键字。
+    Absolute(AbsoluteSize),
+    /// `larger`。
+    Larger,
+    /// `smaller`。
+    Smaller,
+}
+
+/// `font-weight` 值
+/// （[CSS Fonts 4 §2.2](https://drafts.csswg.org/css-fonts-4/#font-weight-numeric)）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FontWeightValue {
+    /// 数值字重，1–1000（`normal` = 400、`bold` = 700 已在解析期折算）。
+    Weight(f32),
+    /// `bolder`：相对继承值。
+    Bolder,
+    /// `lighter`：相对继承值。
+    Lighter,
+}
+
+/// 字体族列表中的一项
+/// （[CSS Fonts 4 §2.3](https://drafts.csswg.org/css-fonts-4/#font-family-prop)）。
+///
+/// 带引号的 `"serif"` 是名为 serif 的普通字体族，只有不带引号的
+/// generic 关键字才映射到 [`FontFamilyValue`] 的 generic 变体。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FontFamilyValue {
+    /// generic 族（`serif` / `sans-serif` / `cursive` / `fantasy` /
+    /// `monospace` / `system-ui` / `ui-serif` / `ui-sans-serif` /
+    /// `ui-monospace` / `ui-rounded` / `math` / `emoji` / `fangsong`）。
+    Generic(&'static str),
+    /// 具名字体族。
+    Family(String),
+}
+
+/// `line-height` 值
+/// （[CSS 2.1 §10.8.1](https://www.w3.org/TR/CSS21/visudet.html#line-height)）。
+///
+/// 数值保持数值（以自身数值继承，子元素按自身 font-size 求值）；
+/// 百分比与 em 在 computed 阶段按元素自身 font-size 折算（cascade 模块）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LineHeightValue {
+    /// `normal`（initial，约 1.2，具体由 UA 决定）。
+    Normal,
+    /// 无单位数值（可为 0，不可为负）。
+    Number(f32),
+    /// 绝对长度（已折算为 CSS px）。
+    Length(f32),
+    /// 相对自身 font-size 的 em。
+    Em(f32),
+    /// 百分比（以小数存储，`150%` → `1.5`；computed 阶段乘 font-size）。
+    Percent(f32),
+}
+
+/// `width` / `height` 值
+/// （[CSS 2.1 §10.2](https://www.w3.org/TR/CSS21/visudet.html#the-width-property)、
+/// [§10.5](https://www.w3.org/TR/CSS21/visudet.html#the-height-property)）。
+///
+/// 百分比由 layout 相对包含块宽度解析；负值非法（声明无效）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SizeValue {
+    /// `auto`（initial）。
+    Auto,
+    /// 绝对长度（CSS px）。
+    Length(f32),
+    /// 百分比（以小数存储）。
+    Percent(f32),
+    /// 视口单位（`50vw` → `Viewport(50.0, Vw)`）；cascade 在 computed 阶段
+    /// 按视口尺寸折算为 [`SizeValue::Length`]，无视口信息时原样保留。
+    Viewport(f32, ViewportUnit),
+}
+
+/// `box-sizing` 值
+/// （[CSS Sizing 4 §5.3](https://drafts.csswg.org/css-sizing-4/#box-sizing)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoxSizingValue {
+    /// `content-box`（initial）：width/height 指内容盒。
+    ContentBox,
+    /// `border-box`：width/height 指边框盒。
+    BorderBox,
+}
+
+/// `overflow` 值
+/// （[CSS Overflow 3 §3](https://drafts.csswg.org/css-overflow-3/#overflow-control)）。
+///
+/// 本层只建模 visible / hidden 的裁剪标记；`auto` / `scroll` / `clip`
+/// 暂按无效声明丢弃（回退 initial `visible`，见模块偏差）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverflowValue {
+    /// `visible`（initial）：内容溢出可见。
+    Visible,
+    /// `hidden`：内容裁剪标记（裁剪实现待 paint/layout 接入）。
+    Hidden,
+}
+
+/// `position` 值
+/// （[CSS Position 3 §2](https://drafts.csswg.org/css-position-3/#position-properties)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionValue {
+    /// `static`（initial）：常规流，不建立包含块。
+    Static,
+    /// `relative`：相对自身偏移，仍占常规流空间。
+    Relative,
+    /// `absolute`：相对最近定位祖先（无则视口）定位，脱离常规流。
+    Absolute,
+    /// `fixed`：相对视口定位（本布局层按 absolute 处理）。
+    Fixed,
+}
+
+/// `top` / `right` / `bottom` / `left` 值（inset）
+/// （[CSS Position 3 §3](https://drafts.csswg.org/css-position-3/#insets)）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InsetValue {
+    /// 绝对长度（CSS px）。
+    Length(f32),
+    /// 百分比（相对包含块对应轴尺寸；本层仅垂直相对高度，水平相对宽度，
+    /// 由 layout 解析）。
+    Percent(f32),
+    /// `auto`（initial）。
+    Auto,
+    /// 视口单位；cascade 在 computed 阶段折算（同 [`SizeValue::Viewport`]）。
+    Viewport(f32, ViewportUnit),
+}
+
+/// `flex-direction` 值
+/// （[CSS Flexbox §8.3.1](https://drafts.csswg.org/css-flexbox/#flex-direction-property)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlexDirectionValue {
+    /// `row`（initial）。
+    Row,
+    /// `row-reverse`。
+    RowReverse,
+    /// `column`。
+    Column,
+    /// `column-reverse`。
+    ColumnReverse,
+}
+
+/// `flex-wrap` 值
+/// （[CSS Flexbox §8.4.1](https://drafts.csswg.org/css-flexbox/#flex-wrap-property)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlexWrapValue {
+    /// `nowrap`（initial）：单行。
+    NoWrap,
+    /// `wrap`：多行。
+    Wrap,
+    /// `wrap-reverse`：多行反向。
+    WrapReverse,
+}
+
+/// `align-items` / `align-self` 的 cross-axis 对齐值
+/// （[CSS Box Alignment §7](https://drafts.csswg.org/css-align-3/#align-items-property)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignItemsValue {
+    /// `stretch`（initial）。
+    Stretch,
+    /// `flex-start` / `start`。
+    FlexStart,
+    /// `flex-end` / `end`。
+    FlexEnd,
+    /// `center`。
+    Center,
+    /// `baseline`。
+    Baseline,
+}
+
+/// `justify-content` 的主轴对齐值
+/// （[CSS Box Alignment §8](https://drafts.csswg.org/css-align-3/#justify-content-property)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JustifyContentValue {
+    /// `flex-start` / `start`（initial）。
+    FlexStart,
+    /// `flex-end` / `end`。
+    FlexEnd,
+    /// `center`。
+    Center,
+    /// `space-between`。
+    SpaceBetween,
+    /// `space-around`。
+    SpaceAround,
+    /// `space-evenly`。
+    SpaceEvenly,
+}
+
+/// `align-self` 值（在 `align-items` 基础上多一个 `auto` 回退父值）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignSelfValue {
+    /// `auto`（initial）：回退到父 `align-items`。
+    Auto,
+    /// 同 [`AlignItemsValue::Stretch`]。
+    Stretch,
+    /// 同 [`AlignItemsValue::FlexStart`]。
+    FlexStart,
+    /// 同 [`AlignItemsValue::FlexEnd`]。
+    FlexEnd,
+    /// 同 [`AlignItemsValue::Center`]。
+    Center,
+    /// 同 [`AlignItemsValue::Baseline`]。
+    Baseline,
+}
+
+/// `gap` 值
+/// （[CSS Box Alignment §6](https://drafts.csswg.org/css-align-3/#gap-shorthand)）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GapValue {
+    /// 绝对长度（CSS px）。
+    Length(f32),
+    /// 百分比（相对包含块对应轴尺寸）。
+    Percent(f32),
+    /// `normal`（initial）：退化为 0。
+    Normal,
+    /// 视口单位；cascade 在 computed 阶段折算（同 [`SizeValue::Viewport`]）。
+    Viewport(f32, ViewportUnit),
+}
+
+/// `grid-auto-flow` 值
+/// （[CSS Grid §7.7](https://drafts.csswg.org/css-grid/#grid-auto-flow-property)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GridAutoFlowValue {
+    /// `row`（initial）。
+    Row,
+    /// `column`。
+    Column,
+    /// `row dense`。
+    RowDense,
+    /// `column dense`。
+    ColumnDense,
+}
+
+/// 一条 grid 轨道的轨道尺寸函数（简化版）。
+///
+/// 仅覆盖布局几何需要的子集：固定长度、百分比、弹性系数 `fr`、自适应
+/// `auto`、以及两段式 `minmax(a, b)`（a/b 各为长度/百分比/fr/auto）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum GridTrack {
+    /// 固定长度（CSS px）。
+    Length(f32),
+    /// 百分比（相对网格容器尺寸）。
+    Percent(f32),
+    /// 弹性系数 `fr`（参与剩余空间分配）。
+    Fr(f32),
+    /// `auto`：内容驱动尺寸。
+    Auto,
+    /// `minmax(a, b)`。
+    MinMax(Box<GridTrack>, Box<GridTrack>),
+}
+
+/// `grid-template-columns` / `grid-template-rows` 的轨道列表。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GridTrackList {
+    /// 轨道序列；空表示未显式指定（用隐式轨道）。
+    pub tracks: Vec<GridTrack>,
+}
+
+/// `margin-*` 值
+/// （[CSS 2.1 §8.3](https://www.w3.org/TR/CSS21/box.html#margin-properties)）。
+///
+/// 可为负；百分比由 layout 相对包含块宽度解析。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MarginValue {
+    /// 绝对长度（CSS px，可负）。
+    Length(f32),
+    /// 百分比（以小数存储）。
+    Percent(f32),
+    /// `auto`（initial；块级布局中解析为 0 或剩余空间）。
+    Auto,
+    /// 视口单位；cascade 在 computed 阶段折算（同 [`SizeValue::Viewport`]）。
+    Viewport(f32, ViewportUnit),
+}
+
+/// `padding-*` 值
+/// （[CSS 2.1 §8.4](https://www.w3.org/TR/CSS21/box.html#padding-properties)）。
+///
+/// 不接受 auto，负值非法；百分比由 layout 相对包含块宽度解析。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PaddingValue {
+    /// 绝对长度（CSS px，非负）。
+    Length(f32),
+    /// 百分比（以小数存储）。
+    Percent(f32),
+    /// 视口单位；cascade 在 computed 阶段折算（同 [`SizeValue::Viewport`]）。
+    Viewport(f32, ViewportUnit),
+}
+
+/// `border-*-width` 值
+/// （[CSS 2.1 §8.5.4](https://www.w3.org/TR/CSS21/box.html#border-width-properties)）。
+///
+/// 关键字在解析期折算（thin 1px / medium 3px / thick 5px，与浏览器默认一致）；
+/// computed 阶段 style 为 none/hidden 时归零（cascade 模块）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BorderWidthValue {
+    /// 绝对长度（CSS px，非负）。
+    Length(f32),
+    /// `thin`（1px）。
+    Thin,
+    /// `medium`（initial，3px）。
+    Medium,
+    /// `thick`（5px）。
+    Thick,
+}
+
+impl BorderWidthValue {
+    /// 关键字/长度 → CSS px。
+    #[must_use]
+    pub fn px(self) -> f32 {
+        match self {
+            BorderWidthValue::Length(px) => px,
+            BorderWidthValue::Thin => 1.0,
+            BorderWidthValue::Medium => 3.0,
+            BorderWidthValue::Thick => 5.0,
+        }
+    }
+}
+
+/// `border-*-style` 关键字
+/// （[CSS 2.1 §8.5.3](https://www.w3.org/TR/CSS21/box.html#border-style-properties)）。
+///
+/// 全部 10 个关键字都按规范接受；绘制端当前只区分 none/hidden 与可见边框
+/// （`solid` 语义），其余样式的绘制待 paint 层扩展。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorderStyle {
+    /// `none`（initial）。
+    None,
+    /// `hidden`。
+    Hidden,
+    /// `solid`。
+    Solid,
+    /// `dashed`。
+    Dashed,
+    /// `dotted`。
+    Dotted,
+    /// `double`。
+    Double,
+    /// `groove`。
+    Groove,
+    /// `ridge`。
+    Ridge,
+    /// `inset`。
+    Inset,
+    /// `outset`。
+    Outset,
+}
+
+impl BorderStyle {
+    /// 是否画出可见边框（none/hidden 之外）。
+    #[must_use]
+    pub fn visible(self) -> bool {
+        !matches!(self, BorderStyle::None | BorderStyle::Hidden)
+    }
+}
+
+/// `border-*-color` 值
+/// （[CSS 2.1 §8.5.2](https://www.w3.org/TR/CSS21/box.html#border-color-properties)）。
+///
+/// `currentcolor` 在 computed 阶段按本元素 `color` 解析（cascade 模块）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BorderColorValue {
+    /// 具体颜色。
+    Rgba(Rgba),
+    /// `currentcolor`。
+    CurrentColor,
+}
+
+/// 把声明值解析为 [`DeclaredValue`]：先识别 CSS-wide 关键字，再按属性语法解析。
+///
+/// `input` 已由调用方限定在本条声明的值范围内（分号 / 块尾之前）。
+/// 返回值连同该声明是否带 `!important`（CSS Cascade 5 §5.1）；返回 `Err`
+/// 表示整条声明无效。
+pub(crate) fn parse_declared_value(
+    property: PropertyId,
+    input: &mut Parser<'_>,
+) -> Result<(DeclaredValue, bool), ()> {
+    if let Ok(keyword) = input.try_parse(parse_css_wide_keyword) {
+        let important = input.try_parse(parse_important).is_ok();
+        // CSS-wide 关键字不允许再拼接其他值
+        // （CSS Cascade 5：关键字是完整的 <declaration-value>）。
+        if input.expect_exhausted().is_err() {
+            return Err(());
+        }
+        return Ok((DeclaredValue::CssWide(keyword), important));
+    }
+    let value = parse_property_value(property, input)?;
+    let important = input.try_parse(parse_important).is_ok();
+    if input.expect_exhausted().is_err() {
+        return Err(());
+    }
+    Ok((DeclaredValue::Typed(value), important))
+}
+
+/// 解析 CSS-wide 关键字（ASCII case-insensitive）。
+pub(crate) fn parse_css_wide_keyword(input: &mut Parser<'_>) -> Result<CssWideKeyword, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("initial") {
+        Ok(CssWideKeyword::Initial)
+    } else if name.eq_ignore_ascii_case("inherit") {
+        Ok(CssWideKeyword::Inherit)
+    } else if name.eq_ignore_ascii_case("unset") {
+        Ok(CssWideKeyword::Unset)
+    } else if name.eq_ignore_ascii_case("revert") {
+        Ok(CssWideKeyword::Revert)
+    } else {
+        Err(())
+    }
+}
+
+/// 按属性语法解析值。
+fn parse_property_value(property: PropertyId, input: &mut Parser<'_>) -> Result<PropertyValue, ()> {
+    match property {
+        PropertyId::Display => parse_display(input).map(PropertyValue::Display),
+        PropertyId::TextAlign => parse_text_align(input).map(PropertyValue::TextAlign),
+        PropertyId::FontStyle => parse_font_style(input).map(PropertyValue::FontStyle),
+        PropertyId::Color => parse_color(input).map(PropertyValue::Color),
+        PropertyId::FontSize => parse_font_size(input).map(PropertyValue::FontSize),
+        PropertyId::FontWeight => parse_font_weight(input).map(PropertyValue::FontWeight),
+        PropertyId::FontFamily => parse_font_family(input).map(PropertyValue::FontFamily),
+        PropertyId::BackgroundColor => parse_color(input).map(PropertyValue::Color),
+        PropertyId::LineHeight => parse_line_height(input).map(PropertyValue::LineHeight),
+        PropertyId::WhiteSpace => parse_white_space(input).map(PropertyValue::WhiteSpace),
+        PropertyId::OverflowWrap => parse_overflow_wrap(input).map(PropertyValue::OverflowWrap),
+        PropertyId::WordBreak => parse_word_break(input).map(PropertyValue::WordBreak),
+        PropertyId::Width
+        | PropertyId::Height
+        | PropertyId::MinWidth
+        | PropertyId::MaxWidth
+        | PropertyId::MinHeight
+        | PropertyId::MaxHeight => parse_size(input).map(PropertyValue::Size),
+        PropertyId::BoxSizing => parse_box_sizing(input).map(PropertyValue::BoxSizing),
+        PropertyId::Overflow => parse_overflow(input).map(PropertyValue::Overflow),
+        PropertyId::FlexGrow => parse_flex_grow(input).map(PropertyValue::FlexGrow),
+        PropertyId::FlexBasis => parse_size(input).map(PropertyValue::FlexBasis),
+        PropertyId::Position => parse_position(input).map(PropertyValue::Position),
+        PropertyId::Top | PropertyId::Right | PropertyId::Bottom | PropertyId::Left => {
+            parse_inset(input).map(PropertyValue::Inset)
+        }
+        PropertyId::FlexDirection => parse_flex_direction(input).map(PropertyValue::FlexDirection),
+        PropertyId::FlexWrap => parse_flex_wrap(input).map(PropertyValue::FlexWrap),
+        PropertyId::FlexShrink => parse_flex_shrink(input).map(PropertyValue::FlexShrink),
+        PropertyId::AlignItems => parse_align_items(input).map(PropertyValue::AlignItems),
+        PropertyId::JustifyContent => {
+            parse_justify_content(input).map(PropertyValue::JustifyContent)
+        }
+        PropertyId::AlignSelf => parse_align_self(input).map(PropertyValue::AlignSelf),
+        PropertyId::GridTemplateColumns | PropertyId::GridTemplateRows => {
+            parse_grid_track_list(input).map(PropertyValue::GridTrack)
+        }
+        PropertyId::RowGap | PropertyId::ColumnGap => parse_gap(input).map(PropertyValue::Gap),
+        PropertyId::GridAutoFlow => parse_grid_auto_flow(input).map(PropertyValue::GridAutoFlow),
+        PropertyId::MarginTop
+        | PropertyId::MarginRight
+        | PropertyId::MarginBottom
+        | PropertyId::MarginLeft => parse_margin(input).map(PropertyValue::Margin),
+        PropertyId::PaddingTop
+        | PropertyId::PaddingRight
+        | PropertyId::PaddingBottom
+        | PropertyId::PaddingLeft => parse_padding(input).map(PropertyValue::Padding),
+        PropertyId::BorderTopWidth
+        | PropertyId::BorderRightWidth
+        | PropertyId::BorderBottomWidth
+        | PropertyId::BorderLeftWidth => parse_border_width(input).map(PropertyValue::BorderWidth),
+        PropertyId::BorderTopStyle
+        | PropertyId::BorderRightStyle
+        | PropertyId::BorderBottomStyle
+        | PropertyId::BorderLeftStyle => parse_border_style(input).map(PropertyValue::BorderStyle),
+        PropertyId::BorderTopColor
+        | PropertyId::BorderRightColor
+        | PropertyId::BorderBottomColor
+        | PropertyId::BorderLeftColor => parse_border_color(input).map(PropertyValue::BorderColor),
+    }
+}
+
+/// `line-height`：normal | <number [0,∞]> | <length> | <percentage>
+/// （CSS 2.1 §10.8.1）。
+fn parse_line_height(input: &mut Parser<'_>) -> Result<LineHeightValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("normal") => Ok(LineHeightValue::Normal),
+        Token::Number { value, .. } => {
+            sanitize_number(*value).filter(|value| *value >= 0.0).map(LineHeightValue::Number).ok_or(())
+        }
+        Token::Percentage { unit_value, .. } => {
+            sanitize_number(*unit_value).map(LineHeightValue::Percent).ok_or(())
+        }
+        Token::Dimension { value, unit, .. } => {
+            if unit.eq_ignore_ascii_case("em") {
+                sanitize_number(*value).map(LineHeightValue::Em).ok_or(())
+            } else {
+                length_to_px(*value, unit)
+                    .map(LineHeightValue::Length)
+                    .ok_or(())
+            }
+        }
+        _ => Err(()),
+    }
+}
+
+/// `white-space`：CSS Text 3 §3.1 的六个关键字。
+///
+/// Level 4 拆分的 `white-space-collapse` / `text-wrap-mode` 未实现；两个关键字
+/// 连写（如 `pre nowrap`）按非法值整条丢弃。
+fn parse_white_space(input: &mut Parser<'_>) -> Result<WhiteSpaceValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("normal") {
+        Ok(WhiteSpaceValue::Normal)
+    } else if name.eq_ignore_ascii_case("nowrap") {
+        Ok(WhiteSpaceValue::Nowrap)
+    } else if name.eq_ignore_ascii_case("pre") {
+        Ok(WhiteSpaceValue::Pre)
+    } else if name.eq_ignore_ascii_case("pre-wrap") {
+        Ok(WhiteSpaceValue::PreWrap)
+    } else if name.eq_ignore_ascii_case("pre-line") {
+        Ok(WhiteSpaceValue::PreLine)
+    } else if name.eq_ignore_ascii_case("break-spaces") {
+        Ok(WhiteSpaceValue::BreakSpaces)
+    } else {
+        Err(())
+    }
+}
+
+/// `overflow-wrap`：normal | break-word | anywhere（CSS Text 3 §5.4）。
+fn parse_overflow_wrap(input: &mut Parser<'_>) -> Result<OverflowWrapValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("normal") {
+        Ok(OverflowWrapValue::Normal)
+    } else if name.eq_ignore_ascii_case("break-word") {
+        Ok(OverflowWrapValue::BreakWord)
+    } else if name.eq_ignore_ascii_case("anywhere") {
+        Ok(OverflowWrapValue::Anywhere)
+    } else {
+        Err(())
+    }
+}
+
+/// `word-break`：normal | break-all | keep-all（CSS Text 3 §5.1）。
+fn parse_word_break(input: &mut Parser<'_>) -> Result<WordBreakValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("normal") {
+        Ok(WordBreakValue::Normal)
+    } else if name.eq_ignore_ascii_case("break-all") {
+        Ok(WordBreakValue::BreakAll)
+    } else if name.eq_ignore_ascii_case("keep-all") {
+        Ok(WordBreakValue::KeepAll)
+    } else {
+        Err(())
+    }
+}
+
+/// `width` / `height`：<length> | <percentage> | auto，负值非法。
+fn parse_size(input: &mut Parser<'_>) -> Result<SizeValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("auto") => Ok(SizeValue::Auto),
+        Token::Number { value: 0.0, .. } => Ok(SizeValue::Length(0.0)),
+        Token::Percentage { unit_value, .. } => {
+            sanitize_number(*unit_value).map(SizeValue::Percent).ok_or(())
+        }
+        Token::Dimension { value, unit, .. } => {
+            if *value < 0.0 {
+                return Err(());
+            }
+            if let Some((amount, unit)) = viewport_length(*value, unit) {
+                return sanitize_number(amount)
+                    .map(|amount| SizeValue::Viewport(amount, unit))
+                    .ok_or(());
+            }
+            length_to_px(*value, unit).map(SizeValue::Length).ok_or(())
+        }
+        _ => Err(()),
+    }
+}
+
+/// `box-sizing`：content-box | border-box（ASCII case-insensitive）。
+fn parse_box_sizing(input: &mut Parser<'_>) -> Result<BoxSizingValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("content-box") => {
+            Ok(BoxSizingValue::ContentBox)
+        }
+        Token::Ident(name) if name.eq_ignore_ascii_case("border-box") => {
+            Ok(BoxSizingValue::BorderBox)
+        }
+        _ => Err(()),
+    }
+}
+
+/// `overflow`：visible | hidden（偏差：auto/scroll/clip 暂按无效丢弃）。
+fn parse_overflow(input: &mut Parser<'_>) -> Result<OverflowValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("visible") => Ok(OverflowValue::Visible),
+        Token::Ident(name) if name.eq_ignore_ascii_case("hidden") => Ok(OverflowValue::Hidden),
+        _ => Err(()),
+    }
+}
+
+/// `flex-grow`：<number [0,∞]>（CSS Flexbox §7.1；负数非法）。
+fn parse_flex_grow(input: &mut Parser<'_>) -> Result<f32, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Number { value, .. } if *value >= 0.0 => sanitize_number(*value).ok_or(()),
+        _ => Err(()),
+    }
+}
+
+/// `position`：static | relative | absolute | fixed（ASCII case-insensitive）。
+///
+/// `fixed` 在本布局层按 `absolute` 处理（相对视口定位的包含块由 layout 提供）。
+fn parse_position(input: &mut Parser<'_>) -> Result<PositionValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("static") {
+        Ok(PositionValue::Static)
+    } else if name.eq_ignore_ascii_case("relative") {
+        Ok(PositionValue::Relative)
+    } else if name.eq_ignore_ascii_case("absolute") {
+        Ok(PositionValue::Absolute)
+    } else if name.eq_ignore_ascii_case("fixed") {
+        Ok(PositionValue::Fixed)
+    } else {
+        Err(())
+    }
+}
+
+/// `top` / `right` / `bottom` / `left`：<length> | <percentage> | auto。
+fn parse_inset(input: &mut Parser<'_>) -> Result<InsetValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("auto") => Ok(InsetValue::Auto),
+        Token::Number { value: 0.0, .. } => Ok(InsetValue::Length(0.0)),
+        Token::Percentage { unit_value, .. } => {
+            sanitize_number(*unit_value).map(InsetValue::Percent).ok_or(())
+        }
+        Token::Dimension { value, unit, .. } => {
+            if let Some((amount, unit)) = viewport_length(*value, unit) {
+                return sanitize_number(amount)
+                    .map(|amount| InsetValue::Viewport(amount, unit))
+                    .ok_or(());
+            }
+            length_to_px(*value, unit).map(InsetValue::Length).ok_or(())
+        }
+        _ => Err(()),
+    }
+}
+
+/// `flex-direction`：row | row-reverse | column | column-reverse。
+fn parse_flex_direction(input: &mut Parser<'_>) -> Result<FlexDirectionValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("row") {
+        Ok(FlexDirectionValue::Row)
+    } else if name.eq_ignore_ascii_case("row-reverse") {
+        Ok(FlexDirectionValue::RowReverse)
+    } else if name.eq_ignore_ascii_case("column") {
+        Ok(FlexDirectionValue::Column)
+    } else if name.eq_ignore_ascii_case("column-reverse") {
+        Ok(FlexDirectionValue::ColumnReverse)
+    } else {
+        Err(())
+    }
+}
+
+/// `flex-wrap`：nowrap | wrap | wrap-reverse。
+fn parse_flex_wrap(input: &mut Parser<'_>) -> Result<FlexWrapValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("nowrap") {
+        Ok(FlexWrapValue::NoWrap)
+    } else if name.eq_ignore_ascii_case("wrap") {
+        Ok(FlexWrapValue::Wrap)
+    } else if name.eq_ignore_ascii_case("wrap-reverse") {
+        Ok(FlexWrapValue::WrapReverse)
+    } else {
+        Err(())
+    }
+}
+
+/// `flex-shrink`：<number [0,∞]>（CSS Flexbox §7.2；负数非法）。
+fn parse_flex_shrink(input: &mut Parser<'_>) -> Result<f32, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Number { value, .. } if *value >= 0.0 => sanitize_number(*value).ok_or(()),
+        _ => Err(()),
+    }
+}
+
+/// `align-items`：stretch | flex-start | flex-end | center | baseline
+/// （兼容 `start` / `end` 取 flex-* 语义；CSS Box Alignment §7）。
+fn parse_align_items(input: &mut Parser<'_>) -> Result<AlignItemsValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("stretch") {
+        Ok(AlignItemsValue::Stretch)
+    } else if name.eq_ignore_ascii_case("flex-start") || name.eq_ignore_ascii_case("start") {
+        Ok(AlignItemsValue::FlexStart)
+    } else if name.eq_ignore_ascii_case("flex-end") || name.eq_ignore_ascii_case("end") {
+        Ok(AlignItemsValue::FlexEnd)
+    } else if name.eq_ignore_ascii_case("center") {
+        Ok(AlignItemsValue::Center)
+    } else if name.eq_ignore_ascii_case("baseline") {
+        Ok(AlignItemsValue::Baseline)
+    } else {
+        Err(())
+    }
+}
+
+/// `justify-content`：flex-start | flex-end | center | space-between |
+/// space-around | space-evenly（兼容 `start` / `end`）。
+fn parse_justify_content(input: &mut Parser<'_>) -> Result<JustifyContentValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("flex-start") || name.eq_ignore_ascii_case("start") {
+        Ok(JustifyContentValue::FlexStart)
+    } else if name.eq_ignore_ascii_case("flex-end") || name.eq_ignore_ascii_case("end") {
+        Ok(JustifyContentValue::FlexEnd)
+    } else if name.eq_ignore_ascii_case("center") {
+        Ok(JustifyContentValue::Center)
+    } else if name.eq_ignore_ascii_case("space-between") {
+        Ok(JustifyContentValue::SpaceBetween)
+    } else if name.eq_ignore_ascii_case("space-around") {
+        Ok(JustifyContentValue::SpaceAround)
+    } else if name.eq_ignore_ascii_case("space-evenly") {
+        Ok(JustifyContentValue::SpaceEvenly)
+    } else {
+        Err(())
+    }
+}
+
+/// `align-self`：auto | stretch | flex-start | flex-end | center | baseline。
+fn parse_align_self(input: &mut Parser<'_>) -> Result<AlignSelfValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("auto") {
+        Ok(AlignSelfValue::Auto)
+    } else if name.eq_ignore_ascii_case("stretch") {
+        Ok(AlignSelfValue::Stretch)
+    } else if name.eq_ignore_ascii_case("flex-start") || name.eq_ignore_ascii_case("start") {
+        Ok(AlignSelfValue::FlexStart)
+    } else if name.eq_ignore_ascii_case("flex-end") || name.eq_ignore_ascii_case("end") {
+        Ok(AlignSelfValue::FlexEnd)
+    } else if name.eq_ignore_ascii_case("center") {
+        Ok(AlignSelfValue::Center)
+    } else if name.eq_ignore_ascii_case("baseline") {
+        Ok(AlignSelfValue::Baseline)
+    } else {
+        Err(())
+    }
+}
+
+/// `row-gap` / `column-gap`：<length> | <percentage> | normal
+/// （CSS Box Alignment §6；`auto` 不是合法 gap 值，按无效声明丢弃）。
+fn parse_gap(input: &mut Parser<'_>) -> Result<GapValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("normal") => Ok(GapValue::Normal),
+        Token::Number { value: 0.0, .. } => Ok(GapValue::Length(0.0)),
+        Token::Percentage { unit_value, .. } => {
+            sanitize_number(*unit_value).map(GapValue::Percent).ok_or(())
+        }
+        Token::Dimension { value, unit, .. } => {
+            if let Some((amount, unit)) = viewport_length(*value, unit) {
+                return sanitize_number(amount)
+                    .map(|amount| GapValue::Viewport(amount, unit))
+                    .ok_or(());
+            }
+            length_to_px(*value, unit).map(GapValue::Length).ok_or(())
+        }
+        _ => Err(()),
+    }
+}
+
+/// `grid-auto-flow`：row | column | row dense | column dense。
+fn parse_grid_auto_flow(input: &mut Parser<'_>) -> Result<GridAutoFlowValue, ()> {
+    let first = match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("row") => GridAutoFlowValue::Row,
+        Token::Ident(name) if name.eq_ignore_ascii_case("column") => GridAutoFlowValue::Column,
+        _ => return Err(()),
+    };
+    // 可选 `dense` 后缀
+    if input
+        .try_parse(|i| i.expect_ident_matching("dense").map(|_| ()))
+        .is_ok()
+    {
+        if input.expect_exhausted().is_err() {
+            return Err(());
+        }
+        return Ok(match first {
+            GridAutoFlowValue::Row => GridAutoFlowValue::RowDense,
+            GridAutoFlowValue::Column => GridAutoFlowValue::ColumnDense,
+            _ => unreachable!(),
+        });
+    }
+    if input.expect_exhausted().is_err() {
+        return Err(());
+    }
+    Ok(first)
+}
+
+/// `grid-template-columns` / `grid-template-rows` 的轨道列表解析
+/// （CSS Grid §7.2/§7.3；空白分隔轨道，支持 `minmax()`）。
+fn parse_grid_track_list(input: &mut Parser<'_>) -> Result<GridTrackList, ()> {
+    let mut tracks = Vec::new();
+    let mut first = true;
+    while !input.is_exhausted() {
+        if !first && input.try_parse(|i| i.expect_whitespace()).is_err() {
+            return Err(());
+        }
+        first = false;
+        tracks.push(parse_grid_track(input)?);
+    }
+    Ok(GridTrackList { tracks })
+}
+
+/// 单条 grid 轨道尺寸函数。
+fn parse_grid_track(input: &mut Parser<'_>) -> Result<GridTrack, ()> {
+    if input
+        .try_parse(|i| i.expect_function_matching("minmax").map(|_| ()))
+        .is_ok()
+    {
+        return input
+            .parse_nested_block(|i| {
+                let a =
+                    parse_grid_track_size(i).map_err(|_| ParseError::<()>::unexpected_token())?;
+                i.expect_comma()
+                    .map_err(|_| ParseError::<()>::unexpected_token())?;
+                let b =
+                    parse_grid_track_size(i).map_err(|_| ParseError::<()>::unexpected_token())?;
+                i.expect_exhausted()
+                    .map_err(|_| ParseError::<()>::unexpected_token())?;
+                Ok(GridTrack::MinMax(Box::new(a), Box::new(b)))
+            })
+            .map_err(|_| ());
+    }
+    parse_grid_track_size(input)
+}
+
+/// 单段轨道尺寸（`minmax` 内的一段）：<length> | <percentage> | <flex> | auto。
+fn parse_grid_track_size(input: &mut Parser<'_>) -> Result<GridTrack, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("auto") => Ok(GridTrack::Auto),
+        Token::Number { value: 0.0, .. } => Ok(GridTrack::Length(0.0)),
+        Token::Percentage { unit_value, .. } => {
+            sanitize_number(*unit_value).map(GridTrack::Percent).ok_or(())
+        }
+        Token::Dimension { value, unit, .. } => {
+            if unit.eq_ignore_ascii_case("fr") {
+                sanitize_number(*value).map(GridTrack::Fr).ok_or(())
+            } else {
+                length_to_px(*value, unit).map(GridTrack::Length).ok_or(())
+            }
+        }
+        _ => Err(()),
+    }
+}
+
+/// `margin-*`：<length> | <percentage> | auto，长度可负。
+fn parse_margin(input: &mut Parser<'_>) -> Result<MarginValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("auto") => Ok(MarginValue::Auto),
+        Token::Number { value: 0.0, .. } => Ok(MarginValue::Length(0.0)),
+        Token::Percentage { unit_value, .. } => {
+            sanitize_number(*unit_value).map(MarginValue::Percent).ok_or(())
+        }
+        Token::Dimension { value, unit, .. } => {
+            if let Some((amount, unit)) = viewport_length(*value, unit) {
+                return sanitize_number(amount)
+                    .map(|amount| MarginValue::Viewport(amount, unit))
+                    .ok_or(());
+            }
+            length_to_px(*value, unit)
+                .map(MarginValue::Length)
+                .ok_or(())
+        }
+        _ => Err(()),
+    }
+}
+
+/// `padding-*`：<length> | <percentage>，不接受 auto、负值非法。
+fn parse_padding(input: &mut Parser<'_>) -> Result<PaddingValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Number { value: 0.0, .. } => Ok(PaddingValue::Length(0.0)),
+        Token::Percentage { unit_value, .. } => {
+            sanitize_number(*unit_value).map(PaddingValue::Percent).ok_or(())
+        }
+        Token::Dimension { value, unit, .. } => {
+            if *value < 0.0 {
+                return Err(());
+            }
+            if let Some((amount, unit)) = viewport_length(*value, unit) {
+                return sanitize_number(amount)
+                    .map(|amount| PaddingValue::Viewport(amount, unit))
+                    .ok_or(());
+            }
+            length_to_px(*value, unit)
+                .map(PaddingValue::Length)
+                .ok_or(())
+        }
+        _ => Err(()),
+    }
+}
+
+/// `border-*-width`：<line-width>（<length [0,∞]> | thin | medium | thick）。
+fn parse_border_width(input: &mut Parser<'_>) -> Result<BorderWidthValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("thin") => Ok(BorderWidthValue::Thin),
+        Token::Ident(name) if name.eq_ignore_ascii_case("medium") => Ok(BorderWidthValue::Medium),
+        Token::Ident(name) if name.eq_ignore_ascii_case("thick") => Ok(BorderWidthValue::Thick),
+        Token::Number { value: 0.0, .. } => Ok(BorderWidthValue::Length(0.0)),
+        Token::Dimension { value, unit, .. } => {
+            if *value < 0.0 {
+                return Err(());
+            }
+            length_to_px(*value, unit)
+                .map(BorderWidthValue::Length)
+                .ok_or(())
+        }
+        _ => Err(()),
+    }
+}
+
+/// `border-*-style`：<line-style>（10 个关键字）。
+fn parse_border_style(input: &mut Parser<'_>) -> Result<BorderStyle, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    const STYLES: [(&str, BorderStyle); 10] = [
+        ("none", BorderStyle::None),
+        ("hidden", BorderStyle::Hidden),
+        ("solid", BorderStyle::Solid),
+        ("dashed", BorderStyle::Dashed),
+        ("dotted", BorderStyle::Dotted),
+        ("double", BorderStyle::Double),
+        ("groove", BorderStyle::Groove),
+        ("ridge", BorderStyle::Ridge),
+        ("inset", BorderStyle::Inset),
+        ("outset", BorderStyle::Outset),
+    ];
+    STYLES
+        .into_iter()
+        .find(|(keyword, _)| keyword.eq_ignore_ascii_case(name))
+        .map(|(_, style)| style)
+        .ok_or(())
+}
+
+/// `border-*-color`：<color> | currentcolor。
+fn parse_border_color(input: &mut Parser<'_>) -> Result<BorderColorValue, ()> {
+    if let Ok(rgba) = input.try_parse(parse_color) {
+        return Ok(BorderColorValue::Rgba(rgba));
+    }
+    match input.next().map_err(|_| ())? {
+        Token::Ident(name) if name.eq_ignore_ascii_case("currentcolor") => {
+            Ok(BorderColorValue::CurrentColor)
+        }
+        _ => Err(()),
+    }
+}
+
+/// 以下为简写展开（parser 模块）复用的单值解析入口。
+pub(crate) fn parse_margin_value(input: &mut Parser<'_>) -> Result<MarginValue, ()> {
+    parse_margin(input)
+}
+
+pub(crate) fn parse_padding_value(input: &mut Parser<'_>) -> Result<PaddingValue, ()> {
+    parse_padding(input)
+}
+
+pub(crate) fn parse_border_width_value(input: &mut Parser<'_>) -> Result<BorderWidthValue, ()> {
+    parse_border_width(input)
+}
+
+pub(crate) fn parse_border_style_value(input: &mut Parser<'_>) -> Result<BorderStyle, ()> {
+    parse_border_style(input)
+}
+
+pub(crate) fn parse_border_color_value(input: &mut Parser<'_>) -> Result<BorderColorValue, ()> {
+    parse_border_color(input)
+}
+
+/// `inset` 简写复用单值解析入口。
+pub(crate) fn parse_inset_value(input: &mut Parser<'_>) -> Result<InsetValue, ()> {
+    parse_inset(input)
+}
+
+/// `gap` 简写复用单值解析入口。
+pub(crate) fn parse_gap_value(input: &mut Parser<'_>) -> Result<GapValue, ()> {
+    parse_gap(input)
+}
+
+fn parse_display(input: &mut Parser<'_>) -> Result<DisplayValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("inline") {
+        return Ok(DisplayValue::Inline);
+    }
+    if name.eq_ignore_ascii_case("block") {
+        return Ok(DisplayValue::Block);
+    }
+    if name.eq_ignore_ascii_case("list-item") {
+        return Ok(DisplayValue::ListItem);
+    }
+    if name.eq_ignore_ascii_case("inline-block") {
+        return Ok(DisplayValue::InlineBlock);
+    }
+    if name.eq_ignore_ascii_case("flow-root") {
+        return Ok(DisplayValue::FlowRoot);
+    }
+    if name.eq_ignore_ascii_case("flex") {
+        return Ok(DisplayValue::Flex);
+    }
+    if name.eq_ignore_ascii_case("inline-flex") {
+        return Ok(DisplayValue::InlineFlex);
+    }
+    if name.eq_ignore_ascii_case("grid") {
+        return Ok(DisplayValue::Grid);
+    }
+    if name.eq_ignore_ascii_case("inline-grid") {
+        return Ok(DisplayValue::InlineGrid);
+    }
+    if name.eq_ignore_ascii_case("table") {
+        return Ok(DisplayValue::Table);
+    }
+    if name.eq_ignore_ascii_case("inline-table") {
+        return Ok(DisplayValue::InlineTable);
+    }
+    if name.eq_ignore_ascii_case("contents") {
+        return Ok(DisplayValue::Contents);
+    }
+    if name.eq_ignore_ascii_case("none") {
+        return Ok(DisplayValue::None);
+    }
+    const INTERNAL: [(&str, &str); 8] = [
+        ("table-row-group", "table-row-group"),
+        ("table-header-group", "table-header-group"),
+        ("table-footer-group", "table-footer-group"),
+        ("table-row", "table-row"),
+        ("table-cell", "table-cell"),
+        ("table-column-group", "table-column-group"),
+        ("table-column", "table-column"),
+        ("table-caption", "table-caption"),
+    ];
+    for (keyword, label) in INTERNAL {
+        if name.eq_ignore_ascii_case(keyword) {
+            return Ok(DisplayValue::TableInternal(label));
+        }
+    }
+    Err(())
+}
+
+fn parse_text_align(input: &mut Parser<'_>) -> Result<TextAlignValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("start") {
+        return Ok(TextAlignValue::Start);
+    }
+    if name.eq_ignore_ascii_case("end") {
+        return Ok(TextAlignValue::End);
+    }
+    if name.eq_ignore_ascii_case("left") {
+        return Ok(TextAlignValue::Left);
+    }
+    if name.eq_ignore_ascii_case("right") {
+        return Ok(TextAlignValue::Right);
+    }
+    if name.eq_ignore_ascii_case("center") {
+        return Ok(TextAlignValue::Center);
+    }
+    if name.eq_ignore_ascii_case("justify") {
+        return Ok(TextAlignValue::Justify);
+    }
+    if name.eq_ignore_ascii_case("match-parent") {
+        return Ok(TextAlignValue::MatchParent);
+    }
+    if name.eq_ignore_ascii_case("justify-all") {
+        return Ok(TextAlignValue::JustifyAll);
+    }
+    Err(())
+}
+
+fn parse_font_style(input: &mut Parser<'_>) -> Result<FontStyleValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("normal") {
+        return Ok(FontStyleValue::Normal);
+    }
+    if name.eq_ignore_ascii_case("italic") {
+        return Ok(FontStyleValue::Italic);
+    }
+    if name.eq_ignore_ascii_case("oblique") {
+        // oblique [ <angle> | none ]?
+        let angle = input.try_parse(parse_angle).ok();
+        if angle.is_none()
+            && (input.try_parse(|i| i.expect_ident_matching("none").map_err(|_| ()))).is_err()
+            && input.expect_exhausted().is_err()
+        {
+            return Err(());
+        }
+        return Ok(FontStyleValue::Oblique(angle));
+    }
+    Err(())
+}
+
+/// 解析角度并折算为角度制。
+fn parse_angle(input: &mut Parser<'_>) -> Result<f32, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Dimension { value, unit, .. } => {
+            if unit.eq_ignore_ascii_case("deg") {
+                Ok(*value)
+            } else if unit.eq_ignore_ascii_case("grad") {
+                Ok(*value * 360.0 / 400.0)
+            } else if unit.eq_ignore_ascii_case("rad") {
+                Ok(value.to_degrees())
+            } else if unit.eq_ignore_ascii_case("turn") {
+                Ok(*value * 360.0)
+            } else {
+                Err(())
+            }
+        }
+        _ => Err(()),
+    }
+}
+
+/// 长度类数值的卫生上限（CSS px）。
+///
+/// 不可信输入里的巨数 token（`1e40px` 在 f32 中溢出为 `inf`）与相对单位
+/// 乘积在解析/计算出口被钳到该量级（与 Chromium 的传统长度上限同量级；
+/// 超出按 UA clamp 记偏差），`inf`/`NaN` 直接拒绝——非有限值一旦进入
+/// 布局会沿几何扩散污染整页坐标。
+pub const MAX_CSS_LENGTH: f32 = 1.0e7;
+
+/// 解析出口的数值卫生：非有限值拒绝（整条声明按无效处理），有限值 clamp
+/// 到 `[-MAX_CSS_LENGTH, MAX_CSS_LENGTH]`。
+pub(crate) fn sanitize_number(value: f32) -> Option<f32> {
+    value
+        .is_finite()
+        .then(|| value.clamp(-MAX_CSS_LENGTH, MAX_CSS_LENGTH))
+}
+
+/// `<length-percentage>` 折算为 px；返回 `None` 表示该单位不受支持或数值
+/// 非有限。
+fn length_to_px(value: f32, unit: &str) -> Option<f32> {
+    let px = if unit.eq_ignore_ascii_case("px") {
+        Some(value)
+    } else if unit.eq_ignore_ascii_case("pt") {
+        // 1pt = 1/72in，1in = 96px（CSS Values 4 绝对长度定义）
+        Some(value * 96.0 / 72.0)
+    } else if unit.eq_ignore_ascii_case("pc") {
+        Some(value * 16.0)
+    } else if unit.eq_ignore_ascii_case("in") {
+        Some(value * 96.0)
+    } else if unit.eq_ignore_ascii_case("cm") {
+        Some(value * 96.0 / 2.54)
+    } else if unit.eq_ignore_ascii_case("mm") {
+        Some(value * 96.0 / 25.4)
+    } else if unit.eq_ignore_ascii_case("q") {
+        Some(value * 96.0 / 101.6)
+    } else {
+        None
+    }?;
+    sanitize_number(px)
+}
+
+/// 视口单位（[CSS Values 4 §6.2](https://drafts.csswg.org/css-values-4/#viewport-relative-units)）：
+/// 相对初始包含块（视口）对应边的小数百分比基数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewportUnit {
+    /// `vw`：视口宽的 1%。
+    Vw,
+    /// `vh`：视口高的 1%。
+    Vh,
+    /// `vmin`：视口短边的 1%。
+    Vmin,
+    /// `vmax`：视口长边的 1%。
+    Vmax,
+}
+
+/// 维度 token 的单位是否为视口单位；是则返回 `(数量, 单位)`。
+fn viewport_length(value: f32, unit: &str) -> Option<(f32, ViewportUnit)> {
+    let unit = if unit.eq_ignore_ascii_case("vw") {
+        ViewportUnit::Vw
+    } else if unit.eq_ignore_ascii_case("vh") {
+        ViewportUnit::Vh
+    } else if unit.eq_ignore_ascii_case("vmin") {
+        ViewportUnit::Vmin
+    } else if unit.eq_ignore_ascii_case("vmax") {
+        ViewportUnit::Vmax
+    } else {
+        return None;
+    };
+    Some((value, unit))
+}
+
+fn parse_font_size(input: &mut Parser<'_>) -> Result<FontSizeValue, ()> {
+    match input.next().map_err(|_| ())? {
+        // <length> 为 0 时单位可省略（CSS Values 4）
+        Token::Number { value: 0.0, .. } => Ok(FontSizeValue::Px(0.0)),
+        Token::Number { .. } => Err(()),
+        Token::Percentage { unit_value, .. } => {
+            sanitize_number(*unit_value).map(FontSizeValue::Percent).ok_or(())
+        }
+        Token::Dimension { value, unit, .. } => {
+            if unit.eq_ignore_ascii_case("em") {
+                sanitize_number(*value).map(FontSizeValue::Em).ok_or(())
+            } else {
+                length_to_px(*value, unit).map(FontSizeValue::Px).ok_or(())
+            }
+        }
+        Token::Ident(name) => {
+            if name.eq_ignore_ascii_case("xx-small") {
+                Ok(FontSizeValue::Absolute(AbsoluteSize::XxSmall))
+            } else if name.eq_ignore_ascii_case("x-small") {
+                Ok(FontSizeValue::Absolute(AbsoluteSize::XSmall))
+            } else if name.eq_ignore_ascii_case("small") {
+                Ok(FontSizeValue::Absolute(AbsoluteSize::Small))
+            } else if name.eq_ignore_ascii_case("medium") {
+                Ok(FontSizeValue::Absolute(AbsoluteSize::Medium))
+            } else if name.eq_ignore_ascii_case("large") {
+                Ok(FontSizeValue::Absolute(AbsoluteSize::Large))
+            } else if name.eq_ignore_ascii_case("x-large") {
+                Ok(FontSizeValue::Absolute(AbsoluteSize::XLarge))
+            } else if name.eq_ignore_ascii_case("xx-large") {
+                Ok(FontSizeValue::Absolute(AbsoluteSize::XxLarge))
+            } else if name.eq_ignore_ascii_case("xxx-large") {
+                Ok(FontSizeValue::Absolute(AbsoluteSize::XxxLarge))
+            } else if name.eq_ignore_ascii_case("larger") {
+                Ok(FontSizeValue::Larger)
+            } else if name.eq_ignore_ascii_case("smaller") {
+                Ok(FontSizeValue::Smaller)
+            } else {
+                Err(())
+            }
+        }
+        _ => Err(()),
+    }
+}
+
+fn parse_font_weight(input: &mut Parser<'_>) -> Result<FontWeightValue, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Number { value, .. } => {
+            // CSS Fonts 4：<number [1,1000]>，越界无效
+            if (1.0..=1000.0).contains(value) {
+                Ok(FontWeightValue::Weight(*value))
+            } else {
+                Err(())
+            }
+        }
+        Token::Ident(name) => {
+            if name.eq_ignore_ascii_case("normal") {
+                Ok(FontWeightValue::Weight(400.0))
+            } else if name.eq_ignore_ascii_case("bold") {
+                Ok(FontWeightValue::Weight(700.0))
+            } else if name.eq_ignore_ascii_case("bolder") {
+                Ok(FontWeightValue::Bolder)
+            } else if name.eq_ignore_ascii_case("lighter") {
+                Ok(FontWeightValue::Lighter)
+            } else {
+                Err(())
+            }
+        }
+        _ => Err(()),
+    }
+}
+
+fn parse_font_family(input: &mut Parser<'_>) -> Result<Vec<FontFamilyValue>, ()> {
+    let mut families = Vec::new();
+    loop {
+        families.push(parse_family_item(input)?);
+        // 逗号 → 还有下一项；`!`（!important 前缀）、其他终止符或 EOF →
+        // 族名列表结束，后续交给调用方（parse_important / 耗尽校验）。
+        // 注意逗号是独立的 Token::Comma，不是 Delim。
+        if input.try_parse(|i| i.expect_comma()).is_err() {
+            break;
+        }
+    }
+    Ok(families)
+}
+
+/// 解析一个字体族名：`<string>` 或一串 `<custom-ident>`（以空白分隔）。
+///
+/// 遇到终止符（逗号、`!`、EOF）即停止且不消费，留给调用方——它们经
+/// `try_parse` 的 `Err` 返回，位置已还原；其他无法归入族名语法的 token
+/// （数字、不匹配的括号等）照常消费并由 [`family_from_tokens`] 判为无效。
+fn parse_family_item(input: &mut Parser<'_>) -> Result<FontFamilyValue, ()> {
+    let mut tokens = Vec::new();
+    loop {
+        let peeked = input.try_parse(|i| match i.next_including_whitespace() {
+            Ok(Token::Comma) | Ok(Token::Delim('!')) => Err(()),
+            Ok(token) => Ok(token.clone()),
+            Err(_) => Err(()),
+        });
+        match peeked {
+            Ok(token) => tokens.push(token),
+            Err(()) => break,
+        }
+    }
+    family_from_tokens(&tokens)
+}
+
+/// 把族名的 token 序列归一化为 [`FontFamilyValue`]：去首尾空白、中部空白
+/// 折叠为单个空格；无引号的单词族名映射 generic。
+fn family_from_tokens(tokens: &[Token<'_>]) -> Result<FontFamilyValue, ()> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    let mut quoted = false;
+    for token in tokens {
+        match token {
+            Token::WhiteSpace(_) => {
+                if let Some(word) = current.take() {
+                    parts.push(word);
+                }
+            }
+            Token::Ident(name) => {
+                current.get_or_insert_with(String::new).push_str(name);
+            }
+            Token::QuotedString(text) => {
+                if current.is_some() || !parts.is_empty() {
+                    // 字符串只能单独成族名（CSS Fonts 4 §2.3 语法）
+                    return Err(());
+                }
+                quoted = true;
+                parts.push(text.to_string());
+            }
+            _ => return Err(()),
+        }
+    }
+    if let Some(word) = current.take() {
+        parts.push(word);
+    }
+
+    if parts.is_empty() {
+        return Err(());
+    }
+    // 带引号的 "serif" 是名为 serif 的普通族名，不映射 generic
+    if parts.len() == 1
+        && !quoted
+        && let Some(generic) = generic_family(&parts[0])
+    {
+        return Ok(FontFamilyValue::Generic(generic));
+    }
+    Ok(FontFamilyValue::Family(parts.join(" ")))
+}
+
+/// `font` 简写值解析并展开为 longhand（CSS Fonts 4 §3.3）。
+///
+/// 语法：`[ <'font-style'> || <font-variant-css2> || <'font-weight'> ||
+/// <font-width-css3> ]? <'font-size'> [ / <'line-height'> ]? <'font-family'>#`——
+/// `||` 成分任意顺序、每项至多一次；缺省成分按简写语义重置为 initial。
+/// 偏差：`font-variant-css2`（`small-caps`）与 `<font-width-css3>`（宽度
+/// 关键字/百分比）无对应 longhand，按语法接受后丢弃；系统字体关键字
+/// （`caption` 等）整条无效。
+pub(crate) fn parse_font_shorthand(
+    input: &mut Parser<'_>,
+) -> Result<Vec<(PropertyId, PropertyValue)>, ()> {
+    if is_system_family_name(input) {
+        return Err(());
+    }
+    let mut style: Option<FontStyleValue> = None;
+    let mut weight: Option<FontWeightValue> = None;
+    let mut small_caps_seen = false;
+    let mut width_seen = false;
+    // `normal` 可出现在 style / variant / weight / width 四个槽位，统一计数
+    // （各槽初值均为 normal，无需区分归属）。
+    let mut normals = 0usize;
+    loop {
+        if normals < 4 && try_parse_ident(input, "normal") {
+            normals += 1;
+            continue;
+        }
+        if style.is_none()
+            && let Ok(value) = input.try_parse(parse_font_style_shorthand)
+        {
+            style = Some(value);
+            continue;
+        }
+        if weight.is_none()
+            && let Ok(value) = input.try_parse(parse_font_weight)
+        {
+            weight = Some(value);
+            continue;
+        }
+        if !small_caps_seen && try_parse_ident(input, "small-caps") {
+            small_caps_seen = true;
+            continue;
+        }
+        if !width_seen && try_parse_font_width(input) {
+            width_seen = true;
+            continue;
+        }
+        break;
+    }
+
+    let size = parse_font_size(input)?;
+    let line_height = if input.try_parse(|i| i.expect_delim('/')).is_ok() {
+        Some(parse_line_height(input)?)
+    } else {
+        None
+    };
+    let families = parse_font_family(input)?;
+
+    Ok(vec![
+        (
+            PropertyId::FontStyle,
+            PropertyValue::FontStyle(style.unwrap_or(FontStyleValue::Normal)),
+        ),
+        (
+            PropertyId::FontWeight,
+            PropertyValue::FontWeight(weight.unwrap_or(FontWeightValue::Weight(400.0))),
+        ),
+        (PropertyId::FontSize, PropertyValue::FontSize(size)),
+        (
+            PropertyId::LineHeight,
+            PropertyValue::LineHeight(line_height.unwrap_or(LineHeightValue::Normal)),
+        ),
+        (PropertyId::FontFamily, PropertyValue::FontFamily(families)),
+    ])
+}
+
+/// 简写前缀里的 `<font-style>`：`italic | oblique [ <angle> | none ]?`。
+/// 与 longhand [`parse_font_style`] 的差别：裸 `oblique` 合法——简写中
+/// 其后还有 size 等成分，不能要求耗尽。
+fn parse_font_style_shorthand(input: &mut Parser<'_>) -> Result<FontStyleValue, ()> {
+    let Token::Ident(name) = input.next().map_err(|_| ())? else {
+        return Err(());
+    };
+    if name.eq_ignore_ascii_case("italic") {
+        return Ok(FontStyleValue::Italic);
+    }
+    if name.eq_ignore_ascii_case("oblique") {
+        let angle = input.try_parse(parse_angle).ok();
+        if angle.is_none()
+            && input
+                .try_parse(|i| i.expect_ident_matching("none").map_err(|_| ()))
+                .is_ok()
+        {
+            return Ok(FontStyleValue::Oblique(None));
+        }
+        return Ok(FontStyleValue::Oblique(angle));
+    }
+    Err(())
+}
+
+/// `font` 简写的系统字体关键字（CSS Fonts 4 §3.3 `<system-family-name>`）：
+/// 依赖 UA 系统设置且要求重置全部子属性，本层不支持。
+fn is_system_family_name(input: &mut Parser<'_>) -> bool {
+    const SYSTEM: [&str; 6] = [
+        "caption",
+        "icon",
+        "menu",
+        "message-box",
+        "small-caption",
+        "status-bar",
+    ];
+    input
+        .try_parse(|i| match i.next() {
+            Ok(Token::Ident(name)) if SYSTEM.iter().any(|k| name.eq_ignore_ascii_case(k)) => Ok(()),
+            _ => Err(()),
+        })
+        .is_ok()
+}
+
+/// 尝试消费一个指定关键字（ASCII case-insensitive），命中则消费并返回真。
+fn try_parse_ident(input: &mut Parser<'_>, expected: &str) -> bool {
+    input
+        .try_parse(|i| match i.next() {
+            Ok(Token::Ident(name)) if name.eq_ignore_ascii_case(expected) => Ok(()),
+            _ => Err(()),
+        })
+        .is_ok()
+}
+
+/// `<font-width-css3>`：宽度关键字或非负百分比。本层无 font-stretch
+/// longhand，按语法接受后丢弃（返回是否命中）。
+fn try_parse_font_width(input: &mut Parser<'_>) -> bool {
+    const KEYWORDS: [&str; 8] = [
+        "ultra-condensed",
+        "extra-condensed",
+        "condensed",
+        "semi-condensed",
+        "semi-expanded",
+        "expanded",
+        "extra-expanded",
+        "ultra-expanded",
+    ];
+    input
+        .try_parse(|i| match i.next() {
+            Ok(Token::Ident(name)) if KEYWORDS.iter().any(|k| name.eq_ignore_ascii_case(k)) => {
+                Ok(())
+            }
+            Ok(Token::Percentage { unit_value, .. }) if *unit_value >= 0.0 => Ok(()),
+            _ => Err(()),
+        })
+        .is_ok()
+}
+
+/// 无引号的 generic 族关键字
+/// （CSS Fonts 4 §2.3：serif、sans-serif、cursive、fantasy、monospace、
+/// system-ui、math、emoji、fangsong、ui-serif、ui-sans-serif、ui-monospace、
+/// ui-rounded）。
+fn generic_family(name: &str) -> Option<&'static str> {
+    const GENERICS: [&str; 13] = [
+        "serif",
+        "sans-serif",
+        "cursive",
+        "fantasy",
+        "monospace",
+        "system-ui",
+        "math",
+        "emoji",
+        "fangsong",
+        "ui-serif",
+        "ui-sans-serif",
+        "ui-monospace",
+        "ui-rounded",
+    ];
+    GENERICS
+        .into_iter()
+        .find(|generic| generic.eq_ignore_ascii_case(name))
+}
+
+/// 解析 `<color>`（[CSS Color 4 §5](https://drafts.csswg.org/css-color-4/#color-syntax)）：
+/// hex、`rgb()` / `rgba()`、`hsl()` / `hsla()`（现代与 legacy 逗号语法）、
+/// 命名色与 `transparent`。
+pub(crate) fn parse_color(input: &mut Parser<'_>) -> Result<Rgba, ()> {
+    let token = input.next().map_err(|_| ())?;
+    match token {
+        // `#fff` 这类合法标识符形式的 hash 会词法为 IDHash，与 Hash 同义
+        Token::Hash(hash) | Token::IDHash(hash) => parse_hex(hash),
+        Token::Ident(name) => {
+            if name.eq_ignore_ascii_case("transparent") {
+                Ok(Rgba::transparent())
+            } else if name.eq_ignore_ascii_case("currentcolor") {
+                // 依赖元素上下文，本轮不支持（见模块文档偏差）
+                Err(())
+            } else {
+                named_color(name).ok_or(())
+            }
+        }
+        Token::Function(name) => {
+            if name.eq_ignore_ascii_case("rgb") || name.eq_ignore_ascii_case("rgba") {
+                input
+                    .parse_nested_block(|input| {
+                        parse_rgb_arguments(input).map_err(|_| ParseError::<()>::unexpected_token())
+                    })
+                    .map_err(|_| ())
+            } else if name.eq_ignore_ascii_case("hsl") || name.eq_ignore_ascii_case("hsla") {
+                input
+                    .parse_nested_block(|input| {
+                        parse_hsl_arguments(input).map_err(|_| ParseError::<()>::unexpected_token())
+                    })
+                    .map_err(|_| ())
+            } else {
+                Err(())
+            }
+        }
+        _ => Err(()),
+    }
+}
+
+/// CSS Color 4 §6.1 命名色表（148 项，由规范表格生成）。
+const NAMED_COLORS: [(&str, u8, u8, u8); 148] = [
+    ("aliceblue", 0xf0, 0xf8, 0xff),
+    ("antiquewhite", 0xfa, 0xeb, 0xd7),
+    ("aqua", 0x00, 0xff, 0xff),
+    ("aquamarine", 0x7f, 0xff, 0xd4),
+    ("azure", 0xf0, 0xff, 0xff),
+    ("beige", 0xf5, 0xf5, 0xdc),
+    ("bisque", 0xff, 0xe4, 0xc4),
+    ("black", 0x00, 0x00, 0x00),
+    ("blanchedalmond", 0xff, 0xeb, 0xcd),
+    ("blue", 0x00, 0x00, 0xff),
+    ("blueviolet", 0x8a, 0x2b, 0xe2),
+    ("brown", 0xa5, 0x2a, 0x2a),
+    ("burlywood", 0xde, 0xb8, 0x87),
+    ("cadetblue", 0x5f, 0x9e, 0xa0),
+    ("chartreuse", 0x7c, 0xfc, 0x00),
+    ("chocolate", 0xd2, 0x69, 0x1e),
+    ("coral", 0xff, 0x7f, 0x50),
+    ("cornflowerblue", 0x64, 0x95, 0xed),
+    ("cornsilk", 0xff, 0xf8, 0xdc),
+    ("crimson", 0xdc, 0x14, 0x3c),
+    ("cyan", 0x00, 0xff, 0xff),
+    ("darkblue", 0x00, 0x00, 0x8b),
+    ("darkcyan", 0x00, 0x8b, 0x8b),
+    ("darkgoldenrod", 0xb8, 0x86, 0x0b),
+    ("darkgray", 0xa9, 0xa9, 0xa9),
+    ("darkgreen", 0x00, 0x80, 0x00),
+    ("darkgrey", 0xa9, 0xa9, 0xa9),
+    ("darkkhaki", 0xbd, 0xb7, 0x6b),
+    ("darkmagenta", 0x8b, 0x00, 0x8b),
+    ("darkolivegreen", 0x55, 0x6b, 0x2f),
+    ("darkorange", 0xff, 0x8c, 0x00),
+    ("darkorchid", 0x99, 0x32, 0xcc),
+    ("darkred", 0x8b, 0x00, 0x00),
+    ("darksalmon", 0xe9, 0x96, 0x7a),
+    ("darkseagreen", 0x8f, 0xbc, 0x8f),
+    ("darkslateblue", 0x48, 0x3d, 0x8b),
+    ("darkslategray", 0x2f, 0x4f, 0x4f),
+    ("darkslategrey", 0x2f, 0x4f, 0x4f),
+    ("darkturquoise", 0x00, 0xce, 0xd1),
+    ("darkviolet", 0x94, 0x00, 0xd3),
+    ("deeppink", 0xff, 0x14, 0x93),
+    ("deepskyblue", 0x00, 0xbf, 0xff),
+    ("dimgray", 0x69, 0x69, 0x69),
+    ("dimgrey", 0x69, 0x69, 0x69),
+    ("dodgerblue", 0x1e, 0x90, 0xff),
+    ("firebrick", 0xb2, 0x22, 0x22),
+    ("floralwhite", 0xff, 0xfa, 0xf0),
+    ("forestgreen", 0x22, 0x8b, 0x22),
+    ("fuchsia", 0xff, 0x00, 0xff),
+    ("gainsboro", 0xdc, 0xdc, 0xdc),
+    ("ghostwhite", 0xf8, 0xf8, 0xff),
+    ("gold", 0xff, 0xd7, 0x00),
+    ("goldenrod", 0xda, 0xa5, 0x20),
+    ("gray", 0x80, 0x80, 0x80),
+    ("green", 0x00, 0x80, 0x00),
+    ("greenyellow", 0xad, 0xff, 0x2f),
+    ("grey", 0x80, 0x80, 0x80),
+    ("honeydew", 0xf0, 0xff, 0xf0),
+    ("hotpink", 0xff, 0x69, 0xb4),
+    ("indianred", 0xcd, 0x5c, 0x5c),
+    ("indigo", 0x4b, 0x00, 0x82),
+    ("ivory", 0xff, 0xff, 0xf0),
+    ("khaki", 0xf0, 0xe6, 0x8c),
+    ("lavender", 0xe6, 0xe6, 0xfa),
+    ("lavenderblush", 0xff, 0xf0, 0xf5),
+    ("lawngreen", 0x7c, 0xfc, 0x00),
+    ("lemonchiffon", 0xff, 0xfa, 0xcd),
+    ("lightblue", 0xad, 0xd8, 0xe6),
+    ("lightcoral", 0xf0, 0x80, 0x80),
+    ("lightcyan", 0xe0, 0xff, 0xff),
+    ("lightgoldenrodyellow", 0xfa, 0xfa, 0xd2),
+    ("lightgray", 0xd3, 0xd3, 0xd3),
+    ("lightgreen", 0x90, 0xee, 0x90),
+    ("lightgrey", 0xd3, 0xd3, 0xd3),
+    ("lightpink", 0xff, 0xb6, 0xc1),
+    ("lightsalmon", 0xff, 0xa0, 0x7a),
+    ("lightseagreen", 0x20, 0xb2, 0xaa),
+    ("lightskyblue", 0x87, 0xce, 0xfa),
+    ("lightslategray", 0x77, 0x88, 0x99),
+    ("lightslategrey", 0x77, 0x88, 0x99),
+    ("lightsteelblue", 0xb0, 0xc4, 0xde),
+    ("lightyellow", 0xff, 0xff, 0xe0),
+    ("lime", 0x00, 0xff, 0x00),
+    ("limegreen", 0x32, 0xcd, 0x32),
+    ("linen", 0xfa, 0xf0, 0xe6),
+    ("magenta", 0xff, 0x00, 0xff),
+    ("maroon", 0x80, 0x00, 0x00),
+    ("mediumaquamarine", 0x66, 0xcd, 0xaa),
+    ("mediumblue", 0x00, 0x00, 0xcd),
+    ("mediumorchid", 0xba, 0x55, 0xd3),
+    ("mediumpurple", 0x93, 0x70, 0xdb),
+    ("mediumseagreen", 0x3c, 0xb3, 0x71),
+    ("mediumslateblue", 0x7b, 0x68, 0xee),
+    ("mediumspringgreen", 0x00, 0xfa, 0x9a),
+    ("mediumturquoise", 0x48, 0xd1, 0xcc),
+    ("mediumvioletred", 0xc7, 0x15, 0x85),
+    ("midnightblue", 0x19, 0x19, 0x70),
+    ("mintcream", 0xf5, 0xff, 0xfa),
+    ("mistyrose", 0xff, 0xe4, 0xe1),
+    ("moccasin", 0xff, 0xe4, 0xb5),
+    ("navajowhite", 0xff, 0xde, 0xad),
+    ("navy", 0x00, 0x00, 0x80),
+    ("oldlace", 0xfd, 0xf5, 0xe6),
+    ("olive", 0x80, 0x80, 0x00),
+    ("olivedrab", 0x6b, 0x8e, 0x23),
+    ("orange", 0xff, 0xa5, 0x00),
+    ("orangered", 0xff, 0x45, 0x00),
+    ("orchid", 0xda, 0x70, 0xd6),
+    ("palegoldenrod", 0xee, 0xe8, 0xaa),
+    ("palegreen", 0x98, 0xfb, 0x98),
+    ("paleturquoise", 0xaf, 0xee, 0xee),
+    ("palevioletred", 0xdb, 0x70, 0x93),
+    ("papayawhip", 0xff, 0xef, 0xd5),
+    ("peachpuff", 0xff, 0xda, 0xb9),
+    ("peru", 0xcd, 0x85, 0x3f),
+    ("pink", 0xff, 0xc0, 0xcb),
+    ("plum", 0xdd, 0xa0, 0xdd),
+    ("powderblue", 0xb0, 0xe0, 0xe6),
+    ("purple", 0x80, 0x00, 0x80),
+    ("rebeccapurple", 0x66, 0x33, 0x99),
+    ("red", 0xff, 0x00, 0x00),
+    ("rosybrown", 0xbc, 0x8f, 0x8f),
+    ("royalblue", 0x41, 0x69, 0xe1),
+    ("saddlebrown", 0x8b, 0x45, 0x13),
+    ("salmon", 0xfa, 0x80, 0x72),
+    ("sandybrown", 0xf4, 0xa4, 0x60),
+    ("seagreen", 0x2e, 0x8b, 0x57),
+    ("seashell", 0xff, 0xf5, 0xee),
+    ("sienna", 0xa0, 0x52, 0x2d),
+    ("silver", 0xc0, 0xc0, 0xc0),
+    ("skyblue", 0x87, 0xce, 0xeb),
+    ("slateblue", 0x6a, 0x5a, 0xcd),
+    ("slategray", 0x70, 0x80, 0x90),
+    ("slategrey", 0x70, 0x80, 0x90),
+    ("snow", 0xff, 0xfa, 0xfa),
+    ("springgreen", 0x00, 0xff, 0x7f),
+    ("steelblue", 0x46, 0x82, 0xb4),
+    ("tan", 0xd2, 0xb4, 0x8c),
+    ("teal", 0x00, 0x80, 0x80),
+    ("thistle", 0xd8, 0xbf, 0xd8),
+    ("tomato", 0xff, 0x63, 0x47),
+    ("turquoise", 0x40, 0xe0, 0xd0),
+    ("violet", 0xee, 0x82, 0xee),
+    ("wheat", 0xf5, 0xde, 0xb3),
+    ("white", 0xff, 0xff, 0xff),
+    ("whitesmoke", 0xf5, 0xf5, 0xf5),
+    ("yellow", 0xff, 0xff, 0x00),
+    ("yellowgreen", 0x9a, 0xcd, 0x32),
+];
+
+fn named_color(name: &str) -> Option<Rgba> {
+    NAMED_COLORS
+        .iter()
+        .find(|(keyword, ..)| keyword.eq_ignore_ascii_case(name))
+        .map(|&(_, r, g, b)| Rgba::opaque(r, g, b))
+}
+
+/// hex 记法：`#rgb` `#rgba` `#rrggbb` `#rrggbbaa`（CSS Color 4 §5.2）。
+fn parse_hex(hash: &str) -> Result<Rgba, ()> {
+    fn hex_digit(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = hash.as_bytes();
+    let parse_pair = |slice: &[u8]| -> Option<u8> {
+        Some(hex_digit(*slice.first()?)? * 16 + hex_digit(*slice.get(1)?)?)
+    };
+    match bytes.len() {
+        3 => {
+            let digits: Option<Vec<u8>> = bytes.iter().map(|&c| hex_digit(c)).collect();
+            let d = digits.ok_or(())?;
+            Ok(Rgba::opaque(d[0] * 17, d[1] * 17, d[2] * 17))
+        }
+        4 => {
+            let digits: Option<Vec<u8>> = bytes.iter().map(|&c| hex_digit(c)).collect();
+            let d = digits.ok_or(())?;
+            Ok(Rgba {
+                r: d[0] * 17,
+                g: d[1] * 17,
+                b: d[2] * 17,
+                a: d[3] * 17,
+            })
+        }
+        6 => Ok(Rgba::opaque(
+            parse_pair(&bytes[0..2]).ok_or(())?,
+            parse_pair(&bytes[2..4]).ok_or(())?,
+            parse_pair(&bytes[4..6]).ok_or(())?,
+        )),
+        8 => Ok(Rgba {
+            r: parse_pair(&bytes[0..2]).ok_or(())?,
+            g: parse_pair(&bytes[2..4]).ok_or(())?,
+            b: parse_pair(&bytes[4..6]).ok_or(())?,
+            a: parse_pair(&bytes[6..8]).ok_or(())?,
+        }),
+        _ => Err(()),
+    }
+}
+
+/// 颜色分量：数字或百分比，可选 `none` 视为本轮不支持。
+enum Component {
+    Number(f32),
+    Percentage(f32),
+}
+
+fn parse_component(input: &mut Parser<'_>) -> Result<Component, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Number { value, .. } => Ok(Component::Number(*value)),
+        Token::Percentage { unit_value, .. } => Ok(Component::Percentage(*unit_value * 100.0)),
+        _ => Err(()),
+    }
+}
+
+/// alpha 分量：数字（0–1）或百分比（0–100%）。
+fn parse_alpha(input: &mut Parser<'_>) -> Result<f32, ()> {
+    let component = parse_component(input)?;
+    Ok(match component {
+        Component::Number(value) => value,
+        Component::Percentage(value) => value / 100.0,
+    })
+}
+
+/// 分量 → 8bit 通道：数字按 0–255、百分比按 0–100% 折算后 clamp 并四舍五入
+/// （CSS Color 4：rgb() 分量超出范围时 clamp 到设备无关 0–255）。
+fn component_to_byte(component: Component) -> u8 {
+    let raw = match component {
+        Component::Number(value) => value,
+        Component::Percentage(value) => value * 255.0 / 100.0,
+    };
+    raw.clamp(0.0, 255.0).round() as u8
+}
+
+/// rgb() / rgba() 的参数：现代空白语法（可带 `/ alpha`）与 legacy 逗号语法
+/// （CSS Color 4 §5.3）。
+fn parse_rgb_arguments(input: &mut Parser<'_>) -> Result<Rgba, ()> {
+    let first = parse_component(input)?;
+    let comma = input.try_parse(Parser::expect_comma).is_ok();
+
+    let (red, green, blue, alpha) = if comma {
+        let green = parse_component(input)?;
+        input.expect_comma().map_err(|_| ())?;
+        let blue = parse_component(input)?;
+        let alpha = if input.try_parse(Parser::expect_comma).is_ok() {
+            parse_alpha(input)?
+        } else {
+            1.0
+        };
+        (first, green, blue, alpha)
+    } else {
+        let green = parse_component(input)?;
+        let blue = parse_component(input)?;
+        let alpha = if input.try_parse(|i| i.expect_delim('/')).is_ok() {
+            parse_alpha(input)?
+        } else {
+            1.0
+        };
+        (first, green, blue, alpha)
+    };
+
+    if input.expect_exhausted().is_err() {
+        return Err(());
+    }
+    Ok(Rgba {
+        r: component_to_byte(red),
+        g: component_to_byte(green),
+        b: component_to_byte(blue),
+        a: (alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
+    })
+}
+
+/// hsl() / hsla() 的参数（CSS Color 4 §7）。
+fn parse_hsl_arguments(input: &mut Parser<'_>) -> Result<Rgba, ()> {
+    let hue = parse_hue(input)?;
+    let comma = input.try_parse(Parser::expect_comma).is_ok();
+    let (saturation, lightness, alpha) = if comma {
+        let saturation = parse_percentage(input)?;
+        input.expect_comma().map_err(|_| ())?;
+        let lightness = parse_percentage(input)?;
+        let alpha = if input.try_parse(Parser::expect_comma).is_ok() {
+            parse_alpha(input)?
+        } else {
+            1.0
+        };
+        (saturation, lightness, alpha)
+    } else {
+        let saturation = parse_percentage(input)?;
+        let lightness = parse_percentage(input)?;
+        let alpha = if input.try_parse(|i| i.expect_delim('/')).is_ok() {
+            parse_alpha(input)?
+        } else {
+            1.0
+        };
+        (saturation, lightness, alpha)
+    };
+    if input.expect_exhausted().is_err() {
+        return Err(());
+    }
+    Ok(hsl_to_rgb(
+        hue,
+        saturation / 100.0,
+        lightness / 100.0,
+        alpha,
+    ))
+}
+
+/// `<hue>`：裸数字（度）或角度 dimension。
+fn parse_hue(input: &mut Parser<'_>) -> Result<f32, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Number { value, .. } => Ok(*value),
+        Token::Dimension { value, unit, .. } => {
+            if unit.eq_ignore_ascii_case("deg") {
+                Ok(*value)
+            } else if unit.eq_ignore_ascii_case("grad") {
+                Ok(*value * 360.0 / 400.0)
+            } else if unit.eq_ignore_ascii_case("rad") {
+                Ok(value.to_degrees())
+            } else if unit.eq_ignore_ascii_case("turn") {
+                Ok(*value * 360.0)
+            } else {
+                Err(())
+            }
+        }
+        _ => Err(()),
+    }
+}
+
+/// 百分比的数值（`50%` → `50.0`），与 [`Component::Percentage`] 一致。
+fn parse_percentage(input: &mut Parser<'_>) -> Result<f32, ()> {
+    match input.next().map_err(|_| ())? {
+        Token::Percentage { unit_value, .. } => Ok(*unit_value * 100.0),
+        _ => Err(()),
+    }
+}
+
+/// HSL → sRGB（CSS Color 4 §7.1 的转换算法）。
+fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32, alpha: f32) -> Rgba {
+    let t2 = if lightness <= 0.5 {
+        lightness * (1.0 + saturation)
+    } else {
+        lightness + saturation - lightness * saturation
+    };
+    let t1 = 2.0 * lightness - t2;
+    let channel = |offset: f32| -> u8 {
+        let h = (hue.rem_euclid(360.0) + offset).rem_euclid(360.0);
+        let value = if h < 60.0 {
+            t1 + (t2 - t1) * h / 60.0
+        } else if h < 180.0 {
+            t2
+        } else if h < 240.0 {
+            t1 + (t2 - t1) * (240.0 - h) / 60.0
+        } else {
+            t1
+        };
+        (value.clamp(0.0, 1.0) * 255.0).round() as u8
+    };
+    Rgba {
+        r: channel(120.0),
+        g: channel(0.0),
+        b: channel(-120.0),
+        a: (alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 单值解析入口：解析整段文本后要求耗尽。
+    fn parse_typed(property: PropertyId, text: &str) -> Result<PropertyValue, ()> {
+        let mut parser = Parser::new(text);
+        let value = parse_property_value(property, &mut parser)?;
+        parser.expect_exhausted().map_err(|_| ())?;
+        Ok(value)
+    }
+
+    fn parse_one(property: PropertyId, text: &str) -> PropertyValue {
+        parse_typed(property, text).expect("value should parse")
+    }
+
+    fn parse_err(property: PropertyId, text: &str) {
+        assert!(
+            parse_typed(property, text).is_err(),
+            "{text} should not parse"
+        );
+    }
+
+    #[test]
+    fn position_inset_flex_grid_properties_parse() {
+        use PropertyValue::{
+            AlignItems, AlignSelf, FlexDirection, FlexShrink, FlexWrap, Gap, GridAutoFlow,
+            GridTrack as GridTrackValue, Inset, JustifyContent, Position,
+        };
+        // position
+        assert_eq!(
+            parse_one(PropertyId::Position, "absolute"),
+            Position(PositionValue::Absolute)
+        );
+        assert_eq!(
+            parse_one(PropertyId::Position, "FIXED"),
+            Position(PositionValue::Fixed)
+        );
+        parse_err(PropertyId::Position, "sticky");
+
+        // inset（四边 longhand 共用 InsetValue）
+        assert_eq!(
+            parse_one(PropertyId::Top, "10px"),
+            Inset(InsetValue::Length(10.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::Left, "50%"),
+            Inset(InsetValue::Percent(0.5))
+        );
+        assert_eq!(
+            parse_one(PropertyId::Bottom, "auto"),
+            Inset(InsetValue::Auto)
+        );
+
+        // flex-direction / flex-wrap / flex-shrink
+        assert_eq!(
+            parse_one(PropertyId::FlexDirection, "column"),
+            FlexDirection(FlexDirectionValue::Column)
+        );
+        assert_eq!(
+            parse_one(PropertyId::FlexWrap, "wrap-reverse"),
+            FlexWrap(FlexWrapValue::WrapReverse)
+        );
+        assert_eq!(parse_one(PropertyId::FlexShrink, "2"), FlexShrink(2.0));
+        parse_err(PropertyId::FlexShrink, "-1");
+
+        // align-items / justify-content / align-self（兼容 start/end）
+        assert_eq!(
+            parse_one(PropertyId::AlignItems, "center"),
+            AlignItems(AlignItemsValue::Center)
+        );
+        assert_eq!(
+            parse_one(PropertyId::AlignItems, "start"),
+            AlignItems(AlignItemsValue::FlexStart)
+        );
+        assert_eq!(
+            parse_one(PropertyId::JustifyContent, "space-between"),
+            JustifyContent(JustifyContentValue::SpaceBetween)
+        );
+        assert_eq!(
+            parse_one(PropertyId::AlignSelf, "auto"),
+            AlignSelf(AlignSelfValue::Auto)
+        );
+
+        // gap（auto 非法）
+        assert_eq!(
+            parse_one(PropertyId::RowGap, "8px"),
+            Gap(GapValue::Length(8.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::ColumnGap, "normal"),
+            Gap(GapValue::Normal)
+        );
+        parse_err(PropertyId::RowGap, "auto");
+
+        // grid-auto-flow（可选 dense 后缀）
+        assert_eq!(
+            parse_one(PropertyId::GridAutoFlow, "row dense"),
+            GridAutoFlow(GridAutoFlowValue::RowDense)
+        );
+        assert_eq!(
+            parse_one(PropertyId::GridAutoFlow, "column"),
+            GridAutoFlow(GridAutoFlowValue::Column)
+        );
+
+        // grid 轨道列表（含 minmax 与 fr）
+        assert_eq!(
+            parse_one(PropertyId::GridTemplateColumns, "100px 1fr auto"),
+            GridTrackValue(GridTrackList {
+                tracks: vec![
+                    GridTrack::Length(100.0),
+                    GridTrack::Fr(1.0),
+                    GridTrack::Auto,
+                ]
+            })
+        );
+        assert_eq!(
+            parse_one(PropertyId::GridTemplateRows, "minmax(50px, 1fr)"),
+            GridTrackValue(GridTrackList {
+                tracks: vec![GridTrack::MinMax(
+                    Box::new(GridTrack::Length(50.0)),
+                    Box::new(GridTrack::Fr(1.0)),
+                )]
+            })
+        );
+        // 无空白分隔 / 未知轨道关键字 → 整条声明无效
+        parse_err(PropertyId::GridTemplateColumns, "100px2px");
+        parse_err(PropertyId::GridTemplateColumns, "auto bogus");
+        // gridshorthand：gap 两值、inset 四值
+    }
+
+    #[test]
+    fn gap_and_inset_shorthands_expand() {
+        let sheet =
+            crate::parser::Stylesheet::parse("div { gap: 10px 20px; inset: 1px 2px 3px 4px; }");
+        let declarations = &sheet.rules()[0].declarations();
+        assert_eq!(declarations.len(), 6);
+        let get = |property: PropertyId| {
+            declarations
+                .iter()
+                .find(|d| d.property == property)
+                .map(|d| &d.value)
+        };
+        assert_eq!(
+            get(PropertyId::RowGap),
+            Some(&DeclaredValue::Typed(PropertyValue::Gap(GapValue::Length(
+                10.0
+            ))))
+        );
+        assert_eq!(
+            get(PropertyId::ColumnGap),
+            Some(&DeclaredValue::Typed(PropertyValue::Gap(GapValue::Length(
+                20.0
+            ))))
+        );
+        assert_eq!(
+            get(PropertyId::Top),
+            Some(&DeclaredValue::Typed(PropertyValue::Inset(
+                InsetValue::Length(1.0)
+            )))
+        );
+        assert_eq!(
+            get(PropertyId::Left),
+            Some(&DeclaredValue::Typed(PropertyValue::Inset(
+                InsetValue::Length(4.0)
+            )))
+        );
+    }
+
+    #[test]
+    fn property_id_lookup_is_ascii_case_insensitive() {
+        assert_eq!(
+            PropertyId::from_name("FONT-SIZE"),
+            Some(PropertyId::FontSize)
+        );
+        assert_eq!(PropertyId::from_name("color"), Some(PropertyId::Color));
+        assert_eq!(PropertyId::from_name("grid-area"), None);
+        assert_eq!(PropertyId::FontSize.as_str(), "font-size");
+    }
+
+    #[test]
+    fn box_sizing_overflow_and_min_max_parse() {
+        assert_eq!(
+            parse_one(PropertyId::BoxSizing, "border-box"),
+            PropertyValue::BoxSizing(BoxSizingValue::BorderBox)
+        );
+        assert_eq!(
+            parse_one(PropertyId::BoxSizing, "CONTENT-BOX"),
+            PropertyValue::BoxSizing(BoxSizingValue::ContentBox)
+        );
+        parse_err(PropertyId::BoxSizing, "padding-box");
+
+        assert_eq!(
+            parse_one(PropertyId::Overflow, "hidden"),
+            PropertyValue::Overflow(OverflowValue::Hidden)
+        );
+        assert_eq!(
+            parse_one(PropertyId::Overflow, "visible"),
+            PropertyValue::Overflow(OverflowValue::Visible)
+        );
+        // 偏差：auto/scroll/clip 暂不建模，按无效声明丢弃
+        parse_err(PropertyId::Overflow, "auto");
+        parse_err(PropertyId::Overflow, "scroll");
+        parse_err(PropertyId::Overflow, "clip");
+
+        assert_eq!(
+            parse_one(PropertyId::MinWidth, "40px"),
+            PropertyValue::Size(SizeValue::Length(40.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::MaxWidth, "50%"),
+            PropertyValue::Size(SizeValue::Percent(0.5))
+        );
+        assert_eq!(
+            parse_one(PropertyId::MinHeight, "auto"),
+            PropertyValue::Size(SizeValue::Auto)
+        );
+        assert_eq!(
+            parse_one(PropertyId::MaxHeight, "0"),
+            PropertyValue::Size(SizeValue::Length(0.0))
+        );
+        // 负尺寸非法
+        parse_err(PropertyId::MaxWidth, "-10px");
+    }
+
+    #[test]
+    fn color_hex_forms() {
+        assert_eq!(
+            parse_one(PropertyId::Color, "#fff"),
+            PropertyValue::Color(Rgba::opaque(255, 255, 255))
+        );
+        assert_eq!(
+            parse_one(PropertyId::Color, "#0000"),
+            PropertyValue::Color(Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 0
+            })
+        );
+        assert_eq!(
+            parse_one(PropertyId::Color, "#336699"),
+            PropertyValue::Color(Rgba::opaque(0x33, 0x66, 0x99))
+        );
+        assert_eq!(
+            parse_one(PropertyId::Color, "#33669980"),
+            PropertyValue::Color(Rgba {
+                r: 0x33,
+                g: 0x66,
+                b: 0x99,
+                a: 0x80
+            })
+        );
+        parse_err(PropertyId::Color, "#ff");
+        parse_err(PropertyId::Color, "#ffggzz");
+    }
+
+    #[test]
+    fn color_named_and_transparent() {
+        assert_eq!(
+            parse_one(PropertyId::Color, "rebeccapurple"),
+            PropertyValue::Color(Rgba::opaque(0x66, 0x33, 0x99))
+        );
+        assert_eq!(
+            parse_one(PropertyId::Color, "BLACK"),
+            PropertyValue::Color(Rgba::opaque(0, 0, 0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::Color, "transparent"),
+            PropertyValue::Color(Rgba::transparent())
+        );
+        parse_err(PropertyId::Color, "notacolor");
+        parse_err(PropertyId::Color, "currentcolor");
+    }
+
+    #[test]
+    fn color_rgb_legacy_and_modern() {
+        assert_eq!(
+            parse_one(PropertyId::Color, "rgb(255, 0, 128)"),
+            PropertyValue::Color(Rgba::opaque(255, 0, 128))
+        );
+        assert_eq!(
+            parse_one(PropertyId::Color, "rgba(255, 0, 128, 0.5)"),
+            PropertyValue::Color(Rgba {
+                r: 255,
+                g: 0,
+                b: 128,
+                a: 128
+            })
+        );
+        assert_eq!(
+            parse_one(PropertyId::Color, "rgb(255 0 128)"),
+            PropertyValue::Color(Rgba::opaque(255, 0, 128))
+        );
+        assert_eq!(
+            parse_one(PropertyId::Color, "rgb(255 0 128 / 50%)"),
+            PropertyValue::Color(Rgba {
+                r: 255,
+                g: 0,
+                b: 128,
+                a: 128
+            })
+        );
+        assert_eq!(
+            parse_one(PropertyId::Color, "rgb(50% 0% 100%)"),
+            PropertyValue::Color(Rgba::opaque(128, 0, 255))
+        );
+        // 超范围 clamp（CSS Color 4）
+        assert_eq!(
+            parse_one(PropertyId::Color, "rgb(-20 300 128)"),
+            PropertyValue::Color(Rgba::opaque(0, 255, 128))
+        );
+        parse_err(PropertyId::Color, "rgb(255 0)");
+        parse_err(PropertyId::Color, "rgb(255, 0, 128 0.5)");
+    }
+
+    #[test]
+    fn color_hsl() {
+        assert_eq!(
+            parse_one(PropertyId::Color, "hsl(120, 100%, 50%)"),
+            PropertyValue::Color(Rgba::opaque(0, 255, 0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::Color, "hsl(120 100% 50%)"),
+            PropertyValue::Color(Rgba::opaque(0, 255, 0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::Color, "hsla(0, 0%, 0%, 0.5)"),
+            PropertyValue::Color(Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 128
+            })
+        );
+        // 色相取模
+        assert_eq!(
+            parse_one(PropertyId::Color, "hsl(480 100% 50%)"),
+            PropertyValue::Color(Rgba::opaque(0, 255, 0))
+        );
+        parse_err(PropertyId::Color, "hsl(120 50 50%)");
+    }
+
+    #[test]
+    fn font_size_forms() {
+        assert_eq!(
+            parse_one(PropertyId::FontSize, "16px"),
+            PropertyValue::FontSize(FontSizeValue::Px(16.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::FontSize, "12pt"),
+            PropertyValue::FontSize(FontSizeValue::Px(16.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::FontSize, "1.5em"),
+            PropertyValue::FontSize(FontSizeValue::Em(1.5))
+        );
+        assert_eq!(
+            parse_one(PropertyId::FontSize, "120%"),
+            PropertyValue::FontSize(FontSizeValue::Percent(1.2))
+        );
+        assert_eq!(
+            parse_one(PropertyId::FontSize, "0"),
+            PropertyValue::FontSize(FontSizeValue::Px(0.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::FontSize, "x-large"),
+            PropertyValue::FontSize(FontSizeValue::Absolute(AbsoluteSize::XLarge))
+        );
+        assert_eq!(
+            parse_one(PropertyId::FontSize, "larger"),
+            PropertyValue::FontSize(FontSizeValue::Larger)
+        );
+        parse_err(PropertyId::FontSize, "16");
+        parse_err(PropertyId::FontSize, "2rem");
+        parse_err(PropertyId::FontSize, "medium small");
+    }
+
+    #[test]
+    fn absolute_size_table_matches_spec_factors() {
+        // CSS Fonts 4 §2.5.1 scaling factors
+        assert_eq!(AbsoluteSize::XxSmall.factor(), 0.6);
+        assert_eq!(AbsoluteSize::XSmall.factor(), 0.75);
+        assert_eq!(AbsoluteSize::Small.factor(), 8.0 / 9.0);
+        assert_eq!(AbsoluteSize::Medium.factor(), 1.0);
+        assert_eq!(AbsoluteSize::Large.factor(), 1.2);
+        assert_eq!(AbsoluteSize::XLarge.factor(), 1.5);
+        assert_eq!(AbsoluteSize::XxLarge.factor(), 2.0);
+        assert_eq!(AbsoluteSize::XxxLarge.factor(), 3.0);
+    }
+
+    #[test]
+    fn font_weight_forms() {
+        assert_eq!(
+            parse_one(PropertyId::FontWeight, "400"),
+            PropertyValue::FontWeight(FontWeightValue::Weight(400.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::FontWeight, "normal"),
+            PropertyValue::FontWeight(FontWeightValue::Weight(400.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::FontWeight, "bold"),
+            PropertyValue::FontWeight(FontWeightValue::Weight(700.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::FontWeight, "bolder"),
+            PropertyValue::FontWeight(FontWeightValue::Bolder)
+        );
+        parse_err(PropertyId::FontWeight, "0");
+        parse_err(PropertyId::FontWeight, "1001");
+        parse_err(PropertyId::FontWeight, "bold 700");
+    }
+
+    #[test]
+    fn font_family_forms() {
+        assert_eq!(
+            parse_one(PropertyId::FontFamily, "serif"),
+            PropertyValue::FontFamily(vec![FontFamilyValue::Generic("serif")])
+        );
+        assert_eq!(
+            parse_one(PropertyId::FontFamily, "SANS-SERIF"),
+            PropertyValue::FontFamily(vec![FontFamilyValue::Generic("sans-serif")])
+        );
+        // 带引号的 serif 是普通族名，不是 generic
+        assert_eq!(
+            parse_one(PropertyId::FontFamily, "\"serif\""),
+            PropertyValue::FontFamily(vec![FontFamilyValue::Family("serif".into())])
+        );
+        assert_eq!(
+            parse_one(PropertyId::FontFamily, "Times New Roman, Arial, sans-serif"),
+            PropertyValue::FontFamily(vec![
+                FontFamilyValue::Family("Times New Roman".into()),
+                FontFamilyValue::Family("Arial".into()),
+                FontFamilyValue::Generic("sans-serif"),
+            ])
+        );
+        parse_err(PropertyId::FontFamily, "");
+        parse_err(PropertyId::FontFamily, "Times \"New\" Roman");
+        parse_err(PropertyId::FontFamily, "12px");
+    }
+
+    #[test]
+    fn keyword_properties() {
+        assert_eq!(
+            parse_one(PropertyId::Display, "none"),
+            PropertyValue::Display(DisplayValue::None)
+        );
+        assert_eq!(
+            parse_one(PropertyId::Display, "FLEX"),
+            PropertyValue::Display(DisplayValue::Flex)
+        );
+        assert_eq!(
+            parse_one(PropertyId::Display, "table-cell"),
+            PropertyValue::Display(DisplayValue::TableInternal("table-cell"))
+        );
+        parse_err(PropertyId::Display, "ruby");
+        parse_err(PropertyId::Display, "block flex");
+
+        assert_eq!(
+            parse_one(PropertyId::TextAlign, "center"),
+            PropertyValue::TextAlign(TextAlignValue::Center)
+        );
+        assert_eq!(
+            parse_one(PropertyId::TextAlign, "match-parent"),
+            PropertyValue::TextAlign(TextAlignValue::MatchParent)
+        );
+        parse_err(PropertyId::TextAlign, "middle");
+
+        assert_eq!(
+            parse_one(PropertyId::FontStyle, "italic"),
+            PropertyValue::FontStyle(FontStyleValue::Italic)
+        );
+        assert_eq!(
+            parse_one(PropertyId::FontStyle, "oblique"),
+            PropertyValue::FontStyle(FontStyleValue::Oblique(None))
+        );
+        assert_eq!(
+            parse_one(PropertyId::FontStyle, "oblique 30deg"),
+            PropertyValue::FontStyle(FontStyleValue::Oblique(Some(30.0)))
+        );
+        parse_err(PropertyId::FontStyle, "oblique 30px");
+    }
+
+    #[test]
+    fn flex_property_forms() {
+        // flex-grow：<number [0,∞]>（CSS Flexbox §7.1）
+        assert_eq!(
+            parse_one(PropertyId::FlexGrow, "2.5"),
+            PropertyValue::FlexGrow(2.5)
+        );
+        assert_eq!(
+            parse_one(PropertyId::FlexGrow, "0"),
+            PropertyValue::FlexGrow(0.0)
+        );
+        parse_err(PropertyId::FlexGrow, "-1");
+        parse_err(PropertyId::FlexGrow, "auto");
+        parse_err(PropertyId::FlexGrow, "1 2");
+
+        // flex-basis：auto | <length-percentage>（CSS Flexbox §7.2）
+        assert_eq!(
+            parse_one(PropertyId::FlexBasis, "auto"),
+            PropertyValue::FlexBasis(SizeValue::Auto)
+        );
+        assert_eq!(
+            parse_one(PropertyId::FlexBasis, "0"),
+            PropertyValue::FlexBasis(SizeValue::Length(0.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::FlexBasis, "100px"),
+            PropertyValue::FlexBasis(SizeValue::Length(100.0))
+        );
+        assert_eq!(
+            parse_one(PropertyId::FlexBasis, "50%"),
+            PropertyValue::FlexBasis(SizeValue::Percent(0.5))
+        );
+        parse_err(PropertyId::FlexBasis, "-5px");
+        parse_err(PropertyId::FlexBasis, "content");
+    }
+
+    #[test]
+    fn white_space_overflow_wrap_word_break_forms() {
+        // white-space：六个关键字（CSS Text 3 §3.1），大小写不敏感
+        for (text, expected) in [
+            ("normal", WhiteSpaceValue::Normal),
+            ("nowrap", WhiteSpaceValue::Nowrap),
+            ("pre", WhiteSpaceValue::Pre),
+            ("pre-wrap", WhiteSpaceValue::PreWrap),
+            ("PRE-LINE", WhiteSpaceValue::PreLine),
+            ("break-spaces", WhiteSpaceValue::BreakSpaces),
+        ] {
+            assert_eq!(
+                parse_one(PropertyId::WhiteSpace, text),
+                PropertyValue::WhiteSpace(expected)
+            );
+        }
+        parse_err(PropertyId::WhiteSpace, "pre nowrap");
+        parse_err(PropertyId::WhiteSpace, "pre-wrap-x");
+        parse_err(PropertyId::WhiteSpace, "");
+
+        // overflow-wrap：normal | break-word | anywhere
+        assert_eq!(
+            parse_one(PropertyId::OverflowWrap, "normal"),
+            PropertyValue::OverflowWrap(OverflowWrapValue::Normal)
+        );
+        assert_eq!(
+            parse_one(PropertyId::OverflowWrap, "break-word"),
+            PropertyValue::OverflowWrap(OverflowWrapValue::BreakWord)
+        );
+        assert_eq!(
+            parse_one(PropertyId::OverflowWrap, "anywhere"),
+            PropertyValue::OverflowWrap(OverflowWrapValue::Anywhere)
+        );
+        parse_err(PropertyId::OverflowWrap, "break-all");
+        parse_err(PropertyId::OverflowWrap, "word-wrap");
+
+        // word-break：normal | break-all | keep-all
+        assert_eq!(
+            parse_one(PropertyId::WordBreak, "normal"),
+            PropertyValue::WordBreak(WordBreakValue::Normal)
+        );
+        assert_eq!(
+            parse_one(PropertyId::WordBreak, "break-all"),
+            PropertyValue::WordBreak(WordBreakValue::BreakAll)
+        );
+        assert_eq!(
+            parse_one(PropertyId::WordBreak, "keep-all"),
+            PropertyValue::WordBreak(WordBreakValue::KeepAll)
+        );
+        parse_err(PropertyId::WordBreak, "break-word");
+        parse_err(PropertyId::WordBreak, "keep");
+    }
+
+    #[test]
+    fn declared_value_css_wide_keywords() {
+        fn parse_declared(text: &str) -> Result<(DeclaredValue, bool), ()> {
+            let mut parser = Parser::new(text);
+            parse_declared_value(PropertyId::Color, &mut parser)
+        }
+        assert_eq!(
+            parse_declared("inherit"),
+            Ok((DeclaredValue::CssWide(CssWideKeyword::Inherit), false))
+        );
+        assert_eq!(
+            parse_declared("INITIAL !important"),
+            Ok((DeclaredValue::CssWide(CssWideKeyword::Initial), true))
+        );
+        assert_eq!(
+            parse_declared("unset"),
+            Ok((DeclaredValue::CssWide(CssWideKeyword::Unset), false))
+        );
+        assert_eq!(
+            parse_declared("revert"),
+            Ok((DeclaredValue::CssWide(CssWideKeyword::Revert), false))
+        );
+        // CSS-wide 关键字后不允许拼接其他值
+        assert!(parse_declared("inherit red").is_err());
+        assert_eq!(
+            parse_declared("#fff"),
+            Ok((
+                DeclaredValue::Typed(PropertyValue::Color(Rgba::opaque(255, 255, 255))),
+                false
+            ))
+        );
+        assert_eq!(
+            parse_declared("#fff !important"),
+            Ok((
+                DeclaredValue::Typed(PropertyValue::Color(Rgba::opaque(255, 255, 255))),
+                true
+            ))
+        );
+        assert!(parse_declared("#fff important").is_err());
+        assert!(parse_declared("#fff ! bogus").is_err());
+    }
+}
