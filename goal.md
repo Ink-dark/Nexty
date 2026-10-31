@@ -21,7 +21,7 @@
 | E (K4) | T2 text 字体注册表 | ✅ 已完成 | FontRegistry + resolve_font_with + with_registry 接线；5 个注册表测试；SpaceMono Regular/Bold + OFL 入库 tests/data/；text 0.1.9；偏差已记模块文档 |
 | E (K4) | T3 chrome 字体编排 | ✅ 已完成 | FontOrchestrator collect/fetch/register 会话去重 + with_registry 接线 + 就绪恰一轮重排；121 测试全绿、11 组 feature 零 warning；chrome 0.1.29 |
 | B (K2) | UA 表补 `a{text-decoration:underline}` | ✅ 已完成 | ua.rs 追加规则 + 镜像单测；css 0.1.18；:link/:visited 近似偏差已记；cursor/颜色属伪类轮 |
-| 收口 | 批次门禁 + 分 crate 提交 | 执行中（AGENTS chrome 段已补；workspace 门禁进行） | |
+| 收口 | 批次门禁全过（bench text-heavy 段无回退，其余场景用户裁定跳过）+ 分 crate 提交 ✅（8 commits） | | 执行报告 docs/plans/2026-10-31-round-batch1-execution-report.md |
 
 chrome 接线串行链：K1 T3 → K3 T5 → K4 T3；K2 T3 与 K1 T3 分文件并行。
 
