@@ -98,8 +98,11 @@ pub struct ComputedStyle {
     pub max_height: SizeValue,
     /// `box-sizing`（CSS Sizing 4 §5.3）。
     pub box_sizing: BoxSizingValue,
-    /// `overflow`（CSS Overflow 3 §3；仅裁剪标记，裁剪未实现）。
-    pub overflow: OverflowValue,
+    /// `overflow-x`（CSS Overflow 3 §3.1；不继承。双轴冲突时 visible
+    /// 按 auto 处理——CSS Overflow §3 简化档，见 `resolve_all`）。
+    pub overflow_x: OverflowValue,
+    /// `overflow-y`（CSS Overflow 3 §3.2；不继承；转换语义同上）。
+    pub overflow_y: OverflowValue,
     /// `flex-grow`（CSS Flexbox §7.1，initial 0）。
     pub flex_grow: f32,
     /// `flex-basis`（CSS Flexbox §7.2，initial auto）。
@@ -240,7 +243,8 @@ impl ComputedStyle {
             min_height: SizeValue::Auto,
             max_height: SizeValue::Auto,
             box_sizing: BoxSizingValue::ContentBox,
-            overflow: OverflowValue::Visible,
+            overflow_x: OverflowValue::Visible,
+            overflow_y: OverflowValue::Visible,
             flex_grow: 0.0,
             flex_basis: SizeValue::Auto,
             position: PositionValue::Static,
@@ -297,7 +301,7 @@ impl PropertyId {
 /// 顺序承载计算依赖：`FontSize` 先于 `LineHeight`（百分比按自身字号折算）、
 /// `Color` 先于 border / text-decoration 颜色（currentcolor）、border style
 /// 先于 width（none/hidden 时宽度归零）。
-const PROPERTY_ORDER: [PropertyId; 73] = [
+const PROPERTY_ORDER: [PropertyId; 74] = [
     PropertyId::Display,
     PropertyId::Color,
     PropertyId::BackgroundColor,
@@ -325,7 +329,8 @@ const PROPERTY_ORDER: [PropertyId; 73] = [
     PropertyId::MinHeight,
     PropertyId::MaxHeight,
     PropertyId::BoxSizing,
-    PropertyId::Overflow,
+    PropertyId::OverflowX,
+    PropertyId::OverflowY,
     PropertyId::FlexGrow,
     PropertyId::FlexBasis,
     PropertyId::Position,
@@ -1188,8 +1193,11 @@ fn resolve_all(
             (PropertyId::BoxSizing, Decision::Use(PropertyValue::BoxSizing(value))) => {
                 style.box_sizing = *value;
             }
-            (PropertyId::Overflow, Decision::Use(PropertyValue::Overflow(value))) => {
-                style.overflow = *value;
+            (PropertyId::OverflowX, Decision::Use(PropertyValue::Overflow(value))) => {
+                style.overflow_x = *value;
+            }
+            (PropertyId::OverflowY, Decision::Use(PropertyValue::Overflow(value))) => {
+                style.overflow_y = *value;
             }
             (PropertyId::FlexGrow, Decision::Use(PropertyValue::FlexGrow(value))) => {
                 style.flex_grow = *value;
@@ -1378,7 +1386,8 @@ fn resolve_all(
                     PropertyId::MinHeight => style.min_height = source.min_height,
                     PropertyId::MaxHeight => style.max_height = source.max_height,
                     PropertyId::BoxSizing => style.box_sizing = source.box_sizing,
-                    PropertyId::Overflow => style.overflow = source.overflow,
+                    PropertyId::OverflowX => style.overflow_x = source.overflow_x,
+                    PropertyId::OverflowY => style.overflow_y = source.overflow_y,
                     PropertyId::FlexGrow => style.flex_grow = source.flex_grow,
                     PropertyId::FlexBasis => style.flex_basis = source.flex_basis,
                     PropertyId::Position => style.position = source.position,
@@ -1458,6 +1467,17 @@ fn resolve_all(
             // 声明值与属性不匹配只可能来自程序错误；保持 initial 值
             _ => {}
         }
+    }
+    // 双轴可见性转换（CSS Overflow 3 §3 简化档）：一轴非 visible 时，另一轴的
+    // `visible` computed 为 `auto`（规范原文含 `clip` 对应 `hidden` 的半边；
+    // `clip` 未建模，`hidden`/`scroll`/`auto` 均触发转换）。在全部属性求值
+    // 完成后施加，保证读到的是两轴的最终 computed 值。
+    if style.overflow_x != OverflowValue::Visible && style.overflow_y == OverflowValue::Visible {
+        style.overflow_y = OverflowValue::Auto;
+    } else if style.overflow_y != OverflowValue::Visible
+        && style.overflow_x == OverflowValue::Visible
+    {
+        style.overflow_x = OverflowValue::Auto;
     }
     style
 }
@@ -2229,6 +2249,63 @@ mod tests {
         assert_eq!(style.white_space, WhiteSpaceValue::Normal);
         assert_eq!(style.overflow_wrap, OverflowWrapValue::Normal);
         assert_eq!(style.word_break, WordBreakValue::Normal);
+    }
+
+    /// `overflow` 双轴 computed + visible→auto 转换（CSS Overflow 3 §3 简化档）。
+    #[test]
+    fn overflow_dual_axis_computed_with_visibility_conversion() {
+        // 单值简写：双轴同值
+        let style = style_of("<p style=\"overflow: hidden\">x</p>", &[], "p");
+        assert_eq!(style.overflow_x, OverflowValue::Hidden);
+        assert_eq!(style.overflow_y, OverflowValue::Hidden);
+
+        // 双值：第 1 个 = x 轴，第 2 个 = y 轴
+        let style = style_of("<p style=\"overflow: scroll auto\">x</p>", &[], "p");
+        assert_eq!(style.overflow_x, OverflowValue::Scroll);
+        assert_eq!(style.overflow_y, OverflowValue::Auto);
+
+        // 单轴 longhand：另一轴 visible 按 auto 处理（CSS Overflow §3）
+        let style = style_of("<p style=\"overflow-x: hidden\">x</p>", &[], "p");
+        assert_eq!(style.overflow_x, OverflowValue::Hidden);
+        assert_eq!(style.overflow_y, OverflowValue::Auto);
+
+        // author 样式表路径 + 双轴均 visible：不转换
+        let style = style_of("<p>x</p>", &["p { overflow: visible }"], "p");
+        assert_eq!(style.overflow_x, OverflowValue::Visible);
+        assert_eq!(style.overflow_y, OverflowValue::Visible);
+
+        // 双轴均非 visible：互不转换
+        let style = style_of("<p style=\"overflow: hidden scroll\">x</p>", &[], "p");
+        assert_eq!(style.overflow_x, OverflowValue::Hidden);
+        assert_eq!(style.overflow_y, OverflowValue::Scroll);
+    }
+
+    /// `overflow` 双轴均不继承（CSS Overflow §3 "Inherited: no"）。
+    #[test]
+    fn overflow_is_not_inherited() {
+        let document = build_document("<div style=\"overflow: scroll\"><p>x</p></div>");
+        let parsed = Stylesheet::parse("");
+        let div_style = cascade(
+            &document,
+            find_first_by_name(&document, "div").unwrap(),
+            &[&parsed],
+            None,
+            None,
+        );
+        let p_style = cascade(
+            &document,
+            find_first_by_name(&document, "p").unwrap(),
+            &[&parsed],
+            None,
+            Some(&div_style),
+        );
+        assert_eq!(div_style.overflow_x, OverflowValue::Scroll);
+        assert_eq!(
+            p_style.overflow_x,
+            OverflowValue::Visible,
+            "overflow 不继承，子元素回落 initial"
+        );
+        assert_eq!(p_style.overflow_y, OverflowValue::Visible);
     }
 
     /// UA 表给 `<pre>` 系元素 `white-space: pre`，author 声明可覆盖。
