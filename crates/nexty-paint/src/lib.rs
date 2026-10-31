@@ -5,8 +5,8 @@
 //! [`Rasterizer`] trait 即双后端接缝。决策与调研见
 //! `docs/decisions/2026-10-01-crate-selection.md`。
 //!
-//! 指令集：`FillRect` / `StrokeRect` / `DrawText` / `DrawImage`，
-//! 后续消费方（layout）需要什么指令再扩展什么。
+//! 指令集：`FillRect` / `StrokeRect` / `FillRoundedRect` / `StrokeRoundedRect` /
+//! `FillGradient` / `DrawText` / `DrawImage`，后续消费方需要什么指令再扩展什么。
 //!
 //! 上游：`vello_cpu`（CPU 光栅，sparse strips）+ `image`（图片解码）。
 //! **解码归属**：解码器只在 [`decode`] 内出现，产出自有类型 [`Image`]，
@@ -158,6 +158,15 @@ pub struct TextGlyph {
     pub font: u32,
 }
 
+/// 线性渐变的色标（CSS Images §3.4）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GradientStop {
+    /// 色标在渐变线上的位置：0.0 = 起点，1.0 = 终点。
+    pub offset: f32,
+    /// 色标颜色（非预乘）。
+    pub color: Color,
+}
+
 /// 一条绘制指令。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -176,6 +185,54 @@ pub enum Command {
         color: Color,
         /// 线宽，px；非正值不绘制。
         width: f32,
+    },
+    /// 用纯色填充圆角矩形（CSS Backgrounds §5.5 border-radius 语义）。
+    ///
+    /// 半径顺序为左上、右上、右下、左下（CSS `border-radius` 简写序）。相邻角
+    /// 半径之和超过边长时按 CSS §5.5 等比缩减；负值与非有限半径按 0 处理
+    /// （渲染为直角）；矩形坐标非有限或宽高非正时整条指令跳过。
+    FillRoundedRect {
+        /// 目标矩形。
+        rect: Rect,
+        /// 四角半径 `[左上, 右上, 右下, 左下]`，px。
+        radii: [f32; 4],
+        /// 填充色。
+        color: Color,
+    },
+    /// 用纯色描边圆角矩形，圆角边框绘制用。
+    ///
+    /// 与 [`Command::StrokeRect`]（中心线描边）不同，本指令的 `rect` 是
+    /// border-box 外缘，绘制的带落在内侧 `[0, width]`：中心线路径整体内缩
+    /// `width/2`、半径减 `width/2`（负值钳 0），CSS §5.5 缩减在内缩后施加。
+    /// 线宽非有限或非正、内缩后矩形退化时整条指令跳过。
+    StrokeRoundedRect {
+        /// 目标矩形（border-box 外缘）。
+        rect: Rect,
+        /// 四角半径 `[左上, 右上, 右下, 左下]`，px（相对 border-box 外缘）。
+        radii: [f32; 4],
+        /// 描边色。
+        color: Color,
+        /// 带宽，px。
+        width: f32,
+    },
+    /// 用线性渐变填充（可带圆角的）矩形——单条指令覆盖渐变 × border-radius
+    /// 组合，无需调用方自算裁剪。
+    ///
+    /// `start` / `end` 是**场景坐标**下的渐变线两端（CSS Images §3.4 的角度 /
+    /// 关键字 → 端点换算由调用方完成）；色标交给后端按 sRGB、预乘 alpha 插值，
+    /// stop 范围外 Pad 外推取端色——均与 CSS 默认语义一致。offset 非有限的
+    /// 色标被丢弃；全部被丢弃、端点或矩形非法时整条指令跳过。
+    FillGradient {
+        /// 目标矩形。
+        rect: Rect,
+        /// 四角半径 `[左上, 右上, 右下, 左下]`，px；全 0 即直角。
+        radii: [f32; 4],
+        /// 渐变线起点（场景坐标）。
+        start: [f32; 2],
+        /// 渐变线终点（场景坐标）。
+        end: [f32; 2],
+        /// 色标列表（offset 0 = 起点，1 = 终点）。
+        stops: Vec<GradientStop>,
     },
     /// 绘制一行字形。
     ///
@@ -280,6 +337,48 @@ impl Scene {
                     },
                     color: *color,
                     width: *width,
+                },
+                Command::FillRoundedRect { rect, radii, color } => Command::FillRoundedRect {
+                    rect: Rect {
+                        x: rect.x + dx,
+                        y: rect.y + dy,
+                        ..*rect
+                    },
+                    radii: *radii,
+                    color: *color,
+                },
+                Command::StrokeRoundedRect {
+                    rect,
+                    radii,
+                    color,
+                    width,
+                } => Command::StrokeRoundedRect {
+                    rect: Rect {
+                        x: rect.x + dx,
+                        y: rect.y + dy,
+                        ..*rect
+                    },
+                    radii: *radii,
+                    color: *color,
+                    width: *width,
+                },
+                Command::FillGradient {
+                    rect,
+                    radii,
+                    start,
+                    end,
+                    stops,
+                } => Command::FillGradient {
+                    rect: Rect {
+                        x: rect.x + dx,
+                        y: rect.y + dy,
+                        ..*rect
+                    },
+                    radii: *radii,
+                    // 渐变端点是场景坐标：必须与矩形同步平移，否则滚动后渐变错位
+                    start: [start[0] + dx, start[1] + dy],
+                    end: [end[0] + dx, end[1] + dy],
+                    stops: stops.clone(),
                 },
                 Command::DrawText {
                     glyphs,
@@ -450,6 +549,82 @@ impl Rasterizer for VelloCpuRasterizer {
                         f64::from(rect.y) + f64::from(rect.height),
                     ));
                 }
+                Command::FillRoundedRect { rect, radii, color } => {
+                    // 非法输入跳过而非 panic（对齐 draw_image 先例）
+                    if let Some(path) = rounded_rect_path(*rect, *radii) {
+                        context.set_paint(vello_cpu::peniko::Color::from_rgba8(
+                            color.r, color.g, color.b, color.a,
+                        ));
+                        context.fill_path(&path);
+                    }
+                }
+                Command::StrokeRoundedRect {
+                    rect,
+                    radii,
+                    color,
+                    width,
+                } => {
+                    if !width.is_finite() || *width <= 0.0 {
+                        continue;
+                    }
+                    // CSS 边框带在 border-box 内侧：中心线路径整体内缩 width/2，
+                    // 圆角半径减 width/2（负值钳 0）
+                    let half = *width / 2.0;
+                    let inner = Rect {
+                        x: rect.x + half,
+                        y: rect.y + half,
+                        width: rect.width - *width,
+                        height: rect.height - *width,
+                    };
+                    let radii = sanitize_radii(*radii).map(|r| (r - half).max(0.0));
+                    if let Some(path) = rounded_rect_path(inner, radii) {
+                        context.set_paint(vello_cpu::peniko::Color::from_rgba8(
+                            color.r, color.g, color.b, color.a,
+                        ));
+                        context.set_stroke(vello_cpu::kurbo::Stroke::new(f64::from(*width)));
+                        context.stroke_path(&path);
+                    }
+                }
+                Command::FillGradient {
+                    rect,
+                    radii,
+                    start,
+                    end,
+                    stops,
+                } => {
+                    let Some(path) = rounded_rect_path(*rect, *radii) else {
+                        continue;
+                    };
+                    if !start.iter().all(|v| v.is_finite()) || !end.iter().all(|v| v.is_finite()) {
+                        continue;
+                    }
+                    // offset 非有限的色标丢弃；一条不剩则无渐变可画
+                    let peniko_stops: Vec<vello_cpu::peniko::ColorStop> = stops
+                        .iter()
+                        .filter(|stop| stop.offset.is_finite())
+                        .map(|stop| {
+                            vello_cpu::peniko::ColorStop::from((
+                                stop.offset,
+                                gradient_color(stop.color),
+                            ))
+                        })
+                        .collect();
+                    if peniko_stops.is_empty() {
+                        continue;
+                    }
+                    let source = vello_cpu::peniko::ColorStops::from(peniko_stops.as_slice());
+                    let gradient: vello_cpu::peniko::Gradient =
+                        vello_cpu::peniko::Gradient::new_linear(
+                            vello_cpu::kurbo::Point::new(f64::from(start[0]), f64::from(start[1])),
+                            vello_cpu::kurbo::Point::new(f64::from(end[0]), f64::from(end[1])),
+                        )
+                        .with_stops(&source);
+                    // 渐变端点与路径同处场景坐标系，默认恒等 paint transform
+                    // 直接可用（draw_image 的 transform 只服务于图像像素空间映射，
+                    // 其收尾已 reset，无状态残留）。
+                    context.set_paint(gradient);
+                    context.fill_path(&path);
+                }
                 Command::DrawText {
                     glyphs,
                     baseline,
@@ -602,6 +777,94 @@ fn draw_image(
     );
     context.fill_path(&target_rect.to_path(0.1));
     context.reset_paint_transform();
+}
+
+/// 把圆角半径收敛为有限非负值：负值与非有限值一律按 0 处理（渲染为直角）。
+///
+/// 渲染后端对非法数值是 panic 而非返回错误，入口先收敛（对齐 `draw_image`
+/// 的「跳过优于 panic」先例——半径语义上 0 总是安全的降级）。
+#[cfg(feature = "cpu")]
+fn sanitize_radii(radii: [f32; 4]) -> [f32; 4] {
+    radii.map(|radius| {
+        if radius.is_finite() {
+            radius.max(0.0)
+        } else {
+            0.0
+        }
+    })
+}
+
+/// CSS Backgrounds §5.5（角重叠）：任一边上相邻两角半径之和超过边长时，
+/// 全部四角半径按 `f = min(边长 / 半径和)`（只取超限边）等比缩减。
+///
+/// 输入须已过 [`sanitize_radii`]（有限非负）且边长为正——本函数是纯几何
+/// 计算，不做输入防御。
+#[cfg(feature = "cpu")]
+fn scale_overlapping_radii(width: f32, height: f32, radii: [f32; 4]) -> [f32; 4] {
+    // 四条边上的（相邻角半径和, 边长）
+    let edges = [
+        (radii[0] + radii[1], width),  // 上：左上 + 右上
+        (radii[1] + radii[2], height), // 右：右上 + 右下
+        (radii[2] + radii[3], width),  // 下：右下 + 左下
+        (radii[3] + radii[0], height), // 左：左下 + 左上
+    ];
+    let mut factor = f32::INFINITY;
+    for (sum, length) in edges {
+        if sum > length {
+            factor = factor.min(length / sum);
+        }
+    }
+    if factor < 1.0 {
+        radii.map(|radius| radius * factor)
+    } else {
+        radii
+    }
+}
+
+/// 矩形是否可绘制：坐标有限且宽高为正。
+#[cfg(feature = "cpu")]
+fn rect_is_paintable(rect: &Rect) -> bool {
+    rect.x.is_finite()
+        && rect.y.is_finite()
+        && rect.width.is_finite()
+        && rect.height.is_finite()
+        && rect.width > 0.0
+        && rect.height > 0.0
+}
+
+/// 圆角矩形 → 光栅路径；矩形不可绘制时返回 `None`（调用方跳过该指令）。
+///
+/// 半径先经 [`sanitize_radii`] 收敛、再按 [`scale_overlapping_radii`]
+/// 缩减（CSS Backgrounds §5.5）。已知偏差：kurbo 的 `RoundedRect::from_rect`
+/// 会把每个半径再钳到最短边一半——不对称大半径（如 40×100 盒上单角 40px，
+/// CSS 渲染四分之一圆）会被进一步压小，按降级语义接受。
+#[cfg(feature = "cpu")]
+fn rounded_rect_path(rect: Rect, radii: [f32; 4]) -> Option<vello_cpu::kurbo::BezPath> {
+    if !rect_is_paintable(&rect) {
+        return None;
+    }
+    let radii = scale_overlapping_radii(rect.width, rect.height, sanitize_radii(radii));
+    let kurbo_rect = vello_cpu::kurbo::Rect::new(
+        f64::from(rect.x),
+        f64::from(rect.y),
+        f64::from(rect.x) + f64::from(rect.width),
+        f64::from(rect.y) + f64::from(rect.height),
+    );
+    let kurbo_radii = vello_cpu::kurbo::RoundedRectRadii::new(
+        f64::from(radii[0]),
+        f64::from(radii[1]),
+        f64::from(radii[2]),
+        f64::from(radii[3]),
+    );
+    use vello_cpu::kurbo::Shape as _;
+    Some(vello_cpu::kurbo::RoundedRect::from_rect(kurbo_rect, kurbo_radii).to_path(0.1))
+}
+
+/// 非预乘 RGBA8 → peniko 渐变色标颜色（依赖类型不进入 pub 导出）。
+#[cfg(feature = "cpu")]
+fn gradient_color(color: Color) -> vello_cpu::peniko::color::DynamicColor {
+    use vello_cpu::peniko::color::{AlphaColor, Srgb};
+    AlphaColor::<Srgb>::from_rgba8(color.r, color.g, color.b, color.a).into()
 }
 
 // 测试需要 CPU 光栅后端与图片解码（`image`），二者同属 `cpu` feature。
@@ -1374,6 +1637,650 @@ mod tests {
         match &scene.commands[0] {
             Command::FillRect { rect, .. } => assert_eq!((rect.x, rect.y), (1.0, 2.0)),
             other => panic!("source changed: {other:?}"),
+        }
+    }
+
+    /// 断言像素接近期望颜色（`tol` 为每通道容差；渐变插值与抖动用较宽容差）。
+    fn assert_pixel_within(pixmap: &Pixmap, x: u32, y: u32, expected: [u8; 4], tol: u32) {
+        let actual = pixmap.pixel(x, y).expect("pixel in bounds");
+        for (index, (got, want)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                i32::from(*got).abs_diff(i32::from(want)) <= tol,
+                "({x}, {y}) 通道{index}: 实际 {got}，期望 {want}±{tol}，像素 {actual:?}"
+            );
+        }
+    }
+
+    // ---- 圆角矩形填充（FillRoundedRect） ----
+
+    #[test]
+    fn fill_rounded_rect_cuts_all_four_corners() {
+        // 48×48 盒（(8,8)–(56,56)）半径 12：角圆心 (20,20)/(44,20)/(44,44)/(20,44)
+        let scene = Scene {
+            commands: vec![Command::FillRoundedRect {
+                rect: rect(8.0, 8.0, 48.0, 48.0),
+                radii: [12.0; 4],
+                color: Color::opaque(255, 0, 0),
+            }],
+            images: Vec::new(),
+        };
+        let pixmap = VelloCpuRasterizer::new()
+            .rasterize(&scene, size(64, 64))
+            .expect("rasterize");
+
+        // 中心、直边中点与圆角内侧：完全不透明
+        for (x, y) in [
+            (32, 32),
+            (32, 9),
+            (9, 32),
+            (55, 32),
+            (32, 55),
+            (24, 24),
+            (40, 24),
+            (40, 40),
+            (24, 40),
+        ] {
+            assert_pixel_within(&pixmap, x, y, [255, 0, 0, 255], 8);
+        }
+        // 四角外侧（圆角截掉的区域）：透明
+        for (x, y) in [(9, 9), (55, 9), (55, 55), (9, 55)] {
+            let pixel = pixmap.pixel(x, y).expect("in bounds");
+            assert!(pixel[3] <= 8, "({x}, {y}) 应在圆角外，实际 {pixel:?}");
+        }
+    }
+
+    #[test]
+    fn fill_rounded_rect_invalid_radii_render_sharp() {
+        // 负值 / NaN / 无穷半径一律按 0 处理 → 直角矩形，四角全覆盖
+        let scene = Scene {
+            commands: vec![Command::FillRoundedRect {
+                rect: rect(8.0, 8.0, 48.0, 48.0),
+                radii: [-5.0, f32::NAN, f32::INFINITY, -0.5],
+                color: Color::opaque(255, 0, 0),
+            }],
+            images: Vec::new(),
+        };
+        let pixmap = VelloCpuRasterizer::new()
+            .rasterize(&scene, size(64, 64))
+            .expect("rasterize");
+        for (x, y) in [(9, 9), (55, 9), (55, 55), (9, 55), (32, 32)] {
+            assert_pixel_within(&pixmap, x, y, [255, 0, 0, 255], 8);
+        }
+    }
+
+    #[test]
+    fn fill_rounded_rect_invalid_rect_is_skipped() {
+        let cases = [
+            Rect {
+                x: f32::NAN,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            Rect {
+                x: 0.0,
+                y: f32::NAN,
+                width: 10.0,
+                height: 10.0,
+            },
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: f32::NAN,
+                height: 10.0,
+            },
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 10.0,
+            },
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: -3.0,
+            },
+            Rect {
+                x: f32::INFINITY,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+        ];
+        for invalid in cases {
+            let scene = Scene {
+                commands: vec![Command::FillRoundedRect {
+                    rect: invalid,
+                    radii: [4.0; 4],
+                    color: Color::opaque(255, 0, 0),
+                }],
+                images: Vec::new(),
+            };
+            let pixmap = VelloCpuRasterizer::new()
+                .rasterize(&scene, size(16, 16))
+                .expect("rasterize");
+            assert!(
+                pixmap.data.iter().all(|byte| *byte == 0),
+                "非法矩形 {invalid:?} 应被跳过"
+            );
+        }
+    }
+
+    // ---- 圆角矩形描边（StrokeRoundedRect：border-box 内侧带） ----
+
+    #[test]
+    fn stroke_rounded_rect_band_geometry_and_hollow_center() {
+        // border-box (8,8)–(56,56) 半径 12、带宽 4 → 中心线 (10,10)–(54,54)
+        // 半径 10；直边带 y∈[8,12]，角带半径 ∈[8,12]（角圆心 (20,20)）
+        let scene = Scene {
+            commands: vec![Command::StrokeRoundedRect {
+                rect: rect(8.0, 8.0, 48.0, 48.0),
+                radii: [12.0; 4],
+                color: Color::opaque(0, 0, 255),
+                width: 4.0,
+            }],
+            images: Vec::new(),
+        };
+        let pixmap = VelloCpuRasterizer::new()
+            .rasterize(&scene, size(64, 64))
+            .expect("rasterize");
+
+        // 直边带与弧带
+        assert_pixel_within(&pixmap, 32, 9, [0, 0, 255, 255], 8);
+        assert_pixel_within(&pixmap, 13, 13, [0, 0, 255, 255], 8);
+        // 带外（上侧）、空心中心与角圆心
+        for (x, y) in [(32, 7), (32, 32), (20, 20)] {
+            let pixel = pixmap.pixel(x, y).expect("in bounds");
+            assert!(pixel[3] == 0, "({x}, {y}) 应空心，实际 {pixel:?}");
+        }
+        // border-box 外无描边
+        let pixel = pixmap.pixel(9, 9).expect("in bounds");
+        assert!(pixel[3] <= 8, "border-box 外应无描边，实际 {pixel:?}");
+    }
+
+    #[test]
+    fn stroke_rounded_rect_invalid_width_is_noop() {
+        for width in [0.0f32, -2.0, f32::NAN, f32::INFINITY] {
+            let scene = Scene {
+                commands: vec![Command::StrokeRoundedRect {
+                    rect: rect(8.0, 8.0, 48.0, 48.0),
+                    radii: [12.0; 4],
+                    color: Color::opaque(0, 0, 255),
+                    width,
+                }],
+                images: Vec::new(),
+            };
+            let pixmap = VelloCpuRasterizer::new()
+                .rasterize(&scene, size(64, 64))
+                .expect("rasterize");
+            assert!(
+                pixmap.data.iter().all(|byte| *byte == 0),
+                "线宽 {width} 应不绘制"
+            );
+        }
+    }
+
+    #[test]
+    fn stroke_rounded_rect_degenerate_inner_rect_is_skipped() {
+        // 带宽 ≥ 盒边长：中心线内缩后退化，无带可画 → 跳过而非 panic
+        for width in [48.0f32, 60.0] {
+            let scene = Scene {
+                commands: vec![Command::StrokeRoundedRect {
+                    rect: rect(8.0, 8.0, 48.0, 48.0),
+                    radii: [12.0; 4],
+                    color: Color::opaque(0, 0, 255),
+                    width,
+                }],
+                images: Vec::new(),
+            };
+            let pixmap = VelloCpuRasterizer::new()
+                .rasterize(&scene, size(64, 64))
+                .expect("rasterize");
+            assert!(
+                pixmap.data.iter().all(|byte| *byte == 0),
+                "带宽 {width} ≥ 边长应跳过"
+            );
+        }
+    }
+
+    // ---- 线性渐变填充（FillGradient） ----
+
+    #[test]
+    fn fill_gradient_endpoints_and_midpoint() {
+        // 水平渐变（场景坐标端点 (0,8)→(64,8)），矩形 (0,8,64,16)
+        let scene = Scene {
+            commands: vec![Command::FillGradient {
+                rect: rect(0.0, 8.0, 64.0, 16.0),
+                radii: [0.0; 4],
+                start: [0.0, 8.0],
+                end: [64.0, 8.0],
+                stops: vec![
+                    GradientStop {
+                        offset: 0.0,
+                        color: Color::opaque(255, 0, 0),
+                    },
+                    GradientStop {
+                        offset: 1.0,
+                        color: Color::opaque(0, 0, 255),
+                    },
+                ],
+            }],
+            images: Vec::new(),
+        };
+        let pixmap = VelloCpuRasterizer::new()
+            .rasterize(&scene, size(64, 32))
+            .expect("rasterize");
+
+        // t = x/64 的 sRGB 线性插值（光栅抖动容差 ±16）
+        assert_pixel_within(&pixmap, 2, 16, [247, 0, 8, 255], 16);
+        assert_pixel_within(&pixmap, 32, 16, [128, 0, 128, 255], 16);
+        assert_pixel_within(&pixmap, 62, 16, [8, 0, 247, 255], 16);
+        // 矩形外透明
+        assert_eq!(pixmap.pixel(32, 4), Some([0, 0, 0, 0]));
+        assert_eq!(pixmap.pixel(32, 28), Some([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn fill_gradient_explicit_stop_offsets() {
+        // 显式 offset 三色标：25% 处纯绿，绿→蓝插值中点在 t=0.625 → x=40
+        let scene = Scene {
+            commands: vec![Command::FillGradient {
+                rect: rect(0.0, 0.0, 64.0, 8.0),
+                radii: [0.0; 4],
+                start: [0.0, 0.0],
+                end: [64.0, 0.0],
+                stops: vec![
+                    GradientStop {
+                        offset: 0.0,
+                        color: Color::opaque(255, 0, 0),
+                    },
+                    GradientStop {
+                        offset: 0.25,
+                        color: Color::opaque(0, 255, 0),
+                    },
+                    GradientStop {
+                        offset: 1.0,
+                        color: Color::opaque(0, 0, 255),
+                    },
+                ],
+            }],
+            images: Vec::new(),
+        };
+        let pixmap = VelloCpuRasterizer::new()
+            .rasterize(&scene, size(64, 16))
+            .expect("rasterize");
+
+        assert_pixel_within(&pixmap, 16, 4, [0, 255, 0, 255], 8);
+        assert_pixel_within(&pixmap, 40, 4, [0, 128, 128, 255], 16);
+        assert_pixel_within(&pixmap, 62, 4, [0, 8, 247, 255], 16);
+    }
+
+    #[test]
+    fn fill_gradient_clipped_by_rounded_radii() {
+        // 渐变 × 圆角：单条指令完成，角外被路径裁剪
+        let scene = Scene {
+            commands: vec![Command::FillGradient {
+                rect: rect(8.0, 8.0, 48.0, 48.0),
+                radii: [12.0; 4],
+                start: [8.0, 0.0],
+                end: [56.0, 0.0],
+                stops: vec![
+                    GradientStop {
+                        offset: 0.0,
+                        color: Color::opaque(255, 0, 0),
+                    },
+                    GradientStop {
+                        offset: 1.0,
+                        color: Color::opaque(0, 0, 255),
+                    },
+                ],
+            }],
+            images: Vec::new(),
+        };
+        let pixmap = VelloCpuRasterizer::new()
+            .rasterize(&scene, size(64, 64))
+            .expect("rasterize");
+
+        // 中心与直边中点都在渐变中部（x=32 → t≈0.5）
+        assert_pixel_within(&pixmap, 32, 32, [128, 0, 128, 255], 20);
+        assert_pixel_within(&pixmap, 32, 9, [128, 0, 128, 255], 20);
+        // 圆角外被裁剪
+        for (x, y) in [(9, 9), (55, 9), (55, 55), (9, 55)] {
+            let pixel = pixmap.pixel(x, y).expect("in bounds");
+            assert!(
+                pixel[3] <= 8,
+                "({x}, {y}) 渐变应在圆角外被裁剪，实际 {pixel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fill_gradient_invalid_input_is_skipped() {
+        let stops = || {
+            vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: Color::opaque(255, 0, 0),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: Color::opaque(0, 0, 255),
+                },
+            ]
+        };
+        let cases = [
+            // 端点非有限
+            (
+                rect(0.0, 0.0, 64.0, 8.0),
+                [f32::NAN, 0.0],
+                [64.0, 0.0],
+                stops(),
+            ),
+            (
+                rect(0.0, 0.0, 64.0, 8.0),
+                [0.0, 0.0],
+                [f32::NEG_INFINITY, 0.0],
+                stops(),
+            ),
+            // 色标为空
+            (
+                rect(0.0, 0.0, 64.0, 8.0),
+                [0.0, 0.0],
+                [64.0, 0.0],
+                Vec::new(),
+            ),
+            // 矩形非法
+            (
+                Rect {
+                    x: f32::NAN,
+                    y: 0.0,
+                    width: 64.0,
+                    height: 8.0,
+                },
+                [0.0, 0.0],
+                [64.0, 0.0],
+                stops(),
+            ),
+        ];
+        for (invalid_rect, start, end, stops) in cases {
+            let scene = Scene {
+                commands: vec![Command::FillGradient {
+                    rect: invalid_rect,
+                    radii: [0.0; 4],
+                    start,
+                    end,
+                    stops,
+                }],
+                images: Vec::new(),
+            };
+            let pixmap = VelloCpuRasterizer::new()
+                .rasterize(&scene, size(64, 16))
+                .expect("rasterize");
+            assert!(
+                pixmap.data.iter().all(|byte| *byte == 0),
+                "非法渐变输入应被跳过"
+            );
+        }
+    }
+
+    #[test]
+    fn fill_gradient_drops_non_finite_offset_stops() {
+        // 中间色标 offset 为 NaN：该色标被丢弃，红→蓝照常插值
+        let scene = Scene {
+            commands: vec![Command::FillGradient {
+                rect: rect(0.0, 8.0, 64.0, 16.0),
+                radii: [0.0; 4],
+                start: [0.0, 8.0],
+                end: [64.0, 8.0],
+                stops: vec![
+                    GradientStop {
+                        offset: 0.0,
+                        color: Color::opaque(255, 0, 0),
+                    },
+                    GradientStop {
+                        offset: f32::NAN,
+                        color: Color::opaque(0, 255, 0),
+                    },
+                    GradientStop {
+                        offset: 1.0,
+                        color: Color::opaque(0, 0, 255),
+                    },
+                ],
+            }],
+            images: Vec::new(),
+        };
+        let pixmap = VelloCpuRasterizer::new()
+            .rasterize(&scene, size(64, 32))
+            .expect("rasterize");
+        assert_pixel_within(&pixmap, 2, 16, [247, 0, 8, 255], 16);
+        assert_pixel_within(&pixmap, 32, 16, [128, 0, 128, 255], 16);
+        assert_pixel_within(&pixmap, 62, 16, [8, 0, 247, 255], 16);
+    }
+
+    // ---- CSS Backgrounds §5.5 半径缩减（纯函数 + 像素级） ----
+
+    #[test]
+    fn sanitize_radii_clamps_negative_and_non_finite_to_zero() {
+        assert_eq!(
+            sanitize_radii([3.0, -2.0, f32::NAN, f32::INFINITY]),
+            [3.0, 0.0, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn scale_radii_noop_when_adjacent_sums_fit_edges() {
+        assert_eq!(
+            scale_overlapping_radii(100.0, 60.0, [40.0, 40.0, 0.0, 0.0]),
+            [40.0, 40.0, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn scale_radii_applies_min_factor_across_all_edges() {
+        // 100×60，radii [80,40,0,0]：上边和 120/100 → f≈0.833；左边和 80/60 →
+        // f=0.75；取最小 f=0.75 施加到**全部**四角（CSS §5.5）
+        assert_eq!(
+            scale_overlapping_radii(100.0, 60.0, [80.0, 40.0, 0.0, 0.0]),
+            [60.0, 30.0, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn scale_radii_single_oversized_corner_is_capped_to_edge() {
+        // 32×32 单角 128：相邻和 128 > 32 → f = 0.25 → 半径缩到边长
+        assert_eq!(
+            scale_overlapping_radii(32.0, 32.0, [128.0, 0.0, 0.0, 0.0]),
+            [32.0, 0.0, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn scale_radii_zero_sums_need_no_scaling() {
+        assert_eq!(scale_overlapping_radii(32.0, 32.0, [0.0; 4]), [0.0; 4]);
+    }
+
+    #[test]
+    fn fill_rounded_rect_overlarge_radii_scale_down_per_css() {
+        // 40×40 盒四角半径 30：相邻和 60 > 40 → f = 2/3 → 全部缩到 20，
+        // 四角圆心重合于盒中心 (32,32)，形状恰为半径 20 的圆
+        let scene = Scene {
+            commands: vec![Command::FillRoundedRect {
+                rect: rect(12.0, 12.0, 40.0, 40.0),
+                radii: [30.0; 4],
+                color: Color::opaque(255, 0, 0),
+            }],
+            images: Vec::new(),
+        };
+        let pixmap = VelloCpuRasterizer::new()
+            .rasterize(&scene, size(64, 64))
+            .expect("rasterize");
+
+        // 缩减后（r=20，圆心 (32,32)）在形状内；若未缩减（r=30，圆心 (42,42)），
+        // (20,20) 距圆心 31.1 在形状外——该点是缩减行为的判别点
+        assert_pixel_within(&pixmap, 20, 20, [255, 0, 0, 255], 8);
+        assert_pixel_within(&pixmap, 32, 32, [255, 0, 0, 255], 8);
+        assert_pixel_within(&pixmap, 45, 32, [255, 0, 0, 255], 8);
+        // 圆外：距 (32,32) 24.7 > 20
+        let pixel = pixmap.pixel(14, 14).expect("in bounds");
+        assert!(pixel[3] <= 8, "缩减后 (14,14) 应在形状外，实际 {pixel:?}");
+    }
+
+    // ---- M6 兼容：新指令进 Scene::translated 平移路径 ----
+
+    #[test]
+    fn translated_shifts_rounded_and_gradient_commands() {
+        let red = Color::opaque(255, 0, 0);
+        let blue = Color::opaque(0, 0, 255);
+        let stops = vec![
+            GradientStop {
+                offset: 0.0,
+                color: red,
+            },
+            GradientStop {
+                offset: 1.0,
+                color: blue,
+            },
+        ];
+        let scene = Scene {
+            commands: vec![
+                Command::FillRoundedRect {
+                    rect: rect(1.0, 2.0, 3.0, 4.0),
+                    radii: [1.0, 2.0, 3.0, 4.0],
+                    color: red,
+                },
+                Command::StrokeRoundedRect {
+                    rect: rect(5.0, 6.0, 7.0, 8.0),
+                    radii: [4.0; 4],
+                    color: blue,
+                    width: 2.0,
+                },
+                Command::FillGradient {
+                    rect: rect(0.0, 0.0, 10.0, 10.0),
+                    radii: [0.0; 4],
+                    start: [10.0, 20.0],
+                    end: [30.0, 40.0],
+                    stops: stops.clone(),
+                },
+            ],
+            images: Vec::new(),
+        };
+        let moved = scene.translated(3.0, -1.0);
+        match &moved.commands[0] {
+            Command::FillRoundedRect { rect, radii, color } => {
+                assert_eq!(
+                    (rect.x, rect.y, rect.width, rect.height),
+                    (4.0, 1.0, 3.0, 4.0)
+                );
+                assert_eq!(*radii, [1.0, 2.0, 3.0, 4.0]);
+                assert_eq!(*color, red);
+            }
+            other => panic!("first command changed: {other:?}"),
+        }
+        match &moved.commands[1] {
+            Command::StrokeRoundedRect {
+                rect,
+                radii,
+                color,
+                width,
+            } => {
+                assert_eq!(
+                    (rect.x, rect.y, rect.width, rect.height),
+                    (8.0, 5.0, 7.0, 8.0)
+                );
+                assert_eq!(*radii, [4.0; 4]);
+                assert_eq!((*color, *width), (blue, 2.0));
+            }
+            other => panic!("second command changed: {other:?}"),
+        }
+        match &moved.commands[2] {
+            Command::FillGradient {
+                rect,
+                radii,
+                start,
+                end,
+                stops: moved_stops,
+            } => {
+                assert_eq!((rect.x, rect.y), (3.0, -1.0));
+                assert_eq!(*radii, [0.0; 4]);
+                // 渐变端点是场景坐标：必须与矩形同步平移（漏移则滚动后错位）
+                assert_eq!(*start, [13.0, 19.0]);
+                assert_eq!(*end, [33.0, 39.0]);
+                assert_eq!(*moved_stops, stops);
+            }
+            other => panic!("third command changed: {other:?}"),
+        }
+        // 源场景不受影响
+        match &scene.commands[2] {
+            Command::FillGradient { start, end, .. } => {
+                assert_eq!((*start, *end), ([10.0, 20.0], [30.0, 40.0]));
+            }
+            other => panic!("source changed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translated_new_commands_render_identically_at_offset() {
+        // 整数平移后逐像素一致（亚像素相位不变），渐变端点随矩形同步平移
+        let red = Color::opaque(255, 0, 0);
+        let blue = Color::opaque(0, 0, 255);
+        let scene = Scene {
+            commands: vec![
+                Command::FillRoundedRect {
+                    rect: rect(2.0, 2.0, 20.0, 20.0),
+                    radii: [6.0; 4],
+                    color: red,
+                },
+                Command::StrokeRoundedRect {
+                    rect: rect(2.0, 26.0, 20.0, 20.0),
+                    radii: [4.0; 4],
+                    color: blue,
+                    width: 3.0,
+                },
+                Command::FillGradient {
+                    rect: rect(2.0, 50.0, 20.0, 12.0),
+                    radii: [3.0, 0.0, 3.0, 0.0],
+                    start: [2.0, 50.0],
+                    end: [22.0, 62.0],
+                    stops: vec![
+                        GradientStop {
+                            offset: 0.0,
+                            color: red,
+                        },
+                        GradientStop {
+                            offset: 1.0,
+                            color: blue,
+                        },
+                    ],
+                },
+            ],
+            images: Vec::new(),
+        };
+        let direct = VelloCpuRasterizer::new()
+            .rasterize(&scene, size(32, 72))
+            .expect("rasterize");
+        let moved = scene.translated(8.0, 4.0);
+        let shifted = VelloCpuRasterizer::new()
+            .rasterize(&moved, size(32, 72))
+            .expect("rasterize");
+
+        // 非空验证：三条指令各自应有像素落下（防止双方全透明导致空断言）
+        assert_eq!(direct.pixel(12, 12), Some([255, 0, 0, 255]));
+        assert_eq!(direct.pixel(12, 27), Some([0, 0, 255, 255]));
+        assert_pixel_within(&direct, 12, 56, [128, 0, 128, 255], 16);
+
+        // 平移场景在 (+8, +4) 处与原场景逐像素一致（渐变抖动允许 ±2）
+        for y in 0..68u32 {
+            for x in 0..24u32 {
+                let want = direct.pixel(x, y).expect("in bounds");
+                let got = shifted.pixel(x + 8, y + 4).expect("in bounds");
+                for (index, (g, w)) in got.iter().zip(want).enumerate() {
+                    assert!(
+                        i32::from(*g).abs_diff(i32::from(w)) <= 2,
+                        "({x}, {y}) 通道{index}: 平移后 {g}，原始 {w}"
+                    );
+                }
+            }
         }
     }
 }
