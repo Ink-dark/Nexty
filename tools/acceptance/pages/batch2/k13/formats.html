@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>K13 图片格式 formats</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 16px; line-height: 1.5; color: #222; }
+  h1 { font-size: 1.2rem; border-bottom: 1px solid #ccc; padding-bottom: .3rem; }
+  .row { margin: .6rem 0; }
+  .row img { vertical-align: middle; margin-right: 10px; }
+  code { background: #f4f4f4; padding: 0 .25rem; border-radius: 3px; }
+  .note { color: #666; font-size: .9rem; }
+</style>
+</head>
+<body>
+<h1>K13 图片格式：png / jpeg / gif / webp 并排</h1>
+<p>四张 8×8 fixture（<code>crates/nexty-paint/tests/data/gen_k13_fixtures.py</code> 生成，
+经 <code>/k13/img/*</code> 路由出图），以 <code>width/height</code> 属性放大到 64×64 绘制。
+每张应为同一幅四象限色块：<b>左上红、右上绿、左下蓝、右下白</b>。</p>
+
+<div class="row"><img src="/k13/img/png.png" width="64" height="64">PNG（无损：四色应精确）</div>
+<div class="row"><img src="/k13/img/jpeg.jpeg" width="64" height="64">JPEG（有损：允许压缩噪点与边缘振铃，象限色仍应可辨）</div>
+<div class="row"><img src="/k13/img/gif.gif" width="64" height="64">GIF（调色板：应与 PNG 一致；动图取帧 1）</div>
+<div class="row"><img src="/k13/img/webp.webp" width="64" height="64">WebP（有损：允许噪点，象限色仍应可辨）</div>
+
+<h2>判据</h2>
+<p>1. 四张图全部出现（不进错误页、不缺图缺尺寸）；<br>
+2. 每张均为四象限色块：左上红 / 右上绿 / 左下蓝 / 右下白；<br>
+3. jpeg / webp 允许有损噪点，象限主色可辨即可；gif 与 png 应基本一致。</p>
+<p class="note">解码路径：字节 → nexty-paint <code>decode</code>（内容嗅探）→ RGBA8 → DrawImage 放大绘制。</p>
+</body>
+</html>

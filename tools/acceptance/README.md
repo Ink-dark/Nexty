@@ -27,7 +27,7 @@ cargo build -p nexty-chrome --bin nexty --release
 
 ```
 tools/acceptance/
-├── server.cjs                 # 静态 pages/ + 动态端点（GBK/302/缓存/字体/stats）
+├── server.cjs                 # 静态 pages/ + 动态端点（GBK/302/缓存/字体/favicon/stats）
 ├── regenerate-gbk.sh          # gbk-page.src.html → gbk-page.hex（iconv）
 ├── README.md                  # 本文件：运行方式 + 回归清单 + 新增资产约定
 └── pages/
@@ -35,6 +35,7 @@ tools/acceptance/
     ├── batch1/k2/             # K2 绘制扩展对照（五组 / 放大 / 装饰线 / 链接）
     ├── batch1/k3/             # K3 GBK 字节、302 落点页、缓存页
     ├── batch1/k4/             # K4 @font-face 正常页与 404 回退页
+    ├── batch2/k13/            # K13 formats 页 + favicon 两态页（二进制 fixture 复用 paint tests/data）
     ├── core/                  # 长页主页 + 第二页 + dot.png（滚动/键盘/选区/链接）
     ├── links/                 # 链接点击与行内图片形态
     └── legacy/                # 历史轮次页面原样迁入（t3 文本/图片/float，float 冒烟）
@@ -59,6 +60,21 @@ tools/acceptance/
 | K1-1 | `/core/` | 滚轮 / PageUp/PageDown / Home/End 滚动；链接导航；后退前进 | 键盘 + 截图 |
 | K1-2 | `/links/*` | 单次点击链接导航；图片与链接同排 | 点击 + 标题变化 |
 | K1-3 | `/core/` `/legacy/t3/selection.html` | 拖拽选区高亮、`Ctrl+C` 进系统剪贴板、块边界插换行 | 截图 + 读剪贴板 |
+
+## 回归清单（批次 2 增量，K13 图片格式 + favicon）
+
+favicon 页的**前提**：favicon 编排（`FaviconOrchestrator` →
+`AddressBar::set_favicon`）已在 `app.rs` 接线（K13 泳道文件清单不含
+app.rs，接线随批次收口合入）。未接线时导航不发图标请求，`/stats`
+无对应计数——这不是页面或服务器的缺陷。
+
+| # | 路由 | 判据 | 判定方式 |
+| --- | --- | --- | --- |
+| K13-1 | `/k13` | png/jpeg/gif/webp 四张 8×8 并排，均为四象限色块（左上红/右上绿/左下蓝/右下白），jpeg/webp 允许有损噪点 | 截图目测 |
+| K13-2 | `/k13icon` | 地址栏左侧出现 16×16 橙色图标，URL 文本右移让位 | 截图目测 |
+| K13-3 | `/k13icon` | `/stats` 有 `/k13-link-icon.ico` 且无 `/favicon.ico`（link 优先，不回落） | `/stats` |
+| K13-4 | `/k13icon` 二次导航 | `/k13-link-icon.ico` 计数不变（会话去重） | `/stats` |
+| K13-5 | `/k13noicon` | 无 link 回落：`/stats` 有 `/favicon.ico` 计数，图标照常出现 | `/stats` + 截图 |
 
 历史轮次页面（`/legacy/...`）的判据写在各页面末尾或对应轮次文档
 （`docs/plans/`）中；这些页面在当年验收通过后原样迁入，改动需同步更新本文档。

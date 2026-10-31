@@ -1,0 +1,29 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="icon" href="/k13-link-icon.ico">
+<title>K13 favicon：有 link</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 16px; line-height: 1.5; color: #222; }
+  h1 { font-size: 1.2rem; border-bottom: 1px solid #ccc; padding-bottom: .3rem; }
+  code { background: #f4f4f4; padding: 0 .25rem; border-radius: 3px; }
+  .note { color: #666; font-size: .9rem; }
+</style>
+</head>
+<body>
+<h1>K13 favicon 两态页 ①：有 link 图标</h1>
+<p>本页 head 携带 <code>&lt;link rel="icon" href="/k13-link-icon.ico"&gt;</code>——
+16×16 橙色 ICO（<code>crates/nexty-paint/tests/data/gen_k13_fixtures.py</code> 生成，
+经 <code>/k13-link-icon.ico</code> 路由出图）。</p>
+
+<h2>判据</h2>
+<p>1. 地址栏左侧出现 16×16 橙色图标（走 DrawImage 绘制路径，URL 文本右移让位）；<br>
+2. <a href="/stats">/stats</a> 中 <code>/k13-link-icon.ico</code> 计数 +1，
+且 <code>/favicon.ico</code> 无新增计数（link 优先，不回落）；<br>
+3. 同会话二次导航本页：<code>/k13-link-icon.ico</code> 计数不变（会话去重）。</p>
+<p class="note">前提：favicon 编排（FaviconOrchestrator → AddressBar::set_favicon）已在
+app.rs 接线。K13 泳道文件清单不含 app.rs，接线随批次收口合入；未接线时本页只能验证
+页面本身渲染。两态页 ② 见 /k13noicon。</p>
+</body>
+</html>

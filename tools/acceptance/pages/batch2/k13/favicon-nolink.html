@@ -1,0 +1,27 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>K13 favicon：无 link（回落）</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 16px; line-height: 1.5; color: #222; }
+  h1 { font-size: 1.2rem; border-bottom: 1px solid #ccc; padding-bottom: .3rem; }
+  code { background: #f4f4f4; padding: 0 .25rem; border-radius: 3px; }
+  .note { color: #666; font-size: .9rem; }
+</style>
+</head>
+<body>
+<h1>K13 favicon 两态页 ②：无 link 图标（回落 /favicon.ico）</h1>
+<p>本页 head <b>不带</b>任何 <code>link[rel~=icon]</code>——favicon 编排应回落站点根
+<code>/favicon.ico</code>（HTTP 事实标准），由 <code>/favicon.ico</code> 动态路由出同一份
+16×16 橙色 ICO。</p>
+
+<h2>判据</h2>
+<p>1. 地址栏左侧仍出现 16×16 橙色图标（回落命中）；<br>
+2. <a href="/stats">/stats</a> 中 <code>/favicon.ico</code> 计数 +1
+（与两态页 ① 的 <code>/k13-link-icon.ico</code> 相互独立，可分别断言）；<br>
+3. 回落抓取失败或字节非图片时页面照常渲染（静默降级不阻塞——本页正常路径看 1、2 即可）。</p>
+<p class="note">前提同两态页 ①：favicon 编排已在 app.rs 接线（未接线时仅验证页面渲染）。
+重跑验收先开一次 <a href="/reset">/reset</a>。</p>
+</body>
+</html>
