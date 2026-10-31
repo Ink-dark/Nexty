@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "mimosa-hook-status/v1",
+  "recordedAt": "2026-10-11T03:43:43.354Z",
+  "sessionId": "sess_ca7e797f-14f7-4cd4-a65e-6a69d7418103",
+  "event": "PostToolUse",
+  "toolName": "Edit",
+  "file": "D:\\Nexty\\crates\\nexty-layout\\src\\inline.rs",
+  "outcome": "inconclusive",
+  "coverage": "partial",
+  "findingCount": 0,
+  "durationMs": 12,
+  "hostState": "hook_complete",
+  "reportHint": ".mimosa/reports/"
+}
