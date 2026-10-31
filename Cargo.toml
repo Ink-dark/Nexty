@@ -3,6 +3,7 @@
 # 分层与 crate 选型见 docs/decisions/2026-10-01-crate-selection.md
 members = [
     "crates/nexty-dom",
+    "crates/nexty-jsrt-rquickjs",
     "crates/nexty-html",
     "crates/nexty-css",
     "crates/nexty-layout",
