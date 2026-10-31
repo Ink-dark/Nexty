@@ -930,6 +930,51 @@ pub(crate) fn ensure_analysis(
     }
 }
 
+/// 浮动盒的占用矩形（相对 run 叶内容盒坐标）。
+///
+/// 行盒按浮动收缩（CSS 2.2 §9.5）：行顶落在浮动纵向范围内时，行盒左右
+/// 各被浮动占据的部分让出。矩形由布局层从 taffy 已放置的浮动盒换算而来。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FloatRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// 行顶 `y` 处的可用水平区间 `(left, right)`：空浮动表恒为 `(0, max_width)`。
+///
+/// 判定只看行顶（行高在断行期未知）：行跨入更深浮动区间时整行按行顶宽
+/// 放置——记为偏差（规范要求按行内内容跨度的最窄可用区缩短）。左/右由
+/// 浮动盒中心在包含块左半/右半判定（LTR 单侧浮动）。
+fn wrap_bounds(floats: &[FloatRect], y: f32, max_width: f32) -> (f32, f32) {
+    let mut left = 0.0_f32;
+    let mut right = max_width;
+    for float in floats {
+        if y + 0.001 >= float.y && y < float.y + float.height {
+            if float.x + float.width / 2.0 <= max_width / 2.0 {
+                left = left.max(float.x + float.width);
+            } else {
+                right = right.min(float.x);
+            }
+        }
+    }
+    (left, right)
+}
+
+/// 断行放置约束（宽度 / 语义 / 缩进 / 浮动区间）。
+pub(crate) struct LineConstraints<'a> {
+    /// 定宽断行宽（min-content 语义下为 0，max-content 下为 +inf）。
+    pub max_width: f32,
+    /// 是否 min-content 语义（`overflow-wrap: break-word` 的紧急断点不参与）。
+    pub min_content: bool,
+    /// 首行缩进（CSS Text 3 §4；测量路径与后续行由调用方保证传 0）。
+    pub first_line_indent: f32,
+    /// 该 run 所在 BFC 的浮动占用矩形（空表 = 无浮动，行为零变化）；
+    /// 每行按行顶 y 查可用区间收缩（见 [`wrap_bounds`]）。
+    pub floats: &'a [FloatRect],
+}
+
 /// 贪心断行与行盒组装。
 ///
 /// `analysis` 是与 `items` 平行的逐 chunk 宽度无关分析（见
@@ -937,21 +982,23 @@ pub(crate) fn ensure_analysis(
 /// 布局级度量缓存（同一 TextStyle 整次布局只整形一次探针）。
 /// `block_style` 提供 strut（行盒的高度下限与基线位置）。原子图片按基线
 /// 对齐（底边落在基线上，CSS 2.1 §10.8.1），不参与断行（不可拆）。
-/// `min_content` 为真时按 min-content 语义断行（`overflow-wrap: break-word`
-/// 的紧急断点不参与）。`first_line_indent` 是已解析的首行缩进（CSS Text
-/// 3 §4；测量路径与后续行由调用方保证传 0）——从首行可用宽中扣减。
+/// 宽度/语义/缩进/浮动区间见 [`LineConstraints`]。
 pub(crate) fn build_lines(
     shaping: &crate::ShapingContext<'_>,
     items: &[InlineItem],
     analysis: &[Option<ChunkAnalysis>],
-    max_width: f32,
     block_style: &ComputedStyle,
-    min_content: bool,
-    first_line_indent: f32,
+    constraints: &LineConstraints<'_>,
 ) -> Vec<LineFragment> {
     if items.is_empty() {
         return Vec::new();
     }
+    let LineConstraints {
+        max_width,
+        min_content,
+        first_line_indent,
+        floats,
+    } = *constraints;
 
     // 数值卫生兜底：NaN 按 0 降级（污染隔离在单元素）；+inf 是 MaxContent
     // 测量的合法「不折行」语义，保留（游标累加的都是有限宽度，坐标不扩散
@@ -966,16 +1013,22 @@ pub(crate) fn build_lines(
     let strut_above = strut_metrics.ascent + strut_half_leading;
     let strut_below = strut_metrics.descent + strut_half_leading;
 
+    // 首行按 y = 0 查浮动区间：行内游标从浮动右缘之外开始（左浮动），
+    // 行右界收缩到右浮动左缘之前。
+    let (first_left, first_right) = wrap_bounds(floats, 0.0, max_width);
     let mut builder = LineBuilder {
         shaping,
         items,
         analysis,
         max_width,
+        floats,
+        line_top: 0.0,
+        line_right: first_right,
         strut_above,
         strut_below,
         lines: Vec::new(),
         placed: Vec::new(),
-        cursor: first_line_indent,
+        cursor: first_left + first_line_indent,
         current_start: LineStart::Soft { space: false },
         next_start: LineStart::Soft { space: false },
         trailing_letter_spacing: 0.0,
@@ -1047,6 +1100,12 @@ struct LineBuilder<'a> {
     items: &'a [InlineItem],
     analysis: &'a [Option<ChunkAnalysis>],
     max_width: f32,
+    /// 浮动占用矩形（空表 = 无浮动环绕）。
+    floats: &'a [FloatRect],
+    /// 已换出行的高度累计（下一行的行顶 y，用于查浮动区间）。
+    line_top: f32,
+    /// 当前行的可用右界（无浮动时恒为 `max_width`）。
+    line_right: f32,
     strut_above: f32,
     strut_below: f32,
     lines: Vec<LineFragment>,
@@ -1212,7 +1271,7 @@ impl LineBuilder<'_> {
         else {
             return;
         };
-        if !self.placed.is_empty() && self.cursor + width > self.max_width {
+        if !self.placed.is_empty() && self.cursor + width > self.line_right {
             if break_before {
                 self.mark_soft_break(Some(item_index), span.byte_start);
                 self.flush(self.justify);
@@ -1222,7 +1281,7 @@ impl LineBuilder<'_> {
                     return;
                 };
                 start = new_start;
-                if new_width > self.max_width
+                if new_width > self.line_right
                     && let Some(emergency) = emergency
                 {
                     self.place_emergency(item_index, new_start, new_end, emergency);
@@ -1237,7 +1296,7 @@ impl LineBuilder<'_> {
             }
             // 不可断且放不下：溢出放置（保留旧行为）
         } else if self.placed.is_empty()
-            && width > self.max_width
+            && width > self.line_right
             && let Some(emergency) = emergency
         {
             self.place_emergency(item_index, start, end, emergency);
@@ -1270,7 +1329,7 @@ impl LineBuilder<'_> {
             else {
                 continue;
             };
-            if !self.placed.is_empty() && self.cursor + width > self.max_width {
+            if !self.placed.is_empty() && self.cursor + width > self.line_right {
                 self.mark_soft_break(Some(item_index), part.byte_start);
                 self.flush(self.justify);
                 // 新行是空的：本段即使超宽也直接放置（单个 cluster 不可再拆）
@@ -1286,7 +1345,7 @@ impl LineBuilder<'_> {
 
     /// 放置一个原子项（图片 / 原子盒）：不可拆，放不下先换行。
     fn place_atomic(&mut self, item_index: usize, width: f32, break_before: bool) {
-        if !self.placed.is_empty() && self.cursor + width > self.max_width && break_before {
+        if !self.placed.is_empty() && self.cursor + width > self.line_right && break_before {
             self.mark_soft_break(None, 0);
             self.flush(self.justify);
         }
@@ -1404,7 +1463,7 @@ impl LineBuilder<'_> {
                     }
                 }
             }
-            let free = self.max_width - net;
+            let free = self.line_right - net;
             if free > 0.0 && free.is_finite() {
                 let count = (0..self.placed.len() - 1)
                     .filter(|&boundary| self.justify_opportunity(boundary))
@@ -1613,9 +1672,10 @@ impl LineBuilder<'_> {
         {
             glyph.advance -= letter;
         }
+        let line_height = baseline + below;
         self.lines.push(LineFragment {
             baseline,
-            height: baseline + below,
+            height: line_height,
             start: std::mem::replace(
                 &mut self.current_start,
                 std::mem::replace(&mut self.next_start, LineStart::Soft { space: false }),
@@ -1625,7 +1685,11 @@ impl LineBuilder<'_> {
             boxes,
         });
         self.placed.clear();
-        self.cursor = 0.0;
+        // 下一行的行顶在上一行之下：按新 y 重新取浮动区间
+        self.line_top += line_height;
+        let (left, right) = wrap_bounds(self.floats, self.line_top, self.max_width);
+        self.cursor = left;
+        self.line_right = right;
     }
 }
 

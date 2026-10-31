@@ -1706,7 +1706,7 @@ dependencies = [
 
 [[package]]
 name = "nexty-css"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "cssparser",
  "nexty-dom",

@@ -128,6 +128,8 @@ pub(crate) struct InlineRunNode<'a> {
     /// 簇映射 / 断点切分与可用宽无关，跨 measure 宽度档位复用——只有
     /// 贪心放置按宽度重跑。items 在树构建期定型，长度即缓存长度。
     analysis: RefCell<Vec<Option<ChunkAnalysis>>>,
+    /// 环绕修正后的行盒（浮动表非空时由布局层写入，装配优先消费）。
+    wrapped: RefCell<Option<Vec<LineFragment>>>,
 }
 
 impl InlineRunNode<'_> {
@@ -152,6 +154,46 @@ impl InlineRunNode<'_> {
             let (_, _, lines) = self.lines_cache.borrow_mut().remove(position);
             return lines;
         }
+        let lines = self.compute_lines(available_width, min_content, &[]);
+        self.lines_cache
+            .borrow_mut()
+            .push((available_width, min_content, lines.clone()));
+        lines
+    }
+
+    /// 按浮动占用区间重排行盒（浮动环绕修正 pass），并存进 `wrapped` 缓存
+    /// 供片段装配优先消费。返回修正后的行盒总高（作为 run 叶的定高回写
+    /// taffy，使容器高度与后续兄弟位置按实际行数解算）。
+    ///
+    /// 只在定宽语义下使用（`min_content` 恒 false）：内在尺寸测量与浮动
+    /// 无关（CSS 2.2 §10.3.7）；不与 `lines_cache` 混用（同宽不同约束）。
+    #[cfg(feature = "block")]
+    pub(crate) fn wrap_against(
+        &self,
+        available_width: f32,
+        floats: &[crate::inline::FloatRect],
+    ) -> f32 {
+        let lines = self.compute_lines(available_width, false, floats);
+        let height: f32 = lines.iter().map(|line| line.height).sum();
+        *self.wrapped.borrow_mut() = Some(lines);
+        height
+    }
+
+    /// 环绕修正后的行盒（未修正过返回 `None`）。
+    #[cfg(feature = "block")]
+    pub(crate) fn wrapped_lines(&self) -> Option<Vec<LineFragment>> {
+        self.wrapped.borrow_mut().take()
+    }
+
+    /// 行盒计算内核：原子盒惰性布局 + 逐 chunk 分析缓存 + 贪心断行。
+    ///
+    /// `floats` 为空时行为与历史一致（浮动区间恒为全宽）。
+    fn compute_lines(
+        &self,
+        available_width: f32,
+        min_content: bool,
+        floats: &[crate::inline::FloatRect],
+    ) -> Vec<LineFragment> {
         for item in self.items.borrow_mut().iter_mut() {
             if let InlineItem::Block(atomic) = item {
                 // feature `block` 关闭时无原子盒递归布局管线：保持占位片段
@@ -172,32 +214,24 @@ impl InlineRunNode<'_> {
             }
         }
         let items = self.items.borrow();
-        let lines = {
-            let mut analysis = self.analysis.borrow_mut();
-            if analysis.len() != items.len() {
-                analysis.resize_with(items.len(), || None);
-            }
-            // 宽度无关部分（shaping / 簇映射 / 断点切分）按档位懒填充，
-            // 跨 measure 宽度档位复用；贪心放置在 build_lines 内按宽重跑
-            crate::inline::ensure_analysis(self.ctx.shaper, &items, &mut analysis, min_content);
-            let shaping = crate::ShapingContext {
-                shaper: self.ctx.shaper,
-                metrics: &self.ctx.metrics,
-            };
-            crate::inline::build_lines(
-                &shaping,
-                &items,
-                &analysis,
-                available_width,
-                &self.strut_style,
-                min_content,
-                self.first_line_indent(available_width, min_content),
-            )
+        let mut analysis = self.analysis.borrow_mut();
+        if analysis.len() != items.len() {
+            analysis.resize_with(items.len(), || None);
+        }
+        // 宽度无关部分（shaping / 簇映射 / 断点切分）按档位懒填充，
+        // 跨 measure 宽度档位复用；贪心放置在 build_lines 内按宽重跑
+        crate::inline::ensure_analysis(self.ctx.shaper, &items, &mut analysis, min_content);
+        let shaping = crate::ShapingContext {
+            shaper: self.ctx.shaper,
+            metrics: &self.ctx.metrics,
         };
-        self.lines_cache
-            .borrow_mut()
-            .push((available_width, min_content, lines.clone()));
-        lines
+        let constraints = crate::inline::LineConstraints {
+            max_width: available_width,
+            min_content,
+            first_line_indent: self.first_line_indent(available_width, min_content),
+            floats,
+        };
+        crate::inline::build_lines(&shaping, &items, &analysis, &self.strut_style, &constraints)
     }
 
     /// 首行缩进的 used value（CSS Text 3 §4）。
@@ -495,9 +529,11 @@ fn collect_children_boxes<'a>(
                     DisplayValue::Contents => {
                         collect_children_boxes(ctx, boxes, child, child_style, kind, state);
                     }
-                    // 块容器走法：行内级子元素进 run 叶
+                    // 块容器走法：行内级子元素进 run 叶（浮动的元素被 blockify，
+                    // CSS 2.1 §9.7，落进下面的块级分支）
                     _ if kind == WalkKind::BlockContainer
-                        && is_inline_level(child_style.display) =>
+                        && is_inline_level(child_style.display)
+                        && child_style.float == nexty_css::FloatValue::None =>
                     {
                         state
                             .run
@@ -550,6 +586,7 @@ fn flush_run<'a>(
                             strut_style: strut_style.clone(),
                             lines_cache: RefCell::new(Vec::new()),
                             analysis: RefCell::new(Vec::new()),
+                            wrapped: RefCell::new(None),
                         },
                     );
                     state.participants.push(taffy);
