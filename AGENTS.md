@@ -57,6 +57,21 @@ cargo clippy --all-targets -- -D warnings
 
 新增 crate 时在根 `Cargo.toml` 的 `members` 里登记，crate 之间用 `path = "../nexty-xxx"` 互引。
 
+### 实机验收资产（`tools/acceptance/`，入库）
+
+浏览器外壳没有无头模式，渲染/交互/网络行为只能由架构师驱动窗口验收。验收页面
+统一放 `tools/acceptance/pages/`，由 `node tools/acceptance/server.cjs`（默认
+`http://127.0.0.1:8472`）提供固定 URL，索引页 `/` 列出全部路由与判据，
+`/stats` 给出各 URL 请求计数（缓存命中 / 字体去重 / 302 落点靠它做计数断言）。
+
+- 新增验收页面必须三处登记：`pages/index.html`（路由 + 判据）、
+  `tools/acceptance/README.md`（回归清单表格）、必要时 `server.cjs`（需要
+  302 / Cache-Control / charset 等响应头时才加动态路由）。
+- 判据文案写进页面，不要只存在对话里；生成类资产（如 GBK 字节）保留
+  可读源 + 幂等生成脚本（`regenerate-gbk.sh`）。
+- 已知缺陷与宿主测试坑记在 `tools/acceptance/README.md` 的「已知缺陷 / 偏差」，
+  避免下一轮把既有偏差误判成回归。
+
 ## Architecture
 
 ```
@@ -76,6 +91,8 @@ Nexty/                                  # 主仓库 (Ink-dark/Nexty)，workspace
 │   ├── nexty-paint/                    #   vello_cpu + vello_hybrid 双后端封装（隔离渲染线程）
 │   ├── nexty-network/                  #   reqwest 封装（NetworkFetcher trait）
 │   └── nexty-chrome/                   #   winit 窗口 + 地址栏 + 导航
+├── tools/
+│   └── acceptance/                     # 实机验收站与页面（入库，见「实机验收资产」）
 └── docs/
     ├── decisions/                      # 架构决策记录（ADR）：依赖选型、自研决策
     ├── plans/                          # 阶段计划文档

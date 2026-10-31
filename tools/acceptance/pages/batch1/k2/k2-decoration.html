@@ -1,0 +1,15 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>装饰线专项</title>
+</head>
+<body style="margin:16px">
+<p style="font-size:40px">行1 裸 &lt;a&gt;：<a href="#x">裸链接文本</a></p>
+<p style="font-size:40px;text-decoration:underline">行2 继承 underline：普通文本 <span>嵌套 span</span></p>
+<p style="font-size:40px"><a href="#x" style="text-decoration:underline">行3 内联 underline 链接</a></p>
+<p style="font-size:40px"><a href="#x" style="text-decoration:overline line-through">行4 overline+line-through 链接</a></p>
+<p style="font-size:40px"><span style="text-decoration:line-through">行5 line-through span</span></p>
+<p>预期：行1 走 UA 表 a{underline}，与行2/3 一样有下划线；行4 上划线与删除线同时在；行5 仅删除线。</p>
+</body>
+</html>

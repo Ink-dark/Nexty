@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Selection smoke</title>
+<style>
+body { margin: 8px; font-family: sans-serif; font-size: 16px; }
+h2 { font-size: 18px; margin: 16px 0 4px; }
+.narrow { width: 320px; border: 1px solid #999; padding: 4px; }
+.url { width: 220px; border: 1px solid #999; padding: 4px; overflow-wrap: break-word; }
+pre { width: 360px; border: 1px solid #999; padding: 4px; }
+a { color: #0645ad; }
+</style>
+</head>
+<body>
+<h2>1. 中文段落（拖拽跨行选择）</h2>
+<div class="narrow">这是一段用来验证页面文本选择与复制的中文文本。它应该折成多行，拖拽时高亮逐行出现，复制出来的内容不应丢失中间的字符。再来一些文字：一二三四五六七八九十甲乙丙丁戊己庚辛壬癸。</div>
+
+<h2>2. 混合样式与行内原子盒</h2>
+<div class="narrow">alpha <b>bold text</b> omega <span style="display:inline-block; border:1px solid #c00; padding:0 3px">box</span> tail</div>
+
+<h2>3. 硬断行与 pre</h2>
+<p>line one<br>line two<br>line three</p>
+<pre>pre  two  spaces
+second line</pre>
+
+<h2>4. 长 URL</h2>
+<div class="url">https://example.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</div>
+
+<h2>5. 链接（拖过只选择，单击才跳转）</h2>
+<p><a href="links.html">this is a link target</a></p>
+
+<h2>6. 滚动与下方内容</h2>
+<div style="height: 700px">下方留白用于滚动后检查选区对齐。</div>
+<p>EOF marker</p>
+</body>
+</html>

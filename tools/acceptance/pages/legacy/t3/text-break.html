@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>UAX#14 text breaking smoke</title>
+<style>
+body { margin: 8px; font-family: sans-serif; font-size: 16px; }
+h2 { font-size: 18px; margin: 12px 0 4px; }
+.narrow { width: 200px; border: 1px solid #999; padding: 2px; }
+.url { width: 220px; border: 1px solid #999; padding: 2px; }
+</style>
+</head>
+<body>
+<h2>1. 中文 200px 容器（应多行、每行不溢出）</h2>
+<div class="narrow">这是一段用来验证中文断行的测试文本，包含标点符号，不能出现行首标点，也不能横向溢出。我们要看到多行正确折行，浏览器观感与规范一致。再来一些文字：一二三四五六七八九十甲乙丙丁戊己庚辛壬癸。</div>
+
+<h2>2. pre（保留空白与换行）</h2>
+<pre>line one   with   spaces
+line two
+line three</pre>
+
+<h2>3. br（第二行从左边开始，nowrap 仍断行）</h2>
+<p>alpha<br>beta<br>gamma</p>
+<p style="white-space: nowrap">nowrap one<br>nowrap two</p>
+
+<h2>4. break-word 长 URL（应折行不溢出）</h2>
+<div class="url" style="overflow-wrap: break-word">https://example.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</div>
+
+<h2>5. keep-all（中文保持单行溢出）</h2>
+<div class="narrow" style="word-break: keep-all">汉汉汉汉汉汉汉汉汉汉汉汉汉汉汉汉汉汉汉汉</div>
+</body>
+</html>

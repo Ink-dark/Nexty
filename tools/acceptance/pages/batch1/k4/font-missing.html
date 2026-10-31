@@ -1,0 +1,20 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>404 字体页</title>
+<style>
+/* 故意用与 font-face.html 不同的 family 名：同名会命中会话级注册表，
+   看到上一页已注册的字体，掩盖「404 → 回退系统字体」的判定。 */
+@font-face { font-family: "Missing Mono Test"; src: url("/font/missing.ttf"); }
+.mono { font-family: "Missing Mono Test"; font-size: 34px; }
+.sys { font-family: serif; font-size: 34px; }
+</style>
+</head>
+<body style="margin:16px">
+<h1>@font-face 404 回退验收</h1>
+<p class="mono">0123456789 ABC Wgq #{}</p>
+<p class="sys">0123456789 ABC Wgq #{}</p>
+<p>预期：字体 404 → 两行都用系统回退字体（字形相同），页面正常渲染、不出豆腐块、不报错。</p>
+</body>
+</html>

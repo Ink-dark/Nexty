@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+body { margin: 0; font-family: sans-serif; }
+h1 { font-size: 24px; margin: 16px 20px; }
+/* margin collapse: gap between the two p's must be 12px (max), not 24px */
+p { margin: 12px 20px; font-size: 14px; }
+/* flex row: three items, grow 1 basis 0 -> equal thirds */
+.nav { display: flex; margin: 0 20px; }
+.nav div { flex-grow: 1; flex-basis: 0px; height: 32px; border: 2px solid #1a73e8; margin-right: 4px; }
+.nav div:last-child { margin-right: 0; }
+/* flex shrink: three 100px-basis items in a 200px container -> each ~66.7px */
+.shrink { display: flex; width: 200px; margin: 12px 20px; }
+.shrink div { flex-basis: 100px; height: 24px; border: 2px solid #34a853; }
+/* border-box: outer edge must be exactly 100px wide */
+.box { width: 100px; padding: 10px; border: 5px solid #ea4335; box-sizing: border-box;
+       height: 40px; margin: 12px 20px; }
+/* inline flow: text + replaced image + inline-block atomic box */
+.flow { margin: 12px 20px; font-size: 14px; }
+.tag { display: inline-block; width: 80px; height: 24px; border: 2px solid #fbbc04; }
+</style>
+</head>
+<body>
+<h1>T3 taffy layout smoke test</h1>
+<p>First paragraph, margins 12px. Next paragraph collapses with it: gap is 12, not 24.</p>
+<p>Second paragraph. Block boxes stack vertically and fill the containing width.</p>
+<div class="nav"><div></div><div></div><div></div></div>
+<div class="shrink"><div></div><div></div><div></div></div>
+<div class="box">border-box</div>
+<p class="flow">Inline flow: an image <img src="pixel.png" width="32" height="16"> followed by an atomic box <span class="tag">tag</span> and trailing text.</p>
+</body>
+</html>

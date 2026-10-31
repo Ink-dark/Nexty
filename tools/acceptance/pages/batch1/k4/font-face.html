@@ -1,0 +1,18 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>字体验收</title>
+<style>
+@font-face { font-family: "Space Mono Test"; src: url("/font/space-mono.ttf"); }
+.mono { font-family: "Space Mono Test"; font-size: 34px; }
+.sys { font-family: serif; font-size: 34px; }
+</style>
+</head>
+<body style="margin:16px">
+<h1>@font-face 验收</h1>
+<p class="mono">0123456789 ABC Wgq #{}</p>
+<p class="sys">0123456789 ABC Wgq #{}</p>
+<p>上行 = @font-face（Space Mono 等宽），下行 = 系统 serif。两行字形应明显不同。</p>
+</body>
+</html>
