@@ -1,7 +1,7 @@
 [package]
 name = "nexty-chrome"
 description = "Nexty 浏览器外壳：窗口、输入、导航与自绘 UI"
-version = "0.1.33"
+version = "0.1.34"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -11,7 +11,7 @@ rust-version.workspace = true
 # 默认开启全部已实现能力。`window` 是二进制外壳本体（winit+wgpu），
 # 关闭后本 crate 只剩可无头测试的纯逻辑模块（history/ui/scrollbar/pipeline）。
 default = [
-    "pipeline", "resources", "render", "history", "ui", "scrollbar", "selection", "window",
+    "pipeline", "resources", "render", "history", "ui", "scrollbar", "selection", "script", "window",
 ]
 # 导航管线：HTML → 级联 → 布局 → 片段树 → paint 显示列表（纯逻辑，可测试）。
 pipeline = []
@@ -27,9 +27,13 @@ ui = []
 scrollbar = []
 # 页面文本选区状态机（纯逻辑）+ 复制到系统剪贴板。
 selection = ["pipeline", "dep:arboard"]
+# 页面脚本编排（K5 T3）：ScriptHost 装配 + 事件间隙任务泵 + 重排脏位消费。
+# 依赖子资源清单收集（外链脚本清单/抓取）与导航管线（Page），引攀适配层
+# nexty-jsrt-rquickjs 为可选依赖（kernel facade 不引攀；由本 feature 门控）。
+script = ["pipeline", "resources", "dep:nexty-jsrt-rquickjs"]
 # 浏览器外壳本体：winit 事件循环 + wgpu 呈现（`run()` 入口）。
 # 依赖 winit / wgpu / pollster 与下层各 crate，故隐含它们。
-window = ["pipeline", "resources", "render", "history", "ui", "scrollbar", "selection",
+window = ["pipeline", "resources", "render", "history", "ui", "scrollbar", "selection", "script",
     "dep:winit", "dep:wgpu", "dep:pollster"]
 
 [dependencies]
@@ -40,6 +44,9 @@ nexty-layout = { path = "../nexty-layout", version = "0.1.0" }
 nexty-text = { path = "../nexty-text", version = "0.1.0" }
 nexty-paint = { path = "../nexty-paint", version = "0.1.0" }
 nexty-network = { path = "../nexty-network", version = "0.1.0" }
+# 引擎适配层（K5 T3）：可选依赖，仅 `script` feature 引入——kernel facade
+# crate 不默认引攀（JSRT 可插拔，AGENTS.md Hard Rules）。
+nexty-jsrt-rquickjs = { path = "../nexty-jsrt-rquickjs", version = "0.1.1", optional = true }
 winit = { version = "0.30.13", optional = true }
 wgpu = { version = "29", optional = true }
 # wgpu 的异步初始化在 winit 事件循环外的同步入口完成

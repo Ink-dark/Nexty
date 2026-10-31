@@ -19,7 +19,7 @@
 //! 字段（K5 扩回调签名）；`screenX/Y` 未跟踪（置 0）；无 mousemove/悬停
 //! 派发（悬停只更新光标）；地址栏聚焦时按键属 chrome UI，不派发到页面。
 
-use nexty_dom::{DeltaMode, KeyboardEvent, MouseEvent, NodeId, WheelEvent};
+use nexty_dom::{DeltaMode, Event, KeyboardEvent, MouseEvent, NodeId, WheelEvent};
 
 use super::BrowserApp;
 use crate::pipeline::{self, Page, PendingLifecycle};
@@ -50,7 +50,9 @@ pub(super) fn dispatch_mouse(
     event.ctrl_key = modifiers.ctrl;
     event.shift_key = modifiers.shift;
     event.alt_key = modifiers.alt;
-    page.document.dispatch(target, &mut event.event)
+    page.document
+        .borrow_mut()
+        .dispatch(target, &mut event.event)
 }
 
 /// 派发滚轮事件（wheel）到 `target`。
@@ -68,7 +70,9 @@ pub(super) fn dispatch_wheel(
     event.delta_x = delta.0;
     event.delta_y = delta.1;
     event.delta_mode = mode;
-    page.document.dispatch(target, &mut event.event)
+    page.document
+        .borrow_mut()
+        .dispatch(target, &mut event.event)
 }
 
 /// 派发键盘事件（keydown）到 `target`。
@@ -90,7 +94,9 @@ pub(super) fn dispatch_key(
     event.shift_key = modifiers.shift;
     event.alt_key = modifiers.alt;
     event.repeat = repeat;
-    page.document.dispatch(target, &mut event.event)
+    page.document
+        .borrow_mut()
+        .dispatch(target, &mut event.event)
 }
 
 /// chrome 抽象键 → DOM `key`/`code` 字符串（KeyboardEvent 数据面填充用）。
@@ -141,9 +147,15 @@ impl BrowserApp {
         };
         let target = match node {
             Some(node) => node,
-            None => page.document.root(),
+            None => page.document.borrow().root(),
         };
-        dispatch_mouse(page, target, type_, (x, y - BAR_HEIGHT), buttons, modifiers)
+        let dispatched =
+            dispatch_mouse(page, target, type_, (x, y - BAR_HEIGHT), buttons, modifiers);
+        // JS 监听器表同事件派发 + 事件间隙任务泵（K5 T3）：click 监听器改
+        // textContent → 泵后脏位 → 重排。
+        let js_dispatched = self.dispatch_script_event(target, type_);
+        self.pump_scripts();
+        dispatched && js_dispatched
     }
 
     /// 派发滚轮事件（光标命中节点或文档根）。返回「未取消」。
@@ -155,9 +167,12 @@ impl BrowserApp {
         };
         let target = match node {
             Some(node) => node,
-            None => page.document.root(),
+            None => page.document.borrow().root(),
         };
-        dispatch_wheel(page, target, delta, mode)
+        let dispatched = dispatch_wheel(page, target, delta, mode);
+        let js_dispatched = self.dispatch_script_event(target, "wheel");
+        self.pump_scripts();
+        dispatched && js_dispatched
     }
 
     /// 窗口点 `(x, y)` 在页面里的命中节点（工具带高度已扣除并叠加滚动；
@@ -205,8 +220,11 @@ impl BrowserApp {
         let Some(page) = self.page.as_mut() else {
             return true;
         };
-        let target = page.document.root();
-        dispatch_key(page, target, key, code, modifiers, repeat)
+        let target = page.document.borrow().root();
+        let dispatched = dispatch_key(page, target, key, code, modifiers, repeat);
+        let js_dispatched = self.dispatch_script_event(target, "keydown");
+        self.pump_scripts();
+        dispatched && js_dispatched
     }
 
     /// 滚动键的「先派发后默认」：keydown 未取消才执行滚动。
@@ -216,23 +234,100 @@ impl BrowserApp {
         }
     }
 
-    /// 页面安装点的生命周期派发：按跨线程信号 post DOMContentLoaded / load
-    /// 任务（pipeline 单处钩子构造，FIFO 保序），随即排空——事件在当前
-    /// 页面文档根上派发。信号未到的事件不 post（K3/K4 异步 settle 的接缝）。
+    /// 页面安装点的生命周期派发：每个事件按「K1 表（EventLoop post + 排空）
+    /// → JS 监听器表（jsrt 会话）」成对派发，DOMContentLoaded 先于 load。
+    /// 信号未到的事件不派发（K3/K4 异步 settle 的接缝）。K5 T3 语义：defer
+    /// 档脚本已在页面安装期执行完，DCL 此后才派发（K1 时序保持）。
+    ///
+    /// 跨表偏差：K1 的 Rust 监听器与 jsrt 的 JS 监听器是两张表，同一事件
+    /// 各走一遍派发（先后成对，表内保序）——单表语义已在 jsrt gate 模块
+    /// 文档登记。
     pub(super) fn dispatch_page_lifecycle(&mut self, pending: PendingLifecycle) {
-        if pending.is_empty() {
-            return;
+        if pending.dom_content_loaded {
+            self.dispatch_lifecycle_event(true);
         }
+        if pending.load {
+            self.dispatch_lifecycle_event(false);
+        }
+    }
+
+    /// 单个生命周期事件的成对派发 + 事件间隙任务泵。
+    fn dispatch_lifecycle_event(&mut self, dom_content_loaded: bool) {
+        let pending = PendingLifecycle {
+            dom_content_loaded,
+            load: false,
+        };
         if let Some(page) = self.page.as_mut() {
             page.post_lifecycle_tasks(&mut self.dom_loop, pending);
         }
         self.run_dom_tasks();
+        let mut event = if dom_content_loaded {
+            Event::dom_content_loaded()
+        } else {
+            Event::load()
+        };
+        self.dispatch_script_lifecycle(&mut event);
+        self.pump_scripts();
+    }
+
+    /// JS 监听器表上的生命周期事件派发（无脚本会话为无操作）。
+    fn dispatch_script_lifecycle(&mut self, event: &mut Event) {
+        let Some(script) = self.script.as_ref() else {
+            return;
+        };
+        let Some(page) = self.page.as_ref() else {
+            return;
+        };
+        let target = page.document.borrow().root();
+        if let Err(error) = script.dispatch(target, event) {
+            eprintln!("script lifecycle error: {error}");
+        }
+    }
+
+    /// JS 监听器表上的输入事件派发（无脚本会话视为未取消，与无监听器一致）。
+    /// 返回「未取消」。
+    fn dispatch_script_event(&mut self, target: NodeId, type_: &str) -> bool {
+        let Some(script) = self.script.as_ref() else {
+            return true;
+        };
+        let mut event = Event::new(type_, true, true);
+        match script.dispatch(target, &mut event) {
+            Ok(not_prevented) => not_prevented,
+            Err(error) => {
+                eprintln!("script event error: {error}");
+                true
+            }
+        }
+    }
+
+    /// 事件间隙任务泵（K5 T3）：清空微任务 / 到期定时器；绑定面改过文档则
+    /// 重排一轮 + 请求重绘（「DOM 变更后触发重排」的接缝）。泵错误记日志
+    /// 不 panic（偏差：错误后本轮泵终止）。
+    fn pump_scripts(&mut self) {
+        let outcome = match self.script.as_mut() {
+            Some(script) => {
+                let error = script.pump().err();
+                let mutated = script.take_mutated();
+                (error, mutated)
+            }
+            None => return,
+        };
+        if let Some(error) = outcome.0 {
+            eprintln!("script task error: {error}");
+        }
+        if outcome.1 {
+            self.relayout();
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
     }
 
     /// 排空 DOM 宏任务队列（任务在当前页面文档上执行）。
     pub(super) fn run_dom_tasks(&mut self) {
         if let Some(page) = self.page.as_mut() {
-            self.dom_loop.run_pending_tasks(&mut page.document);
+            self.dom_loop
+                .run_pending_tasks(&mut page.document.borrow_mut());
         }
     }
 }
@@ -271,14 +366,14 @@ mod tests {
 
     /// 块级链接页 + 命中节点（布局 200px 视口，点 (10, 5) 命中 `<a>` 盒）。
     fn link_page(log: &Log, prevent_click: bool) -> (Page, NodeId) {
-        let mut page = pipeline::load_page(
+        let page = pipeline::load_page(
             "<body><a href=\"/target\" style=\"display: block; height: 20px\">block link</a></body>",
             "body { margin: 0 }",
         );
         let shaper = nexty_text::ParleyTextShaper::new();
         let root = pipeline::layout_page(&page, &shaper, 200.0).expect("root");
         let node = pipeline::hit_test(&root, 10.0, 5.0).expect("命中链接");
-        page.document.add_listener(
+        page.document.borrow_mut().add_listener(
             node,
             "mousedown",
             false,
@@ -287,7 +382,7 @@ mod tests {
                 prevent_click: false,
             }),
         );
-        page.document.add_listener(
+        page.document.borrow_mut().add_listener(
             node,
             "mouseup",
             false,
@@ -296,7 +391,7 @@ mod tests {
                 prevent_click: false,
             }),
         );
-        page.document.add_listener(
+        page.document.borrow_mut().add_listener(
             node,
             "click",
             false,
@@ -388,25 +483,29 @@ mod tests {
     fn lifecycle_posts_dispatch_exactly_once_per_signal_in_fifo_order() {
         let mut page = pipeline::load_page("<body>hi</body>", "");
         let log: Log = Rc::new(RefCell::new(Vec::new()));
-        let root = page.document.root();
+        let root = page.document.borrow().root();
         let recorder = |log: &Log, label: &'static str| {
             let log = Rc::clone(log);
             Box::new(move |_event: &mut Event| log.borrow_mut().push(label))
                 as Box<dyn EventListener>
         };
-        page.document.add_listener(
+        page.document.borrow_mut().add_listener(
             root,
             nexty_dom::DOM_CONTENT_LOADED,
             false,
             recorder(&log, "dcl"),
         );
-        page.document
-            .add_listener(root, nexty_dom::LOAD, false, recorder(&log, "load"));
+        page.document.borrow_mut().add_listener(
+            root,
+            nexty_dom::LOAD,
+            false,
+            recorder(&log, "load"),
+        );
 
         // 无信号：不 post、不派发
         let mut event_loop = nexty_dom::EventLoop::new();
         page.post_lifecycle_tasks(&mut event_loop, PendingLifecycle::default());
-        event_loop.run_pending_tasks(&mut page.document);
+        event_loop.run_pending_tasks(&mut page.document.borrow_mut());
         assert!(log.borrow().is_empty(), "信号未到不派发");
 
         // 只到解析信号：仅 DOMContentLoaded
@@ -417,7 +516,7 @@ mod tests {
                 load: false,
             },
         );
-        event_loop.run_pending_tasks(&mut page.document);
+        event_loop.run_pending_tasks(&mut page.document.borrow_mut());
         assert_eq!(*log.borrow(), ["dcl"], "仅 DOMContentLoaded 派发");
 
         // settle 信号到：load 恰一次
@@ -428,7 +527,7 @@ mod tests {
                 load: true,
             },
         );
-        event_loop.run_pending_tasks(&mut page.document);
+        event_loop.run_pending_tasks(&mut page.document.borrow_mut());
         assert_eq!(
             *log.borrow(),
             ["dcl", "load"],
@@ -436,7 +535,7 @@ mod tests {
         );
 
         // 队列已空：重复排空不重复派发
-        event_loop.run_pending_tasks(&mut page.document);
+        event_loop.run_pending_tasks(&mut page.document.borrow_mut());
         assert_eq!(log.borrow().len(), 2, "排空后无重复派发");
     }
 
@@ -445,10 +544,10 @@ mod tests {
     #[test]
     fn wheel_and_key_dispatch_gating() {
         let mut page = pipeline::load_page("<body>x</body>", "");
-        let root_node = page.document.root();
+        let root_node = page.document.borrow().root();
         let hits = Rc::new(RefCell::new(Vec::new()));
         let wheel_hits = Rc::clone(&hits);
-        page.document.add_listener(
+        page.document.borrow_mut().add_listener(
             root_node,
             "wheel",
             false,
@@ -464,7 +563,7 @@ mod tests {
         assert_eq!(*hits.borrow(), ["wheel"]);
 
         let key_hits = Rc::new(RefCell::new(Vec::new()));
-        page.document.add_listener(
+        page.document.borrow_mut().add_listener(
             root_node,
             "keydown",
             false,

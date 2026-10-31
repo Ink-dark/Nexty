@@ -32,7 +32,9 @@
 //! （点击滚动容器内的文本会偏移 scrollTop，高亮绘制跟随内容）；hidden
 //! 容器不可编程滚动；退化 padding box 不发裁剪。
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use nexty_css::{
@@ -48,8 +50,9 @@ use nexty_text::TextShaper;
 
 /// 一个已解析、已级联的页面。
 pub struct Page {
-    /// arena 文档。
-    pub document: Document,
+    /// arena 文档（Rc 共享：JSRT 脚本会话与页面共用同一棵树，K5 T3——
+    /// ADR `docs/decisions/2026-10-31-jsrt.md`「页面与引擎同生共死」）。
+    pub document: Rc<RefCell<Document>>,
     /// 各元素的 computed style。
     pub styles: HashMap<NodeId, ComputedStyle>,
     /// 作者样式表（视口变化后重级联用；UA 样式表固定不存）。
@@ -76,14 +79,14 @@ pub struct Page {
 /// 实际视口走 [`recascade`]（后台线程拿不到窗口尺寸）。
 #[must_use]
 pub fn build_page(
-    document: Document,
+    document: Rc<RefCell<Document>>,
     stylesheets: Vec<Stylesheet>,
     images: HashMap<NodeId, Arc<Image>>,
 ) -> Page {
     let sheet_refs: Vec<&Stylesheet> = stylesheets.iter().collect();
     let mut inline_style_cache = nexty_css::InlineStyleCache::new();
     let styles = nexty_css::compute_document_styles_in_with_cache(
-        &document,
+        &document.borrow(),
         &sheet_refs,
         Some(html_ua_stylesheet()),
         None,
@@ -104,7 +107,7 @@ pub fn build_page(
 pub fn recascade(page: &mut Page, viewport: MediaViewport) {
     let sheet_refs: Vec<&Stylesheet> = page.stylesheets.iter().collect();
     page.styles = nexty_css::compute_document_styles_in_with_cache(
-        &page.document,
+        &page.document.borrow(),
         &sheet_refs,
         Some(html_ua_stylesheet()),
         Some(viewport),
@@ -115,7 +118,10 @@ pub fn recascade(page: &mut Page, viewport: MediaViewport) {
 /// 解析并级联一份页面（单张作者样式表，无图片——内部页/空白页用）。
 #[must_use]
 pub fn load_page(html: &str, author_css: &str) -> Page {
-    let document = nexty_html::parse_document(html, ParseOptions::default());
+    let document = Rc::new(RefCell::new(nexty_html::parse_document(
+        html,
+        ParseOptions::default(),
+    )));
     let sheet = Stylesheet::parse(author_css);
     build_page(document, vec![sheet], HashMap::new())
 }
@@ -181,7 +187,7 @@ pub fn layout_page(page: &Page, shaper: &dyn TextShaper, viewport_width: f32) ->
         .map(|(node, image)| (*node, (image.width as f32, image.height as f32)))
         .collect();
     nexty_layout::layout_document(
-        &page.document,
+        &page.document.borrow(),
         shaper,
         &page.styles,
         &image_sizes,
@@ -436,7 +442,7 @@ fn emit(
     };
 
     // 块级替换元素（`<img>` display:block）：内容盒即图片矩形
-    if is_image_node(&page.document, fragment.node) {
+    if is_image_node(&page.document.borrow(), fragment.node) {
         draw_image_at(
             page,
             fragment.node,
@@ -770,17 +776,18 @@ fn has_background(style: &ComputedStyle) -> bool {
 fn find_html_element(page: &Page, name: &str) -> Option<NodeId> {
     use nexty_dom::{Namespace, NodeKind};
     fn walk(page: &Page, node: NodeId, name: &str) -> Option<NodeId> {
-        if let Some(NodeKind::Element(data)) = page.document.node(node)
+        if let Some(NodeKind::Element(data)) = page.document.borrow().node(node)
             && data.namespace == Namespace::Html
             && data.name == name
         {
             return Some(node);
         }
         page.document
+            .borrow()
             .children(node)
             .find_map(|child| walk(page, child, name))
     }
-    walk(page, page.document.root(), name)
+    walk(page, page.document.borrow().root(), name)
 }
 
 /// CSS 2.2 §14.2 的画布背景传播源：html 携带背景用 html，否则 body，
@@ -1028,7 +1035,7 @@ pub fn link_target(page: &Page, node: NodeId) -> Option<String> {
     use nexty_dom::{Namespace, NodeKind};
     let mut current = Some(node);
     while let Some(id) = current {
-        if let Some(NodeKind::Element(data)) = page.document.node(id)
+        if let Some(NodeKind::Element(data)) = page.document.borrow().node(id)
             && data.namespace == Namespace::Html
             && data.name == "a"
         {
@@ -1043,7 +1050,7 @@ pub fn link_target(page: &Page, node: NodeId) -> Option<String> {
             }
             return Some(href);
         }
-        current = page.document.parent(id);
+        current = page.document.borrow().parent(id);
     }
     None
 }
@@ -1364,7 +1371,10 @@ mod tests {
     /// recascade 按视口折算视口单位：50vw @800×600 → 400px、10vh → 60px。
     #[test]
     fn recascade_resolves_viewport_units() {
-        let document = nexty_html::parse_document("<div></div>", ParseOptions::default());
+        let document = Rc::new(RefCell::new(nexty_html::parse_document(
+            "<div></div>",
+            ParseOptions::default(),
+        )));
         let sheet = Stylesheet::parse("div { width: 50vw; height: 10vh }");
         let mut page = build_page(document, vec![sheet], HashMap::new());
 
@@ -1374,7 +1384,7 @@ mod tests {
             .keys()
             .find(|&&id| {
                 matches!(
-                    page.document.node(id),
+                    page.document.borrow().node(id),
                     Some(NodeKind::Element(data)) if data.name == "div"
                 )
             })

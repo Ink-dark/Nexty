@@ -9,6 +9,8 @@
 //! `catch_unwind`）→ Pixmap → `wgpu` 纹理 → 全屏 `textureLoad` blit →
 //! surface present。像素 1:1 上屏，无缩放采样。
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -159,6 +161,9 @@ struct BrowserApp {
     /// DOM 宏任务队列（K1）：生命周期事件经 post_task 派发、
     /// `run_pending_tasks` 排空（FIFO，派发中 post 不重入）。
     dom_loop: nexty_dom::EventLoop,
+    /// 当前页面的脚本会话（K5 T3）：引擎实例 + 注入钩子 + 重排脏位。
+    /// 随页面同生共死：页面安装点重建，导航换页丢弃。
+    script: Option<crate::script::ScriptSession>,
     /// 滚动条交互状态（悬停 / 拖拽）。
     scrollbar: Scrollbar,
     /// 容器滚动条悬停的容器（K6；配色反馈）。
@@ -226,6 +231,7 @@ impl BrowserApp {
             bar: AddressBar::new("about:blank"),
             history: History::new("about:blank"),
             dom_loop: nexty_dom::EventLoop::new(),
+            script: None,
             scrollbar: Scrollbar::new(),
             container_hover: None,
             container_drag: None,
@@ -293,6 +299,7 @@ impl BrowserApp {
     /// 显示空白页（`about:blank` 等内部 scheme 走这里，不经网络）。
     fn show_blank(&mut self) {
         self.bar.set_url("about:blank");
+        self.script = None;
         self.set_page(pipeline::load_page("", ""), true);
         // 内部页生命周期：主线程本地解析完成、零子资源编排 = 立即 settle
         self.dispatch_page_lifecycle(pipeline::PendingLifecycle {
@@ -710,26 +717,46 @@ impl BrowserApp {
             dom_content_loaded: true,
             load: true,
         };
+        // 新页面 = 新脚本会话（旧页引擎与监听器整体丢弃，K5 T3）。
+        self.script = None;
         match payload.result {
             Ok(fetched) => {
                 // 正式文档在主线程构建（Document 含监听器注册表 !Send）：
                 // 按同一 HTML 重建，并装配后台线程抓取的子资源数据面。
                 // 查表 base 与后台抓取一致：响应最终 URL（重定向落点）。
-                let document = nexty_html::parse_document(
+                let document = Rc::new(RefCell::new(nexty_html::parse_document(
                     &fetched.data.html,
                     nexty_html::ParseOptions::default(),
-                );
+                )));
                 let resources = crate::resources::assemble_page_data(
-                    &document,
+                    &document.borrow(),
                     &payload.base_url,
                     &fetched.data,
                 );
+                // 解析完成点单处钩子（K5 T3）：inline + 外链 script 清单。
+                let scripts = crate::resources::collect_script_resources(&document.borrow());
                 // @font-face 字体源收集与后台抓取（K4 T3）：不在 load 门控
                 // 内，首帧先用系统字体渲染；字节就绪注册后经 FontsReady
                 // 触发恰好一轮重排（font-display swap 简化）。
                 self.spawn_font_fetch(&resources.stylesheets, &payload.base_url);
+                // 脚本编排（K5 T3）：引擎装配 + inline/src（defer 档）按文档序
+                // 同步执行 + 泵一轮，都在级联/首轮布局之前——脚本改动直接被
+                // 首轮消费；DCL 在脚本执行完后才派发（K1 语义）。
+                let base_url = payload.base_url.clone();
+                let resolve = move |src: &str| nexty_network::resolve(&base_url, src).ok();
+                match crate::script::install_and_run(
+                    &document,
+                    &scripts,
+                    &fetched.data.scripts,
+                    &resolve,
+                    &resources.stylesheets,
+                    |index, error| eprintln!("script#{index} error: {error}"),
+                ) {
+                    Ok(session) => self.script = session,
+                    Err(error) => eprintln!("script runtime unavailable: {error}"),
+                }
                 let page = pipeline::build_page(document, resources.stylesheets, resources.images);
-                let title = pipeline::document_title(&page.document);
+                let title = pipeline::document_title(&page.document.borrow());
                 self.set_page(page, true);
                 // 302 落点（WHATWG 会话历史）：条目与地址栏改为最终 URL——
                 // 页内相对链接的解析基准（history.current()）随之落在落点，

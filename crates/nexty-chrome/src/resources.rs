@@ -31,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use nexty_css::{FontFaceSource, FontFaceStyle, Stylesheet};
-use nexty_dom::{Document, NodeId};
+use nexty_dom::{Document, Namespace, NodeId, NodeKind};
 use nexty_html::StyleResource;
 use nexty_network::{Method, NetworkError, NetworkFetcher, Request, decode_document, resolve};
 use nexty_paint::{Image, decode};
@@ -56,6 +56,84 @@ pub const MAX_IMAGE_BODY_BYTES: usize = 50 * 1024 * 1024;
 /// 图片压缩体积，20 MB 已远超真实 Web 字体；超预算按既有降级语义跳过该源
 /// （分配失败是 abort，panic 兜底兜不住）。
 pub const MAX_FONT_BODY_BYTES: usize = 20 * 1024 * 1024;
+
+/// 外链脚本响应体字节预算（K5 T3）：与样式表同为文本档，10 MB 已远超真实
+/// 脚本；超预算按既有降级语义跳过该脚本（不执行，页面照常渲染）。
+pub const MAX_SCRIPT_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// 页面脚本清单项（K5 T3）：解析完成点单处收集，文档序即执行序。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptResource {
+    /// `<script>` 元素节点。
+    pub node: NodeId,
+    /// 脚本来源。
+    pub source: ScriptSource,
+}
+
+/// 脚本来源：inline 源文本或外链地址。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptSource {
+    /// 内联源文本（子文本节点拼接；无 src 属性的 script）。
+    Inline(String),
+    /// 外链（src 属性非空）；字节由主文档编排抓取。
+    External {
+        /// src 属性原值（可能是相对地址，由上层解析）。
+        src: String,
+    },
+}
+
+/// 按树序收集文档中的 `<script>` 清单（K5 T3：解析完成点单处钩子）。
+///
+/// 只收集不执行：执行在主线程页面安装点（`script::install_and_run`）。
+/// 规则：
+///
+/// - 只认 HTML 命名空间的 `script`；`<template>` 内容游离主树之外，不收。
+/// - `src` 属性非空 → [`ScriptSource::External`]（defer / async 均按 defer
+///   档处理——async 记偏差）；`src` 缺失或空 → inline（子文本拼接）。
+/// - `type` 属性不检查（偏差：type=text/javascript 之外的档位不区分，
+///   一律当 classic script）。
+#[must_use]
+pub fn collect_script_resources(document: &Document) -> Vec<ScriptResource> {
+    let mut resources = Vec::new();
+    collect_scripts_from(document, document.root(), &mut resources);
+    resources
+}
+
+/// 以先序遍历收集子树里的 `<script>`（script 子内容是 raw text，无元素后代）。
+fn collect_scripts_from(document: &Document, node: NodeId, resources: &mut Vec<ScriptResource>) {
+    for child in document.children(node) {
+        let Some(NodeKind::Element(data)) = document.node(child) else {
+            continue;
+        };
+        if data.namespace != Namespace::Html || data.name != "script" {
+            collect_scripts_from(document, child, resources);
+            continue;
+        }
+        let src = data
+            .attributes
+            .iter()
+            .find(|attr| attr.name == "src")
+            .map(|attr| attr.value.as_str())
+            .unwrap_or_default();
+        let source = if src.is_empty() {
+            let mut inline = String::new();
+            for text in document.children(child) {
+                if let Some(NodeKind::Text(content)) = document.node(text) {
+                    inline.push_str(content);
+                }
+            }
+            ScriptSource::Inline(inline)
+        } else {
+            ScriptSource::External {
+                src: src.to_string(),
+            }
+        };
+        resources.push(ScriptResource {
+            node: child,
+            source,
+        });
+    }
+}
 
 /// favicon 响应体字节预算（K13 T2）：真实站点的 favicon 几乎全部小于
 /// 100 KB，1 MiB 已远超，图片档（50 MB）对它明显过宽。超预算按既有降级
@@ -83,6 +161,9 @@ pub struct FetchedPageData {
     /// 外链样式表字节：绝对 URL → 字节。失败/超时/超预算/URL 解析失败的
     /// URL 不在表内（降级语义：该表不参与级联）。
     pub css: HashMap<String, Vec<u8>>,
+    /// 外链脚本字节（K5 T3）：绝对 URL → 字节。失败/超时/超预算/URL 解析
+    /// 失败的 URL 不在表内（降级语义：该脚本不执行，页面照常渲染）。
+    pub scripts: HashMap<String, Vec<u8>>,
     /// 已解码图片：绝对 URL → 像素。同上缺席 = 该图所有节点无像素；同
     /// URL 一份像素，装配期按 `Arc` 共享（M1 零拷贝）。
     pub images: HashMap<String, Arc<Image>>,
@@ -116,7 +197,7 @@ pub fn fetch_subresources_with_settle(
     document: &Document,
     on_settle: &mut dyn FnMut(),
 ) -> Subresources {
-    let (css, images) = fetch_resolved(fetcher, base_url, document, on_settle);
+    let (css, images, _scripts) = fetch_resolved(fetcher, base_url, document, on_settle);
     assemble_from_maps(document, base_url, &css, &images)
 }
 
@@ -134,8 +215,13 @@ pub fn fetch_page_data(
     html: String,
     on_settle: &mut dyn FnMut(),
 ) -> FetchedPageData {
-    let (css, images) = fetch_resolved(fetcher, base_url, document, on_settle);
-    FetchedPageData { html, css, images }
+    let (css, images, scripts) = fetch_resolved(fetcher, base_url, document, on_settle);
+    FetchedPageData {
+        html,
+        css,
+        images,
+        scripts,
+    }
 }
 
 /// 主文档抓取编排的产物（K3 T5）：[`fetch_document`] 的成功输出，全部为
@@ -275,6 +361,13 @@ pub fn assemble_page_data(
     assemble_from_maps(document, base_url, &fetched.css, &fetched.images)
 }
 
+/// 抓取核心的三类产物：css 字节表、已解码图片表、脚本字节表。
+type FetchedMaps = (
+    HashMap<String, Vec<u8>>,
+    HashMap<String, Arc<Image>>,
+    HashMap<String, Vec<u8>>,
+);
+
 /// 共享抓取核心：收集清单 → URL 解析/去重 → 并发抓取（按类别带预算）→
 /// 解码，成功者按绝对 URL 打包。settle（含失败/超时/预算降级路径）在
 /// 返回前恰触发一次回调。
@@ -283,9 +376,10 @@ fn fetch_resolved(
     base_url: &str,
     document: &Document,
     on_settle: &mut dyn FnMut(),
-) -> (HashMap<String, Vec<u8>>, HashMap<String, Arc<Image>>) {
+) -> FetchedMaps {
     let style_resources = nexty_html::collect_style_resources(document);
     let image_resources = nexty_html::collect_image_resources(document);
+    let script_resources = collect_script_resources(document);
 
     // ---- 阶段一：解析 URL，编出抓取任务（同 URL 只抓一次）----
     let mut css_seen: HashSet<String> = HashSet::new();
@@ -310,9 +404,22 @@ fn fetch_resolved(
         }
     }
 
+    // 外链脚本（K5 T3）：同 URL 去重，defer / async 均按 defer 档编排。
+    let mut script_seen: HashSet<String> = HashSet::new();
+    let mut script_tasks: Vec<String> = Vec::new();
+    for resource in &script_resources {
+        if let ScriptSource::External { src } = &resource.source
+            && let Ok(url) = resolve(base_url, src)
+            && script_seen.insert(url.clone())
+        {
+            script_tasks.push(url);
+        }
+    }
+
     // ---- 阶段二：并发抓取（分块限流，按类别带响应体预算）----
     let css_bytes = fetch_many(fetcher, &css_tasks, MAX_STYLESHEET_BODY_BYTES);
     let image_bytes = fetch_many(fetcher, &image_tasks, MAX_IMAGE_BODY_BYTES);
+    let script_bytes = fetch_many(fetcher, &script_tasks, MAX_SCRIPT_BODY_BYTES);
 
     // ---- 阶段三：成功者按绝对 URL 打包（图片解码在本线程完成）----
     let mut css = HashMap::new();
@@ -330,12 +437,18 @@ fn fetch_resolved(
             images.insert(url.clone(), Arc::new(image));
         } // 解码失败：同样降级
     }
+    let mut scripts = HashMap::new();
+    for (task, url) in script_tasks.iter().enumerate() {
+        if let Some(bytes) = &script_bytes[task] {
+            scripts.insert(url.clone(), bytes.clone());
+        }
+    }
 
     // ---- 首轮编排 settle：全部抓取/解码任务已出结果（含降级路径），
     // 恰触发一次回调 ----
     on_settle();
 
-    (css, images)
+    (css, images, scripts)
 }
 
 /// 按**本线程文档**的清单顺序装配（inline 用原文、外链按绝对 URL 查表、
