@@ -10,6 +10,8 @@ use nexty_text::ParleyTextShaper;
 
 use nexty_chrome::pipeline::{self, Viewport};
 use nexty_chrome::render::{RenderError, RenderThread};
+use nexty_chrome::resources::{fetch_document, normalize_address_bar_input};
+use nexty_network::CachedFetcher;
 
 fn approx(a: f32, b: f32) -> bool {
     (a - b).abs() < 0.01
@@ -25,7 +27,18 @@ fn end_to_end_page_renders_background_and_border() {
     let root = pipeline::layout_page(&page, &shaper, 400.0).expect("root");
     let scene = pipeline::build_scene(&page, &root);
 
-    // 显示列表应包含：body 白底、box 蓝底、四条红边、一条文本
+    // body 白底按 CSS 2.2 §14.2 传播到画布（搬移语义：场景中不再发 body
+    // 白底，由呈现层把 canvas_background_commands 插到场景底部）
+    let canvas = pipeline::canvas_background_commands(&page, 400.0, 300.0);
+    assert!(
+        matches!(
+            &canvas[..],
+            [Command::FillRect { color, .. }] if *color == Color::opaque(255, 255, 255)
+        ),
+        "body 白底传播为画布白色底指令"
+    );
+
+    // 显示列表应包含：box 蓝底、四条红边、一条文本
     let fills: Vec<_> = scene
         .commands
         .iter()
@@ -40,9 +53,6 @@ fn end_to_end_page_renders_background_and_border() {
         .filter(|command| matches!(command, Command::DrawText { .. }))
         .collect();
 
-    let has_white = fills.iter().any(|(rect, color)| {
-        color.r == 255 && color.g == 255 && color.b == 255 && rect.width > 300.0
-    });
     let has_blue = fills
         .iter()
         .any(|(_, color)| *color == Color::opaque(0, 128, 255));
@@ -50,7 +60,6 @@ fn end_to_end_page_renders_background_and_border() {
         .iter()
         .filter(|(_, color)| *color == Color::opaque(255, 0, 0))
         .count();
-    assert!(has_white, "body 白底");
     assert!(has_blue, "box 蓝底");
     assert_eq!(red_strips, 4, "四条红边");
     assert_eq!(texts.len(), 1, "hello 一个文本 run");
@@ -503,15 +512,31 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 /// 内存 mock fetcher：URL → body / 状态码；未登记的 URL 返回 404。
+/// K3 T5 起支持按 URL 的响应头与 final_url 覆盖（charset / 缓存头 /
+/// 重定向落点模拟），并记录抓取计数供缓存命中断言。
 struct MockFetcher {
     routes: Mutex<BTreeMap<String, Result<Vec<u8>, u16>>>,
+    /// 按 URL 的响应头（未登记 = 空头表）。
+    headers: Mutex<BTreeMap<String, Vec<(String, String)>>>,
+    /// 按 URL 的 final_url 覆盖（重定向落点；未登记 = 请求 URL）。
+    final_urls: Mutex<BTreeMap<String, String>>,
+    /// 抓取计数（共享句柄：CachedFetcher 包住 mock 后仍可读内部计数）。
+    hits: Arc<Mutex<Vec<String>>>,
 }
 
 impl MockFetcher {
     fn new() -> Self {
         Self {
             routes: Mutex::new(BTreeMap::new()),
+            headers: Mutex::new(BTreeMap::new()),
+            final_urls: Mutex::new(BTreeMap::new()),
+            hits: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// 抓取计数句柄：mock 被搬进 CachedFetcher 后从外部读计数用。
+    fn hits(&self) -> Arc<Mutex<Vec<String>>> {
+        self.hits.clone()
     }
 
     fn serve(&self, url: &str, body: &[u8]) {
@@ -527,26 +552,58 @@ impl MockFetcher {
             .unwrap()
             .insert(url.to_owned(), Err(status));
     }
+
+    /// 带响应头的登记（charset / cache-control 等用例）。
+    fn serve_with_headers(&self, url: &str, headers: Vec<(String, String)>, body: &[u8]) {
+        self.serve(url, body);
+        self.headers.lock().unwrap().insert(url.to_owned(), headers);
+    }
+
+    /// 模拟重定向落点：响应的 final_url 与请求 URL 不同。
+    fn serve_final_url(&self, url: &str, final_url: &str, body: &[u8]) {
+        self.serve(url, body);
+        self.final_urls
+            .lock()
+            .unwrap()
+            .insert(url.to_owned(), final_url.to_owned());
+    }
 }
 
 impl NetworkFetcher for MockFetcher {
     fn fetch(&self, request: &Request) -> Result<Response, NetworkError> {
+        self.hits.lock().unwrap().push(request.url.clone());
         let routes = self.routes.lock().unwrap();
+        let final_url = self
+            .final_urls
+            .lock()
+            .unwrap()
+            .get(&request.url)
+            .cloned()
+            .unwrap_or_else(|| request.url.clone());
         match routes.get(&request.url) {
             Some(Ok(body)) => Ok(Response {
                 status: 200,
-                headers: Vec::new(),
+                headers: self
+                    .headers
+                    .lock()
+                    .unwrap()
+                    .get(&request.url)
+                    .cloned()
+                    .unwrap_or_default(),
                 body: body.clone(),
+                final_url,
             }),
             Some(Err(status)) => Ok(Response {
                 status: *status,
                 headers: Vec::new(),
                 body: Vec::new(),
+                final_url,
             }),
             None => Ok(Response {
                 status: 404,
                 headers: Vec::new(),
                 body: Vec::new(),
+                final_url,
             }),
         }
     }
@@ -913,5 +970,466 @@ fn hardening_full_chain_body() {
             .iter()
             .any(|command| matches!(command, Command::DrawImage { .. })),
         "巨图声明无像素、无 DrawImage"
+    );
+}
+
+// ---- K1 T3：事件模型接线——生命周期派发（先派发后默认、各恰一次） ----
+
+use nexty_chrome::pipeline::PendingLifecycle;
+use nexty_dom::{DOM_CONTENT_LOADED, Event, EventListener, EventLoop, LOAD};
+use std::cell::RefCell;
+use std::rc::Rc;
+
+type LifecycleLog = Rc<RefCell<Vec<&'static str>>>;
+
+/// 生命周期计数钩子：把派发的事件类型记入日志。
+fn lifecycle_recorder(log: &LifecycleLog, label: &'static str) -> Box<dyn EventListener> {
+    let log = Rc::clone(log);
+    Box::new(move |_event: &mut Event| log.borrow_mut().push(label))
+}
+
+/// ③ DOMContentLoaded 在解析后、load 在子资源 settle 后各恰一次：走与
+/// app.rs 后台线程相同的编排序列（真实 parse → settle 回调信号 →
+/// build_page → 信号 post → 排空），计数钩子挂在文档根上。
+#[test]
+fn lifecycle_events_fire_once_each_in_order_after_signals() {
+    let fetcher = MockFetcher::new();
+    fetcher.serve("https://page.test/ext.css", b"p { color: blue }");
+    let html = "<head><link rel=stylesheet href=ext.css></head><body><p>hi</p></body>";
+
+    // 信号捕获点与 app.rs load 的后台线程一致
+    let document = nexty_html::parse_document(html, ParseOptions::default());
+    let parsed = true; // parse_document 返回
+    let mut settled = false;
+    let sub = resources::fetch_subresources_with_settle(
+        &fetcher,
+        "https://page.test/index.html",
+        &document,
+        &mut || settled = true,
+    );
+    assert!(settled, "首轮编排 settle（成功路径）恰触发一次回调");
+
+    let mut page = pipeline::build_page(document, sub.stylesheets, sub.images);
+    let log: LifecycleLog = Rc::new(RefCell::new(Vec::new()));
+    let root = page.document.root();
+    page.document.add_listener(
+        root,
+        DOM_CONTENT_LOADED,
+        false,
+        lifecycle_recorder(&log, "dcl"),
+    );
+    page.document
+        .add_listener(root, LOAD, false, lifecycle_recorder(&log, "load"));
+
+    // 信号齐 → pipeline 单处钩子 post → EventLoop 排空派发
+    let mut event_loop = EventLoop::new();
+    page.post_lifecycle_tasks(
+        &mut event_loop,
+        PendingLifecycle {
+            dom_content_loaded: parsed,
+            load: settled,
+        },
+    );
+    event_loop.run_pending_tasks(&mut page.document);
+    assert_eq!(
+        *log.borrow(),
+        ["dcl", "load"],
+        "DOMContentLoaded 先于 load，各恰一次"
+    );
+
+    // 队列已空：重复排空不重复派发（每页各恰一次）
+    event_loop.run_pending_tasks(&mut page.document);
+    assert_eq!(log.borrow().len(), 2, "排空后无重复派发");
+}
+
+/// ③（降级路径）：子资源全部失败/超时/超预算时 settle 回调仍恰触发一次，
+/// load 照常派发（含失败/超时/预算降级的语义）。
+#[test]
+fn lifecycle_load_fires_after_settled_degraded_subresources() {
+    let fetcher = MockFetcher::new();
+    fetcher.fail("https://page.test/broken.css", 500);
+    fetcher.fail("https://page.test/lost.png", 404);
+    let html = "<head><link rel=stylesheet href=broken.css></head>\
+                <body><p>hi</p><img src=lost.png></body>";
+
+    let document = nexty_html::parse_document(html, ParseOptions::default());
+    let mut settled = false;
+    let sub = resources::fetch_subresources_with_settle(
+        &fetcher,
+        "https://page.test/index.html",
+        &document,
+        &mut || settled = true,
+    );
+    assert!(settled, "全失败路径 settle 回调仍触发");
+    assert!(sub.stylesheets.is_empty() && sub.images.is_empty());
+
+    let mut page = pipeline::build_page(document, sub.stylesheets, sub.images);
+    let log: LifecycleLog = Rc::new(RefCell::new(Vec::new()));
+    let root = page.document.root();
+    page.document
+        .add_listener(root, LOAD, false, lifecycle_recorder(&log, "load"));
+
+    let mut event_loop = EventLoop::new();
+    page.post_lifecycle_tasks(
+        &mut event_loop,
+        PendingLifecycle {
+            dom_content_loaded: true,
+            load: settled,
+        },
+    );
+    event_loop.run_pending_tasks(&mut page.document);
+    assert_eq!(*log.borrow(), ["load"], "降级 settle 后 load 恰一次");
+}
+
+/// ③（门控）：信号未到不派发；只到解析信号只派发 DOMContentLoaded——
+/// K3/K4 异步 settle 的接缝。
+#[test]
+fn lifecycle_events_wait_for_their_signals() {
+    let mut page = pipeline::load_page("<body>hi</body>", "");
+    let log: LifecycleLog = Rc::new(RefCell::new(Vec::new()));
+    let root = page.document.root();
+    page.document.add_listener(
+        root,
+        DOM_CONTENT_LOADED,
+        false,
+        lifecycle_recorder(&log, "dcl"),
+    );
+    page.document
+        .add_listener(root, LOAD, false, lifecycle_recorder(&log, "load"));
+
+    let mut event_loop = EventLoop::new();
+    page.post_lifecycle_tasks(&mut event_loop, PendingLifecycle::default());
+    event_loop.run_pending_tasks(&mut page.document);
+    assert!(log.borrow().is_empty(), "无信号不派发");
+
+    page.post_lifecycle_tasks(
+        &mut event_loop,
+        PendingLifecycle {
+            dom_content_loaded: true,
+            load: false,
+        },
+    );
+    event_loop.run_pending_tasks(&mut page.document);
+    assert_eq!(*log.borrow(), ["dcl"], "只到解析信号 → 仅 DOMContentLoaded");
+}
+
+// ---- K3 T5：导航编排接线（主文档解码 / 缓存接入 / 重定向落点） ----
+
+/// 主文档解码：Content-Type charset=gbk → 按 GBK 解码，标题正确——
+/// 非 UTF-8 页面不再进错误页（错误页 = fetch_document 返回 Err）。
+#[test]
+fn gbk_document_with_content_type_charset_decodes_title() {
+    let fetcher = MockFetcher::new();
+    // 「中文」的 GBK 编码字节（0xD6 0xD0 0xCE 0xC4）
+    let mut body = b"<html><head><title>".to_vec();
+    body.extend_from_slice(&[0xD6, 0xD0, 0xCE, 0xC4]);
+    body.extend_from_slice(b"</title></head><body></body></html>");
+    fetcher.serve_with_headers(
+        "https://page.test/gbk.html",
+        vec![(
+            "content-type".to_owned(),
+            "text/html; charset=gbk".to_owned(),
+        )],
+        &body,
+    );
+
+    let fetched = fetch_document(&fetcher, "https://page.test/gbk.html")
+        .expect("GBK 页面应成功返回而非错误页");
+    let document = nexty_html::parse_document(&fetched.data.html, ParseOptions::default());
+    assert_eq!(
+        pipeline::document_title(&document).as_deref(),
+        Some("中文"),
+        "GBK 字节按 charset 解码为可读标题"
+    );
+}
+
+/// 无 charset 提示的 GBK 字节：按默认 UTF-8 替换语义兑底，不 panic、
+/// 不进错误页（Err）。非法序列退化为 U+FFFD 可见。
+#[test]
+fn gbk_bytes_without_charset_hint_degrade_without_panic() {
+    let fetcher = MockFetcher::new();
+    fetcher.serve("https://page.test/raw.html", &[0xD6, 0xD0, 0xCE, 0xC4]);
+
+    let fetched =
+        fetch_document(&fetcher, "https://page.test/raw.html").expect("解码兑底路径不失败");
+    assert!(
+        fetched.data.html.contains('\u{FFFD}'),
+        "无提示的非法 UTF-8 序列替换为 U+FFFD"
+    );
+}
+
+/// 缓存接入：CachedFetcher 包裹后同 URL 二次导航命中内存缓存——
+/// mock 计数恰 1 次，两次产物一致。
+#[test]
+fn cached_fetcher_serves_second_navigation_from_cache() {
+    let fetcher = MockFetcher::new();
+    fetcher.serve_with_headers(
+        "https://page.test/doc.html",
+        vec![("cache-control".to_owned(), "max-age=60".to_owned())],
+        b"<title>cached</title><body>x</body>",
+    );
+    let hits = fetcher.hits();
+    let cached = CachedFetcher::new(fetcher);
+
+    let first = fetch_document(&cached, "https://page.test/doc.html").expect("first");
+    let second = fetch_document(&cached, "https://page.test/doc.html").expect("second");
+    assert_eq!(first.data.html, second.data.html, "缓存体与首抓一致");
+    assert_eq!(
+        hits.lock().unwrap().len(),
+        1,
+        "同 URL 二次导航命中缓存，网络只打一次"
+    );
+}
+
+/// 重定向落点：响应 final_url 与请求 URL 不同时，子资源相对地址按落点
+/// （base_url）解析，不按原始请求 URL（WHATWG fetch final URL 语义）。
+#[test]
+fn subresources_resolve_against_final_url_after_redirect() {
+    let fetcher = MockFetcher::new();
+    fetcher.serve_final_url(
+        "https://page.test/r",
+        "https://page.test/final/page.html",
+        b"<head><link rel=stylesheet href=style.css></head><body>x</body>",
+    );
+    fetcher.serve("https://page.test/final/style.css", b"p { color: red }");
+    let hits = fetcher.hits();
+
+    let fetched = fetch_document(&fetcher, "https://page.test/r").expect("ok");
+    assert_eq!(
+        fetched.base_url, "https://page.test/final/page.html",
+        "文档 base = 重定向落点"
+    );
+    assert!(
+        hits.lock()
+            .unwrap()
+            .contains(&"https://page.test/final/style.css".to_owned()),
+        "相对子资源按落点解析"
+    );
+}
+
+/// 地址栏输入规范化接进导航：无 scheme 补 http:// 后可达；非法输入走
+/// 抓取路径返回收敛错误串（错误页兑底），全程不 panic。
+#[test]
+fn address_bar_navigation_normalizes_and_fails_safe() {
+    let fetcher = MockFetcher::new();
+    fetcher.serve("http://plain.test/x", b"<title>ok</title>");
+
+    // 无 scheme 输入补全 http:// 后命中
+    let normalized = normalize_address_bar_input("plain.test/x");
+    assert_eq!(normalized, "http://plain.test/x");
+    let fetched = fetch_document(&fetcher, &normalized).expect("补全后可导航");
+    assert!(fetched.data.html.contains("<title>ok</title>"));
+
+    // 非法输入（含空格）补全后仍非法：mock 按未登记 → 404 → 错误串收敛，
+    // 不 panic（真实后端 reqwest 同路径判 InvalidUrl →「无效的地址」）
+    let invalid = normalize_address_bar_input("hello world");
+    assert_eq!(
+        fetch_document(&fetcher, &invalid).err().as_deref(),
+        Some("HTTP 404")
+    );
+}
+
+// ---- K4 T3：@font-face 字体子资源编排（无头 MockFetcher，与 app.rs 同序） ----
+
+use nexty_chrome::resources::{
+    FetchedFont, FontOrchestrator, FontRegistration, MAX_FONT_BODY_BYTES, fetch_fonts,
+};
+use nexty_layout::TextRun;
+
+/// 独特测试族名：避开系统字体碰撞（nexty-text T2 偏差——同名系统字体合并
+/// 不保证 @font-face 优先）。
+const TEST_FAMILY: &str = "NextyChromeTestMono";
+
+/// 测试字体字节：nexty-text T2 入库的 OFL 字体资产，复用同一份不另入库副本。
+fn test_font_bytes() -> Vec<u8> {
+    std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../nexty-text/tests/data/SpaceMono-Regular.ttf"
+    ))
+    .expect("test font asset (nexty-text tests/data)")
+}
+
+/// 树中首个非空文本 run（字体归属断言用）；找不到时 panic（测试页必有文本）。
+fn first_run(fragment: &Fragment) -> &TextRun {
+    fn find(fragment: &Fragment) -> Option<&TextRun> {
+        for line in &fragment.lines {
+            for run in &line.runs {
+                if !run.glyphs.is_empty() {
+                    return Some(run);
+                }
+            }
+        }
+        for child in &fragment.children {
+            if let Some(run) = find(child) {
+                return Some(run);
+            }
+        }
+        None
+    }
+    find(fragment).expect("no text run in fragment tree")
+}
+
+/// ①③④：@font-face 页字体字节被抓取且注册（shape 归属）；就绪后恰一轮
+/// 重排；同 URL 重复导航不重复抓取。编排序列与 app.rs 的 page_loaded /
+/// spawn_font_fetch / fonts_ready 一致（无头模拟，整形器接线同构造点）。
+#[test]
+fn font_face_page_fetches_registers_and_relayouts_exactly_once() {
+    let font_bytes = test_font_bytes();
+    let fetcher = MockFetcher::new();
+    fetcher.serve("https://page.test/mono.ttf", &font_bytes);
+    let html = format!(
+        "<style>@font-face {{ font-family: {TEST_FAMILY}; src: url(mono.ttf); }}</style>\
+         <body><p style=\"font-family: {TEST_FAMILY}\">Hello</p></body>"
+    );
+    let base = "https://page.test/index.html";
+
+    // 会话与整形器接线：与 app.rs 构造点同序（registry 先于 shaper）
+    let mut fonts = FontOrchestrator::new();
+    let shaper = ParleyTextShaper::with_registry(fonts.registry());
+    let mut layouts = 0usize;
+
+    // 第一轮导航：抓取 → 装配 → 收集（build_page 之前，同 page_loaded）
+    let document = nexty_html::parse_document(&html, ParseOptions::default());
+    let resources = resources::fetch_subresources(&fetcher, base, &document);
+    let requests = fonts.collect(&resources.stylesheets, base);
+    assert_eq!(requests.len(), 1, "收集到 @font-face 的 url() 源");
+    let page = pipeline::build_page(document, resources.stylesheets, resources.images);
+
+    // 首帧布局：注册表为空 → 系统回退字体（不 panic；字节不是注册字体）
+    let root1 = {
+        layouts += 1;
+        pipeline::layout_page(&page, &shaper, 400.0).expect("root")
+    };
+    assert_eq!(layouts, 1);
+    assert!(
+        first_run(&root1)
+            .fonts
+            .iter()
+            .all(|font| font.data().as_ref() != font_bytes.as_slice()),
+        "字体未就绪首帧用系统字体渲染"
+    );
+
+    // SceneCache 缓存键（页面代次）：基线一次 emit
+    let mut cache = pipeline::SceneCache::new();
+    let _ = cache.scene_for(1, &page, &root1, 400.0, &[]);
+    assert_eq!(cache.emits(), 1);
+
+    // 字节就绪（后台 fetch_fonts）→ 注册 → registered > 0 → 恰一轮重排
+    let fetched = fetch_fonts(&fetcher, &requests);
+    assert_eq!(fetched.len(), 1);
+    let registration = fonts.register(fetched);
+    assert_eq!(
+        registration,
+        FontRegistration {
+            registered: 1,
+            rejected: 0
+        }
+    );
+    let root2 = {
+        layouts += 1;
+        pipeline::layout_page(&page, &shaper, 400.0).expect("root")
+    };
+    assert_eq!(layouts, 2, "就绪后恰一轮重排（布局调用恰 +1）");
+
+    // shape 归属：run 字体表含注册字节（同一 shaper 实例自动生效，未重建）
+    assert!(
+        first_run(&root2)
+            .fonts
+            .iter()
+            .any(|font| font.data().as_ref() == font_bytes.as_slice()),
+        "注册字体进入 shape 归属"
+    );
+
+    // 代次推进 → 场景缓存失效重建（重排接既有缓存失效机制）
+    let _ = cache.scene_for(2, &page, &root2, 400.0, &[]);
+    assert_eq!(cache.emits(), 2, "重排推进代次使 SceneCache 重建");
+
+    // 重复/迟到载荷：registered == 0 → 不再重排（layouts 保持 2）
+    let duplicate = fonts.register(vec![FetchedFont {
+        url: "https://page.test/mono.ttf".to_owned(),
+        descriptor: requests[0].descriptor.clone(),
+        bytes: font_bytes.clone(),
+    }]);
+    assert_eq!(duplicate.registered, 0, "重复载荷不重复注册");
+
+    // 第二轮导航（同 URL）：会话去重 → 不再收集、不再抓取、不再重排
+    let document = nexty_html::parse_document(&html, ParseOptions::default());
+    let resources = resources::fetch_subresources(&fetcher, base, &document);
+    assert!(
+        fonts.collect(&resources.stylesheets, base).is_empty(),
+        "会话去重：二次导航不再收集"
+    );
+    assert_eq!(layouts, 2, "二次导航零重排");
+    assert_eq!(
+        fetcher
+            .hits()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|url| **url == "https://page.test/mono.ttf")
+            .count(),
+        1,
+        "mock 计数恰 1"
+    );
+}
+
+/// ②：404 / 非字体数据 / 超预算字体 → 不 panic，页面回退系统字体照常
+/// 渲染；注册失败不触发重排。
+#[test]
+fn font_failures_degrade_to_system_fonts_without_panicking() {
+    let fetcher = MockFetcher::new();
+    fetcher.fail("https://page.test/lost.ttf", 404);
+    fetcher.serve("https://page.test/junk.ttf", b"not a font");
+    fetcher.serve(
+        "https://page.test/huge.ttf",
+        &vec![0u8; MAX_FONT_BODY_BYTES + 1],
+    );
+    let html = "<style>\
+                @font-face { font-family: Lost; src: url(lost.ttf); }\
+                @font-face { font-family: Junk; src: url(junk.ttf); }\
+                @font-face { font-family: Huge; src: url(huge.ttf); }\
+                </style><body><p style=\"font-family: Lost, Junk, Huge\">Hello</p></body>";
+    let base = "https://page.test/index.html";
+
+    let mut fonts = FontOrchestrator::new();
+    let shaper = ParleyTextShaper::with_registry(fonts.registry());
+    let mut layouts = 0usize;
+
+    let document = nexty_html::parse_document(html, ParseOptions::default());
+    let resources = resources::fetch_subresources(&fetcher, base, &document);
+    let requests = fonts.collect(&resources.stylesheets, base);
+    assert_eq!(
+        requests.len(),
+        3,
+        "url() 源全部收集（格式/预算过滤发生在抓取、注册层）"
+    );
+    let page = pipeline::build_page(document, resources.stylesheets, resources.images);
+    let root = {
+        layouts += 1;
+        pipeline::layout_page(&page, &shaper, 400.0).expect("root")
+    };
+
+    // 抓取：404 / 超预算缺席；junk 字节到达但注册期拒收（记报告）
+    let fetched = fetch_fonts(&fetcher, &requests);
+    assert_eq!(fetched.len(), 1, "404 与超预算缺席");
+    let registration = fonts.register(fetched);
+    assert_eq!(
+        registration,
+        FontRegistration {
+            registered: 0,
+            rejected: 1
+        },
+        "非字体数据拒收记数"
+    );
+    assert_eq!(layouts, 1, "注册失败不触发重排");
+
+    // 页面照常渲染：系统回退文本进显示列表（不 panic、不空白）
+    let scene = pipeline::build_scene(&page, &root);
+    assert!(
+        scene
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::DrawText { .. })),
+        "回退路径照常渲染文本"
     );
 }

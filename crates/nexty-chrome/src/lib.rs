@@ -8,14 +8,16 @@
 //! （见 AGENTS.md 硬规则「渲染隔离」）。模块分工：
 //!
 //! - [`pipeline`]：HTML 字符串 → 级联 → 布局 → 片段树 → paint 显示列表；
-//! - [`resources`]：子资源（外链 CSS + 图片）清单解析、并发抓取与解码编排；
+//! - [`resources`]：子资源（外链 CSS + 图片 + @font-face 字体）清单解析、并发抓取与解码编排；
 //! - [`render`]：渲染隔离线程（panic 兜底，线程存活可继续服务）；
 //! - [`ui`]：自绘工具带状态机（纯逻辑，可测试）；
 //! - [`scrollbar`]：滚动几何与拖拽状态机（纯逻辑，可测试）；
 //! - [`selection`]：页面文本选区状态机（纯逻辑，可测试）；
 //! - [`history`]：会话历史栈（纯逻辑，可测试）；
-//! - `app`（私有）：winit 事件循环 + wgpu 呈现胶水——**无法在无头环境
-//!   自动化测试**，实机运行验证（`cargo run -p nexty-chrome --bin nexty`）。
+//! - `app`（私有）：winit 事件循环 + wgpu 呈现胶水——winit/GPU 部分无法
+//!   在无头环境自动化测试，实机运行验证（`cargo run -p nexty-chrome --bin
+//!   nexty`）；交互事件接线与生命周期派发在 `app::events` 子模块（纯函数
+//!   部分有单测，K1 T3）。
 //!
 //! 上游类型一律不得出现在本 crate 的 pub 导出中（AGENTS.md 硬规则）。
 //!
