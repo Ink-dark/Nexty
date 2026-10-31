@@ -228,3 +228,26 @@ AGENTS.md text / css / resources 状态段与偏差清单登记。
   stacking context（K7）。
 - 样式表独立编码探测（按文档编码或 UTF-8，lossy 兜底）。
 - POST 表单提交（K3 后小轮）、文件上传。
+
+## 归档（2026-10-31 执行完毕）
+
+执行方式：Agent 集群——波次 1 五路并行（K1 dom / K3 network / K4 text /
+K2 css / K2 侦察）+ 波次 2 按依赖链派发（K2 paint / K4 T1 css / chrome
+串行链 K1 T3 → K2 T3 → K3 T5 → K4 T3），chrome 触碰任务全程串行无冲突。
+
+- **结果**：12 项任务全部完成（T6 Cookie 可选项按时间盒跳过）；执行详情
+  与证据锚点见 [execution report](2026-10-31-round-batch1-execution-report.md)。
+- **版本落点**：dom 0.1.4 / css 0.1.18 / network 0.1.6 / text 0.1.9 /
+  paint 0.1.8 / chrome 0.1.31（含验收修复）。
+- **门禁**：workspace check / clippy(-D warnings) / fmt / test 全绿；
+  deny / about 通过；bench 本机 text-heavy 无回退 + **CI runner 首次基线**
+  （50 帧全量，四条机器无关断言全绿，滚动 translate 2.4ms / rasterize
+  2472ms——K9 门槛以后的判定口径）。
+- **验收修复**（用户实机验收发现）：302 链接基准缺陷——会话历史条目与
+  地址栏落点后替换为最终 URL（`History::replace_current`，chrome 0.1.31）。
+- **计划外事件**：K2 T3 子代理被框架挂起中断在收尾，编排者补齐（渐变四
+  正向精确轴向量 / 选区测试载体迁移 / clippy 与 fmt 收口）；K1 衍生架构
+  决策（Document !Send → Send 数据面 + 主线程建 Document）留 K5 窗口评估。
+- 根目录 goal.md（状态跟踪工作副本）随归档移除；后续轮次从
+  [kernel-roadmap](2026-10-31-kernel-roadmap.md) 批次 2 启动
+  （K5 JSRT ∥ K6 容器滚动 ∥ K13 小件）。
