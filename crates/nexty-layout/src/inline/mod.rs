@@ -1384,10 +1384,20 @@ impl LineBuilder<'_> {
                             end,
                             last.x,
                         );
-                        let mut excluded = 0.0_f32;
+                        // 被裁部分按字形 x 计量（与游标同口径）：只对 advance
+                        // 求和会漏掉末字形与空格之间的字距间隙（字体的 GPOS
+                        // kern），使 net 偏大、自由空间偏小，行右缘短一个间隙。
+                        let visible_end = if cut > range.start {
+                            let glyph = &shaped.glyphs[cut - 1];
+                            glyph.x + glyph.advance
+                        } else {
+                            shaped.glyphs[range.start].x
+                        };
+                        let span_end = &shaped.glyphs[range.end - 1];
+                        let mut excluded = span_end.x + span_end.advance - visible_end;
                         for (group, delta) in groups.iter().zip(&deltas) {
                             if group.glyphs.start >= cut {
-                                excluded += group.base + delta;
+                                excluded += delta;
                             }
                         }
                         net -= excluded;
