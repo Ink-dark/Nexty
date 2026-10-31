@@ -135,6 +135,14 @@ struct Press {
     node: Option<NodeId>,
 }
 
+/// 容器滚动条拖拽状态（K6）：目标容器 + 该容器自己的滚动条状态机实例
+/// （抓取偏移存于其中）——与视口滚动条状态完全隔离，拖容器滚动条不触碰
+/// 视口滚动量；几何每次事件按当前布局重取。
+struct ContainerDrag {
+    node: NodeId,
+    scrollbar: Scrollbar,
+}
+
 /// 浏览器应用状态。
 struct BrowserApp {
     proxy: EventLoopProxy<BackgroundEvent>,
@@ -153,6 +161,10 @@ struct BrowserApp {
     dom_loop: nexty_dom::EventLoop,
     /// 滚动条交互状态（悬停 / 拖拽）。
     scrollbar: Scrollbar,
+    /// 容器滚动条悬停的容器（K6；配色反馈）。
+    container_hover: Option<NodeId>,
+    /// 容器滚动条拖拽状态（K6）。
+    container_drag: Option<ContainerDrag>,
     /// Alt 修饰键按住状态（后退/前进快捷键）。
     alt_down: bool,
     /// Ctrl 修饰键按住状态（快捷键映射）。
@@ -215,6 +227,8 @@ impl BrowserApp {
             history: History::new("about:blank"),
             dom_loop: nexty_dom::EventLoop::new(),
             scrollbar: Scrollbar::new(),
+            container_hover: None,
+            container_drag: None,
             alt_down: false,
             ctrl_down: false,
             shift_down: false,
@@ -307,6 +321,61 @@ impl BrowserApp {
         }
     }
 
+    /// 设置容器滚动偏移并请求重绘（K6）。
+    ///
+    /// 容器滚动重建场景（偏差）：偏移烘进页面坐标系显示列表，经页面代次
+    /// 推进使 SceneCache 失效——与视口滚动的 `Scene::translated` 零 emit
+    /// 路径不同（基准四断言保持的是后者）。
+    fn set_container_scroll(&mut self, node: NodeId, offset: f32) {
+        if let Some(page) = self.page.as_mut() {
+            page.scroll_offsets.insert(node, offset);
+        }
+        self.page_generation = self.page_generation.wrapping_add(1);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// 当前可滚动容器的滚动条区域（K6）：pipeline 页面坐标 + 视口滚动
+    /// 平移（外层先、内层后排列；命中测试应从内层开始）。
+    fn container_scroll_areas(&self) -> Vec<pipeline::ContainerScrollArea> {
+        let Some(page) = self.page.as_ref() else {
+            return Vec::new();
+        };
+        let Some(root) = self.root.as_ref() else {
+            return Vec::new();
+        };
+        let mut areas = pipeline::collect_container_scroll_areas(root, &page.scroll_offsets);
+        let dy = BAR_HEIGHT - self.scroll_y;
+        for area in &mut areas {
+            area.padding_box.y += dy;
+        }
+        areas
+    }
+
+    /// 光标下的容器滚动条（K6）：返回容器节点；内层优先，无命中为 `None`。
+    fn container_scrollbar_at(&self, x: f32, y: f32) -> Option<NodeId> {
+        let page_y = y - BAR_HEIGHT + self.scroll_y;
+        let areas = self.container_scroll_areas();
+        for area in areas.iter().rev() {
+            let geometry = ScrollGeometry::for_container(
+                area.padding_box.width,
+                area.padding_box.height,
+                area.max_scroll,
+            );
+            let hit = Scrollbar::new().hit(
+                &geometry,
+                area.scroll,
+                x - area.padding_box.x,
+                page_y - area.padding_box.y,
+            );
+            if hit != ScrollbarHit::None {
+                return Some(area.node);
+            }
+        }
+        None
+    }
+
     /// 把已解析页面按当前视口级联并布局。
     ///
     /// 每次都重级联：视口单位（vw/vh）在 computed 阶段折算，resize 后
@@ -315,6 +384,9 @@ impl BrowserApp {
     fn set_page(&mut self, page: Page, reset_scroll: bool) {
         self.root = None;
         self.text_map = None;
+        // 新页面节点 id 从 arena 重新分配：容器滚动条状态不得跨页引用旧 id
+        self.container_hover = None;
+        self.container_drag = None;
         self.page = Some(page);
         // 导航后的第一帧是全新布局：缓存作废由代次推进表达
         self.relayout();
@@ -372,6 +444,13 @@ impl BrowserApp {
         if let Some(geometry) = self.geometry() {
             self.scroll_y = scrollbar::clamp_scroll(self.scroll_y, geometry.max_scroll());
         }
+        // K6：容器滚动偏移保留并 clamp 到新 scrollable overflow（scrollTop
+        // 语义——布局与滚动解耦，重排可能改变各容器的可滚范围）
+        if let Some(root) = self.root.as_ref()
+            && let Some(page) = self.page.as_mut()
+        {
+            pipeline::clamp_scroll_offsets(root, &mut page.scroll_offsets);
+        }
     }
 
     /// 滚动 `delta` px（正值向下看更多内容），并按当前视口 clamp。
@@ -420,31 +499,68 @@ impl BrowserApp {
         }
     }
 
-    /// 页面区域左键按下：滚动条优先（拖拽 thumb / 轨道翻页），其次开始选择
-    /// 手势（点击链接在释放且未拖动时导航）。
+    /// 页面区域左键按下：视口滚动条优先，其次容器滚动条（K6，内层优先；
+    /// 拖拽/翻页都只作用于容器，不触碰视口滚动），最后开始选择手势
+    /// （点击链接在释放且未拖动时导航）。
     fn press_page(&mut self, x: f32, y: f32) {
-        let Some(geometry) = self.geometry() else {
-            return;
-        };
-        match self.scrollbar.hit(&geometry, self.scroll_y, x, y) {
-            ScrollbarHit::None => self.begin_page_gesture(x, y),
-            _ => {
-                self.press = None;
-                if let Some(scroll) = self.scrollbar.on_press(&geometry, self.scroll_y, x, y) {
-                    self.set_scroll(scrollbar::clamp_scroll(scroll, geometry.max_scroll()));
-                }
+        if let Some(geometry) = self.geometry()
+            && self.scrollbar.hit(&geometry, self.scroll_y, x, y) != ScrollbarHit::None
+        {
+            self.press = None;
+            self.container_drag = None;
+            if let Some(scroll) = self.scrollbar.on_press(&geometry, self.scroll_y, x, y) {
+                self.set_scroll(scrollbar::clamp_scroll(scroll, geometry.max_scroll()));
             }
+            return;
         }
+        // 容器滚动条（K6）：绘制次序外层先、内层后（内层在上），命中同序
+        let page_y = y - BAR_HEIGHT + self.scroll_y;
+        let areas = self.container_scroll_areas();
+        for area in areas.iter().rev() {
+            let geometry = ScrollGeometry::for_container(
+                area.padding_box.width,
+                area.padding_box.height,
+                area.max_scroll,
+            );
+            let local = (x - area.padding_box.x, page_y - area.padding_box.y);
+            if Scrollbar::new().hit(&geometry, area.scroll, local.0, local.1) == ScrollbarHit::None
+            {
+                continue;
+            }
+            self.press = None;
+            let mut scrollbar = Scrollbar::new();
+            if let Some(scroll) = scrollbar.on_press(&geometry, area.scroll, local.0, local.1) {
+                // 轨道点击翻页：作用于容器，不影响视口滚动
+                self.set_container_scroll(
+                    area.node,
+                    scrollbar::clamp_scroll(scroll, area.max_scroll),
+                );
+            } else if scrollbar.is_dragging() {
+                // thumb 拖拽开始：抓取偏移已记录，进入容器拖拽态
+                self.container_drag = Some(ContainerDrag {
+                    node: area.node,
+                    scrollbar,
+                });
+            }
+            return;
+        }
+        self.begin_page_gesture(x, y);
     }
 
     /// 开始一次页面点击/选择手势。
     fn begin_page_gesture(&mut self, x: f32, y: f32) {
         let page_y = y - BAR_HEIGHT + self.scroll_y;
-        // 单次命中测试同时供事件目标与链接解析（hit_test_ex 结果 → 事件节点）
+        // 单次命中测试同时供事件目标与链接解析（hit_test_ex 结果 → 事件节点；
+        // K6：计入容器滚动偏移）
+        let offsets = self
+            .page
+            .as_ref()
+            .map(|page| page.scroll_offsets.clone())
+            .unwrap_or_default();
         let hit = self
             .root
             .as_ref()
-            .and_then(|root| pipeline::hit_test_ex(root, x, page_y));
+            .and_then(|root| pipeline::hit_test_scrolled(root, x, page_y, &offsets));
         let node = hit.map(|hit| hit.node);
         let link = hit
             .and_then(|hit| {
@@ -782,6 +898,46 @@ impl BrowserApp {
                 scene
             }
         };
+        // 容器滚动条（K6）：每个可滚容器在其 padding box 右缘画轨道 +
+        // thumb（先于视口滚动条绘制——视口条压最上层，与命中次序一致）。
+        // 悬停/拖拽加深与视口条同款配色。
+        let areas = self.container_scroll_areas();
+        for area in &areas {
+            let geometry = ScrollGeometry::for_container(
+                area.padding_box.width,
+                area.padding_box.height,
+                area.max_scroll,
+            );
+            let (Some(track), Some(thumb)) = (geometry.track(), geometry.thumb(area.scroll)) else {
+                continue;
+            };
+            let dragging = self
+                .container_drag
+                .as_ref()
+                .is_some_and(|drag| drag.node == area.node);
+            let hot = dragging || self.container_hover == Some(area.node);
+            let to_scene = |rect: nexty_paint::Rect| nexty_paint::Rect {
+                x: rect.x + area.padding_box.x,
+                y: rect.y + area.padding_box.y,
+                width: rect.width,
+                height: rect.height,
+            };
+            scene.commands.push(nexty_paint::Command::FillRect {
+                rect: to_scene(track),
+                color: nexty_paint::Color::opaque(0xe2, 0xe2, 0xe2),
+            });
+            let thumb_color = if dragging {
+                nexty_paint::Color::opaque(0x8a, 0x8a, 0x8a)
+            } else if hot {
+                nexty_paint::Color::opaque(0x9e, 0x9e, 0x9e)
+            } else {
+                nexty_paint::Color::opaque(0xb4, 0xb4, 0xb4)
+            };
+            scene.commands.push(nexty_paint::Command::FillRect {
+                rect: to_scene(thumb),
+                color: thumb_color,
+            });
+        }
         // 滚动条：轨道 + thumb，可拖拽（悬停/拖拽时加深）
         if let (Some(track), Some(thumb)) = (track, thumb) {
             scene.commands.push(nexty_paint::Command::FillRect {
@@ -925,6 +1081,31 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
                 {
                     self.set_scroll(scrollbar::clamp_scroll(scroll, geometry.max_scroll()));
                 }
+                // 容器滚动条拖拽中（K6）：thumb 跟随光标（容器 padding box
+                // 局部系），只改容器偏移，不影响视口滚动
+                if let Some(drag_node) = self.container_drag.as_ref().map(|drag| drag.node) {
+                    let areas = self.container_scroll_areas();
+                    if let Some(area) = areas.iter().find(|area| area.node == drag_node) {
+                        let geometry = ScrollGeometry::for_container(
+                            area.padding_box.width,
+                            area.padding_box.height,
+                            area.max_scroll,
+                        );
+                        let local_y = self.cursor.1 - area.padding_box.y;
+                        let drag = self.container_drag.as_mut().expect("checked above");
+                        if let Some(scroll) =
+                            drag.scrollbar.on_drag(&geometry, self.cursor.0, local_y)
+                        {
+                            self.set_container_scroll(
+                                drag_node,
+                                scrollbar::clamp_scroll(scroll, area.max_scroll),
+                            );
+                        }
+                    } else {
+                        // 布局变化使容器消失：结束拖拽（状态卫生）
+                        self.container_drag = None;
+                    }
+                }
                 // 拖拽选择：光标离开行盒时按最近文本吸附（拖到页尾仍扩展）。
                 if self.selection.is_dragging()
                     && self.cursor.1 > BAR_HEIGHT
@@ -936,6 +1117,17 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
                         .or_else(|| map.nearest(self.cursor.0, page_y))
                     {
                         self.selection.extend_to(position);
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                }
+                // 容器滚动条悬停（K6）：配色反馈，变化时重绘一帧；拖拽期间
+                // 光标被捕获，不更新（与视口滚动条悬停语义一致）
+                if self.container_drag.is_none() && !self.scrollbar.is_dragging() {
+                    let hover = self.container_scrollbar_at(self.cursor.0, self.cursor.1);
+                    if hover != self.container_hover {
+                        self.container_hover = hover;
                         if let Some(window) = &self.window {
                             window.request_redraw();
                         }
@@ -971,7 +1163,8 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
                     ),
                 };
                 if self.dispatch_page_wheel(wheel_delta, mode) {
-                    self.scroll_by(-amount);
+                    // K6：默认滚动由内向外链式消费（容器→祖先→视口）
+                    self.wheel_scroll(-amount);
                 }
             }
             WindowEvent::MouseInput {
@@ -1003,6 +1196,7 @@ impl ApplicationHandler<BackgroundEvent> for BrowserApp {
                 ..
             } => {
                 self.scrollbar.on_release();
+                self.container_drag = None;
                 if let Some(press) = self.press.take() {
                     let dragged = !selection::is_click((press.x, press.y), self.cursor);
                     // mouseup 先派发后默认；selection.finish 与滚动条

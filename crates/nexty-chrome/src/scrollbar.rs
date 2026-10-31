@@ -7,7 +7,13 @@
 //! 交互对齐主流浏览器：按住 thumb 拖动（记录抓取偏移，thumb 不随光标跳变）、
 //! 点击轨道空白处翻一页。悬停态只影响绘制色，不改变命中区——命中区随悬停加宽
 //! 会让拖拽过程中尺寸抖动。
+//!
+//! 容器级推广（K6）：[`ScrollGeometry::for_container`] 把滚动容器 padding box
+//! 映射为同构几何（bar=0 的局部系），轨道/thumb/翻页/拖拽与视口级共用同一套
+//! 数学与 [`Scrollbar`] 状态机；每个容器一份状态实例，拖容器滚动条不触碰视口
+//! 滚动量。[`wheel_chain_target`] 是滚轮由内向外链式消费的纯决策。
 
+use nexty_dom::NodeId;
 use nexty_paint::Rect;
 
 /// 滚动条轨道宽度，px。
@@ -56,6 +62,25 @@ impl ScrollGeometry {
     #[must_use]
     pub fn page_step(&self) -> f32 {
         (self.viewport_height - self.bar_height).max(0.0)
+    }
+
+    /// 滚动容器的同构几何（K6）：以 padding box **局部系**表达——bar=0、
+    /// 可视高 = client 高、内容总高 = client + max_scroll。轨道/thumb/
+    /// 翻页/拖拽与视口级共用全部数学（[`Scrollbar`] 状态机原样复用）；
+    /// 调用方负责局部系与页面/视口坐标之间的平移。
+    #[must_use]
+    pub fn for_container(client_width: f32, client_height: f32, max_scroll: f32) -> Self {
+        let max_scroll = if max_scroll.is_finite() {
+            max_scroll
+        } else {
+            0.0
+        };
+        Self {
+            viewport_width: client_width,
+            viewport_height: client_height,
+            content_height: client_height + max_scroll.max(0.0),
+            bar_height: 0.0,
+        }
     }
 
     /// 轨道矩形（视口坐标）；不溢出时为 `None`。
@@ -218,6 +243,28 @@ impl Scrollbar {
     pub fn on_release(&mut self) {
         self.dragging = false;
     }
+}
+
+/// 滚轮链式消费决策（K6，CSS Overflow 滚动链简化档）：沿链由内向外找第一个
+/// 在滚动方向上有空间的容器，返回 `(node, 新偏移)`；全链都到边界返回 `None`
+/// （调用方回落视口滚动）。
+///
+/// 链条目为 `(node, 当前偏移, max_scroll)`。`dy` 为 px（正 = 向下滚，与 DOM
+/// `WheelEvent.deltaY` 同向）。未到边界的容器消费整步并 clamp 到边界——同一次
+/// 滚轮事件的剩余量不拆分传给祖先（与主流浏览器的滚动锁存一致）。
+pub fn wheel_chain_target(
+    chain: impl IntoIterator<Item = (NodeId, f32, f32)>,
+    dy: f32,
+) -> Option<(NodeId, f32)> {
+    for (node, scroll, max) in chain {
+        if dy > 0.0 && scroll < max {
+            return Some((node, clamp_scroll(scroll + dy, max)));
+        }
+        if dy < 0.0 && scroll > 0.0 {
+            return Some((node, clamp_scroll(scroll + dy, max)));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -399,5 +446,66 @@ mod tests {
         // 不溢出时轨道不可悬停
         let g = geometry(100.0, 600.0);
         assert!(!scrollbar.on_hover(&g, 0.0, x, 500.0));
+    }
+
+    /// 容器同构几何（K6）：for_container 的 max/轨道/thumb 数学与视口级
+    /// 同构——max_scroll = 传入值，轨道贯穿 padding box（bar=0 局部系）。
+    #[test]
+    fn for_container_maps_padding_box_to_isomorphic_geometry() {
+        // client 200×300，max 100：max_scroll = 100，翻页步长 = client 高
+        let g = ScrollGeometry::for_container(200.0, 300.0, 100.0);
+        assert_eq!(g.max_scroll(), 100.0);
+        assert_eq!(g.page_step(), 300.0);
+        let track = g.track().expect("溢出容器有轨道");
+        assert_eq!(track.x, 200.0 - TRACK_WIDTH, "轨道贴 client 右缘");
+        assert_eq!(track.y, 0.0, "局部系顶 = padding box 顶");
+        assert_eq!(track.height, 300.0, "轨道贯穿 client 高");
+        // thumb：比例 = client / (client + max)，scroll=0 贴顶、max 贴底
+        let thumb = g.thumb(0.0).expect("thumb");
+        let expected = 300.0f32 * 300.0 / 400.0;
+        assert!((thumb.height - expected.max(MIN_THUMB)).abs() < 1e-4);
+        assert!((thumb.y - 0.0).abs() < 1e-4);
+        let thumb = g.thumb(100.0).expect("thumb");
+        assert!(
+            (thumb.y + thumb.height - 300.0).abs() < 1e-4,
+            "滚到底 thumb 贴底"
+        );
+        // max = 0：不溢出，无轨道（容器不参与滚动交互）
+        assert!(
+            ScrollGeometry::for_container(200.0, 300.0, 0.0)
+                .track()
+                .is_none()
+        );
+        // 非有限 max 降级为不溢出
+        assert!(
+            ScrollGeometry::for_container(200.0, 300.0, f32::NAN)
+                .track()
+                .is_none()
+        );
+    }
+
+    /// 容器拖拽状态机（K6）：Scrollbar 实例原样复用——抓取偏移不跳变、
+    /// 端点对齐、释放后失效；每容器独立实例互不影响。
+    #[test]
+    fn container_thumb_drag_reuses_state_machine() {
+        let g = ScrollGeometry::for_container(200.0, 300.0, 270.0);
+        let track = g.track().expect("track");
+        let tx = track.x + track.width / 2.0;
+        let mut a = Scrollbar::new();
+        let thumb = g.thumb(0.0).expect("thumb");
+        let grab = thumb.y + thumb.height / 2.0;
+        assert_eq!(a.on_press(&g, 0.0, tx, grab), None, "按下 thumb 不改滚动");
+        assert!(a.is_dragging());
+        // 原地拖动：抓取偏移生效，滚动量不变
+        let scroll = a.on_drag(&g, tx, grab).expect("drag");
+        assert!(scroll.abs() < 0.01);
+        // 拖到局部底 = max
+        let scroll = a.on_drag(&g, tx, track.y + track.height).expect("drag");
+        assert!((scroll - 270.0).abs() < 0.01);
+        a.on_release();
+        assert_eq!(a.on_drag(&g, tx, 100.0), None, "释放后不再拖拽");
+        // 另一实例（模拟另一容器）：状态独立，未被按下不响应
+        let b = Scrollbar::new();
+        assert!(!b.is_dragging());
     }
 }

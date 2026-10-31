@@ -23,6 +23,7 @@ use nexty_dom::{DeltaMode, KeyboardEvent, MouseEvent, NodeId, WheelEvent};
 
 use super::BrowserApp;
 use crate::pipeline::{self, Page, PendingLifecycle};
+use crate::scrollbar;
 use crate::ui::{self, BAR_HEIGHT, Modifiers};
 
 /// 派发鼠标事件（mousedown / mouseup / click）到 `target`。
@@ -122,15 +123,6 @@ impl BrowserApp {
         }
     }
 
-    /// 窗口点 `(x, y)` 在页面里的命中节点（工具带高度已扣除并叠加滚动）。
-    pub(super) fn hit_node_at(&self, x: f32, y: f32) -> Option<NodeId> {
-        let page_y = y - BAR_HEIGHT + self.scroll_y;
-        self.root
-            .as_ref()
-            .and_then(|root| pipeline::hit_test_ex(root, x, page_y))
-            .map(|hit| hit.node)
-    }
-
     /// 在命中节点（`node` 为 None 时退回文档根）派发页面鼠标事件。
     ///
     /// `x`/`y` 为窗口坐标；client 取页面视口坐标（扣工具带高度，不含滚动
@@ -166,6 +158,42 @@ impl BrowserApp {
             None => page.document.root(),
         };
         dispatch_wheel(page, target, delta, mode)
+    }
+
+    /// 窗口点 `(x, y)` 在页面里的命中节点（工具带高度已扣除并叠加滚动；
+    /// K6：计入容器滚动偏移，命中的是滚动后实际显示的内容）。
+    pub(super) fn hit_node_at(&self, x: f32, y: f32) -> Option<NodeId> {
+        let page_y = y - BAR_HEIGHT + self.scroll_y;
+        let offsets = self
+            .page
+            .as_ref()
+            .map(|page| page.scroll_offsets.clone())
+            .unwrap_or_default();
+        self.root
+            .as_ref()
+            .and_then(|root| pipeline::hit_test_scrolled(root, x, page_y, &offsets))
+            .map(|hit| hit.node)
+    }
+
+    /// 滚轮默认动作（K6）：由内向外链式消费——光标定位最内可滚动容器，
+    /// 未到边界则消费并停；到边界冒泡祖先；全链到边界回落视口滚动
+    /// （`scroll_by` 保持 `Scene::translated` 零 emit 不变量）。容器消费
+    /// 重建场景（偏差，见 `set_container_scroll`）。
+    ///
+    /// `dy` 为 px（正 = 向下滚，与 DOM `WheelEvent.deltaY` 同向）。
+    pub(super) fn wheel_scroll(&mut self, dy: f32) {
+        let chain = match (self.page.as_ref(), self.root.as_ref()) {
+            (Some(page), Some(root)) => {
+                let (x, y) = self.cursor;
+                let page_y = y - BAR_HEIGHT + self.scroll_y;
+                pipeline::scroll_chain_at(root, x, page_y, &page.scroll_offsets)
+            }
+            _ => Vec::new(),
+        };
+        match scrollbar::wheel_chain_target(chain, dy) {
+            Some((node, offset)) => self.set_container_scroll(node, offset),
+            None => self.scroll_by(dy),
+        }
     }
 
     /// 派发页面键盘事件（keydown，文档根上）。返回「未取消」。
