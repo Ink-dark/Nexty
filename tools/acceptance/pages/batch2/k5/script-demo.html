@@ -1,0 +1,48 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>K5 script demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 24px; line-height: 1.6; }
+  .box { width: 480px; padding: 12px; border: 2px solid #335577; background-color: #eeeeff; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+<h1>K5 脚本演示</h1>
+<p>判据（全部写在本页，对照 README K5-1…K5-4）：</p>
+<p>① 点击下方按钮后，第一个盒子里的文本变为「clicked! DOM changed by JS listener」且底色变橙加粗（click 事件 → JS 监听器 → textContent/style → 脏位重排）。</p>
+<p>② 第二个盒子在加载后的事件间隙内变红加粗并显示「timer fired: setTimeout(0) via event-gap pump」（setTimeout 由任务泵驱动）。</p>
+<p>③ 第三个盒子出现「created by second inline script (createElement + appendChild)」段落（两段 inline 脚本按文档序都执行了）。</p>
+<p>④ 页面正常渲染、无脚本错误页；两段脚本任一失败都不应阻塞另外一段与页面本身（错误只进日志）。</p>
+<p class="note">说明：按钮为文本形态渲染（表单控件替换盒属 K10，尚未实现），点击命中文字即可。</p>
+<div class="box">
+  <p id="target">target: 初始文本（等 JS 改写）</p>
+  <button id="btn">click me (click → JS listener)</button>
+</div>
+<div class="box">
+  <p id="timer">timer: 待触发</p>
+</div>
+<div class="box">
+  <div id="list"></div>
+</div>
+<script>
+  var btn = document.getElementById('btn');
+  btn.addEventListener('click', function () {
+    var t = document.getElementById('target');
+    t.textContent = 'clicked! DOM changed by JS listener';
+    t.setAttribute('style', 'background-color: #ffe8cc; font-weight: bold;');
+  });
+</script>
+<script>
+  var timer = document.getElementById('timer');
+  setTimeout(function () {
+    timer.textContent = 'timer fired: setTimeout(0) via event-gap pump';
+    timer.setAttribute('style', 'color: #cc0000; font-weight: bold;');
+  }, 0);
+  var p = document.createElement('p');
+  p.textContent = 'created by second inline script (createElement + appendChild)';
+  document.getElementById('list').appendChild(p);
+</script>
+</body>
+</html>

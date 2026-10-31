@@ -42,6 +42,8 @@ const ALIASES = {
   "/k6nested": "batch2/k6/nested-scroll.html",
   "/k6hidden": "batch2/k6/hidden-clip.html",
   "/k6bar": "batch2/k6/container-scrollbar.html",
+  // K5 脚本演示页（批次 2）：事件驱动 DOM 变更 + 定时器 + 两段 inline 脚本
+  "/k5script": "batch2/k5/script-demo.html",
 };
 
 // K13 formats 页四张 8x8 fixture：URL → crates/nexty-paint/tests/data/ 下的

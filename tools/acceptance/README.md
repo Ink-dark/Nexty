@@ -37,6 +37,7 @@ tools/acceptance/
     ├── batch1/k4/             # K4 @font-face 正常页与 404 回退页
     ├── batch2/k13/            # K13 formats 页 + favicon 两态页（二进制 fixture 复用 paint tests/data）
     ├── batch2/k6/             # K6 容器滚动三页（嵌套 / hidden 裁剪 / 容器滚动条）
+    ├── batch2/k5/             # K5 脚本演示页（事件驱动 DOM 变更 / 定时器 / 树变更）
     ├── core/                  # 长页主页 + 第二页 + dot.png（滚动/键盘/选区/链接）
     ├── links/                 # 链接点击与行内图片形态
     └── legacy/                # 历史轮次页面原样迁入（t3 文本/图片/float，float 冒烟）
@@ -64,10 +65,9 @@ tools/acceptance/
 
 ## 回归清单（批次 2 增量，K13 图片格式 + favicon）
 
-favicon 页的**前提**：favicon 编排（`FaviconOrchestrator` →
-`AddressBar::set_favicon`）已在 `app.rs` 接线（K13 泳道文件清单不含
-app.rs，接线随批次收口合入）。未接线时导航不发图标请求，`/stats`
-无对应计数——这不是页面或服务器的缺陷。
+favicon 编排已在 `app.rs` 接线（批次收口，chrome 0.1.35）：主线程解析
+URL + 会话缓存查询，未命中起后台抓取线程，就绪后经 `FaviconReady`
+事件回主线程入缓存并上图标槽（跨页门控防串页）。
 
 | # | 路由 | 判据 | 判定方式 |
 | --- | --- | --- | --- |
@@ -90,16 +90,24 @@ app.rs，接线随批次收口合入）。未接线时导航不发图标请求�
 | K6-7 | `/k6bar` | thumb 按内容比例取高；拖拽抓取点不跳变，顶/底端点对齐 | 拖拽 + 截图 |
 | K6-8 | `/k6bar` | 点击 thumb 上/下轨道翻一页；拖容器滚动条期间页面不滚 | 点击/拖拽 + 截图 |
 
+## 回归清单（批次 2 增量，K5 脚本）
+
+| # | 路由 | 判据 | 判定方式 |
+| --- | --- | --- | --- |
+| K5-1 | `/k5script` | 两段 inline 脚本按文档序执行：第三盒出现「created by second inline script…」段落 | 截图目测 |
+| K5-2 | `/k5script` | 点击按钮 → 文本变为「clicked! DOM changed by JS listener」且底色变橙加粗（事件 → JS 监听器 → 重排） | 点击 + 截图 |
+| K5-3 | `/k5script` | 加载后事件间隙内定时器行变红加粗并显示 timer fired（setTimeout 泵驱动） | 截图目测 |
+| K5-4 | `/k5script` | 页面正常渲染无脚本错误页；单段脚本失败不阻塞另一段与页面 | 截图目测 |
+
 历史轮次页面（`/legacy/...`）的判据写在各页面末尾或对应轮次文档
 （`docs/plans/`）中；这些页面在当年验收通过后原样迁入，改动需同步更新本文档。
 
 ## 已知缺陷 / 偏差（验收时不要误判为新问题）
 
-1. **302 后相对链接基准未落到最终 URL**（2026-10-31 实机验收发现，未修）：
-   `/redir` 落点页点相对链接会请求 `/sub.html`（404），而相对**子资源**已按
-   `final_url` 正确解析。根因：链接解析用 `history.current()`（请求 URL），
-   地址栏/历史条目也没更新为落点。见 `crates/nexty-chrome/src/app.rs`
-   （`navigate` / 点击导航处）。
+1. **302 后相对链接基准缺陷——已在批次 1 修复（chrome 0.1.31）**：
+   `History::replace_current` 在页面安装时把当前条目与地址栏原地改写为
+   最终 URL（WHATWG 会话历史语义），相对链接解析基准随之落在落点。
+   `/redir` 现用于回归该修复：落点页点相对链接应到 `/landing/dir/sub.html`。
 2. **@font-face 注册表是会话级**：后一页对**同名 family** 的 src 404 时会沿用
    前一页已注册的字体。`/font404` 故意用不同 family 名，就是为了让这条偏差
    不干扰「404 → 系统回退」的判定。
