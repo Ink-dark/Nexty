@@ -27,7 +27,7 @@ cargo build -p nexty-chrome --bin nexty --release
 
 ```
 tools/acceptance/
-├── server.cjs                 # 静态 pages/ + 动态端点（GBK/302/缓存/字体/stats）
+├── server.cjs                 # 静态 pages/ + 动态端点（GBK/302/缓存/字体/favicon/stats）
 ├── regenerate-gbk.sh          # gbk-page.src.html → gbk-page.hex（iconv）
 ├── README.md                  # 本文件：运行方式 + 回归清单 + 新增资产约定
 └── pages/
@@ -35,6 +35,9 @@ tools/acceptance/
     ├── batch1/k2/             # K2 绘制扩展对照（五组 / 放大 / 装饰线 / 链接）
     ├── batch1/k3/             # K3 GBK 字节、302 落点页、缓存页
     ├── batch1/k4/             # K4 @font-face 正常页与 404 回退页
+    ├── batch2/k13/            # K13 formats 页 + favicon 两态页（二进制 fixture 复用 paint tests/data）
+    ├── batch2/k6/             # K6 容器滚动三页（嵌套 / hidden 裁剪 / 容器滚动条）
+    ├── batch2/k5/             # K5 脚本演示页（事件驱动 DOM 变更 / 定时器 / 树变更）
     ├── core/                  # 长页主页 + 第二页 + dot.png（滚动/键盘/选区/链接）
     ├── links/                 # 链接点击与行内图片形态
     └── legacy/                # 历史轮次页面原样迁入（t3 文本/图片/float，float 冒烟）
@@ -60,16 +63,51 @@ tools/acceptance/
 | K1-2 | `/links/*` | 单次点击链接导航；图片与链接同排 | 点击 + 标题变化 |
 | K1-3 | `/core/` `/legacy/t3/selection.html` | 拖拽选区高亮、`Ctrl+C` 进系统剪贴板、块边界插换行 | 截图 + 读剪贴板 |
 
+## 回归清单（批次 2 增量，K13 图片格式 + favicon）
+
+favicon 编排已在 `app.rs` 接线（批次收口，chrome 0.1.35）：主线程解析
+URL + 会话缓存查询，未命中起后台抓取线程，就绪后经 `FaviconReady`
+事件回主线程入缓存并上图标槽（跨页门控防串页）。
+
+| # | 路由 | 判据 | 判定方式 |
+| --- | --- | --- | --- |
+| K13-1 | `/k13` | png/jpeg/gif/webp 四张 8×8 并排，均为四象限色块（左上红/右上绿/左下蓝/右下白），jpeg/webp 允许有损噪点 | 截图目测 |
+| K13-2 | `/k13icon` | 地址栏左侧出现 16×16 橙色图标，URL 文本右移让位 | 截图目测 |
+| K13-3 | `/k13icon` | `/stats` 有 `/k13-link-icon.ico` 且无 `/favicon.ico`（link 优先，不回落） | `/stats` |
+| K13-4 | `/k13icon` 二次导航 | `/k13-link-icon.ico` 计数不变（会话去重） | `/stats` |
+| K13-5 | `/k13noicon` | 无 link 回落：`/stats` 有 `/favicon.ico` 计数，图标照常出现 | `/stats` + 截图 |
+
+## 回归清单（批次 2 增量，K6 容器滚动）
+
+| # | 路由 | 判据 | 判定方式 |
+| --- | --- | --- | --- |
+| K6-1 | `/k6nested` | 外层与内层右侧各有一条滚动条，各自独立拖拽 | 截图目测 |
+| K6-2 | `/k6nested` | 滚轮在内层先滚内层；内层到顶/底后冒泡外层，外层到边界后冒泡页面 | 滚轮 + 截图 |
+| K6-3 | `/k6nested` | 拖内层滚动条只动内层内容，页面不滚 | 拖拽 + 截图 |
+| K6-4 | `/k6nested` | 外层滚一段后 resize：偏移保留并按新 scrollable overflow 夹取 | resize + 截图 |
+| K6-5 | `/k6hidden` | overflow:hidden 只裁剪：超出部分不可见且不渗出边框；无滚动条 | 截图目测 |
+| K6-6 | `/k6hidden` | 滚轮悬停 hidden 容器：容器不动，页面照常滚（冒泡越过） | 滚轮 + 截图 |
+| K6-7 | `/k6bar` | thumb 按内容比例取高；拖拽抓取点不跳变，顶/底端点对齐 | 拖拽 + 截图 |
+| K6-8 | `/k6bar` | 点击 thumb 上/下轨道翻一页；拖容器滚动条期间页面不滚 | 点击/拖拽 + 截图 |
+
+## 回归清单（批次 2 增量，K5 脚本）
+
+| # | 路由 | 判据 | 判定方式 |
+| --- | --- | --- | --- |
+| K5-1 | `/k5script` | 两段 inline 脚本按文档序执行：第三盒出现「created by second inline script…」段落 | 截图目测 |
+| K5-2 | `/k5script` | 点击按钮 → 文本变为「clicked! DOM changed by JS listener」且底色变橙加粗（事件 → JS 监听器 → 重排） | 点击 + 截图 |
+| K5-3 | `/k5script` | 加载后事件间隙内定时器行变红加粗并显示 timer fired（setTimeout 泵驱动） | 截图目测 |
+| K5-4 | `/k5script` | 页面正常渲染无脚本错误页；单段脚本失败不阻塞另一段与页面 | 截图目测 |
+
 历史轮次页面（`/legacy/...`）的判据写在各页面末尾或对应轮次文档
 （`docs/plans/`）中；这些页面在当年验收通过后原样迁入，改动需同步更新本文档。
 
 ## 已知缺陷 / 偏差（验收时不要误判为新问题）
 
-1. **302 后相对链接基准未落到最终 URL**（2026-10-31 实机验收发现，未修）：
-   `/redir` 落点页点相对链接会请求 `/sub.html`（404），而相对**子资源**已按
-   `final_url` 正确解析。根因：链接解析用 `history.current()`（请求 URL），
-   地址栏/历史条目也没更新为落点。见 `crates/nexty-chrome/src/app.rs`
-   （`navigate` / 点击导航处）。
+1. **302 后相对链接基准缺陷——已在批次 1 修复（chrome 0.1.31）**：
+   `History::replace_current` 在页面安装时把当前条目与地址栏原地改写为
+   最终 URL（WHATWG 会话历史语义），相对链接解析基准随之落在落点。
+   `/redir` 现用于回归该修复：落点页点相对链接应到 `/landing/dir/sub.html`。
 2. **@font-face 注册表是会话级**：后一页对**同名 family** 的 src 404 时会沿用
    前一页已注册的字体。`/font404` 故意用不同 family 名，就是为了让这条偏差
    不干扰「404 → 系统回退」的判定。

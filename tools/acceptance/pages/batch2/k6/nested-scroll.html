@@ -1,0 +1,47 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>K6 嵌套滚动</title>
+<style>
+  body { font-family: sans-serif; margin: 16px; }
+  .outer { overflow: auto; width: 420px; height: 260px; border: 2px solid #345; padding: 8px; background-color: #f0f4ff; }
+  .inner { overflow: auto; width: 300px; height: 120px; border: 2px solid #a53; padding: 6px; background-color: #fff4ec; }
+  .block { height: 40px; background-color: #dde8ff; margin: 6px 0; }
+  .inblock { height: 28px; background-color: #ffd9c0; margin: 4px 0; }
+  p { margin: 6px 0; }
+</style>
+</head>
+<body>
+<h3>K6 nested scroll：内外双层 overflow:auto</h3>
+<ol>
+  <li>外层（蓝框）与内层（橙框）右侧各出现一条滚动条，二者独立拖拽；</li>
+  <li>滚轮悬停内层：内层内容先滚，内层未到边界时外层与页面不动；</li>
+  <li>内层滚到顶/底后继续滚：冒泡到外层；外层到边界后冒泡到页面；</li>
+  <li>拖内层滚动条：只有内层内容移动，页面（窗口级）不滚动；</li>
+  <li>外层滚一段后 resize 窗口：外层滚动偏移保留并按新内容夹取。</li>
+</ol>
+
+<div class="outer">
+  <p>外层首行（滚动外层时移动）</p>
+  <div class="inner">
+    <p>内层首行</p>
+    <div class="inblock"></div>
+    <div class="inblock"></div>
+    <div class="inblock"></div>
+    <div class="inblock"></div>
+    <div class="inblock"></div>
+    <div class="inblock"></div>
+    <p>内层末行（内层 max 之外应被裁剪）</p>
+  </div>
+  <div class="block"></div>
+  <div class="block"></div>
+  <div class="block"></div>
+  <div class="block"></div>
+  <div class="block"></div>
+  <div class="block"></div>
+  <div class="block"></div>
+  <p>外层末行（外层 max 之外应被裁剪）</p>
+</div>
+</body>
+</html>

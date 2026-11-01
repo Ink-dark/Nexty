@@ -435,6 +435,8 @@ impl Collector<'_> {
                 style: style.clone(),
                 children: Vec::new(),
                 lines: Vec::new(),
+                scrollable: false,
+                scrollable_overflow: None,
             },
             style: style.clone(),
         })));
@@ -1674,6 +1676,7 @@ impl LineBuilder<'_> {
         }
         let line_height = baseline + below;
         self.lines.push(LineFragment {
+            top: self.line_top,
             baseline,
             height: line_height,
             start: std::mem::replace(

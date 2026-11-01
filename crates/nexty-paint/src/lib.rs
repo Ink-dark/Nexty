@@ -6,7 +6,16 @@
 //! `docs/decisions/2026-10-01-crate-selection.md`。
 //!
 //! 指令集：`FillRect` / `StrokeRect` / `FillRoundedRect` / `StrokeRoundedRect` /
-//! `FillGradient` / `DrawText` / `DrawImage`，后续消费方需要什么指令再扩展什么。
+//! `FillGradient` / `DrawText` / `DrawImage` / `PushClip` / `PopClip`，
+//! 后续消费方需要什么指令再扩展什么。
+//!
+//! **裁剪（K6）**：`PushClip` / `PopClip` 是嵌套相交裁剪矩形栈（后压入的
+//! 矩形与已有裁剪区求交）。vello_cpu 0.2 探针结论：有 `push_clip_path` /
+//! `pop_clip_path` 栈 API（相交语义，render 前允许未弹平）与离屏
+//! `push_clip_layer`，无 rect 变体——矩形转路径压栈；clip 栈**空弹会
+//! panic**，facade 以配对深度防御未配对的 `PopClip`。偏差：退化裁剪矩形
+//! （非有限坐标或宽高 ≤ 0）按不裁剪处理；圆角滚动容器按矩形裁剪（无
+//! 圆角裁剪路径）。
 //!
 //! 上游：`vello_cpu`（CPU 光栅，sparse strips）+ `image`（图片解码）。
 //! **解码归属**：解码器只在 [`decode`] 内出现，产出自有类型 [`Image`]，
@@ -55,8 +64,9 @@ pub const MAX_PIXEL_AREA: u64 = 1 << 26;
 
 /// 从字节流解码一幅图片（格式由内容嗅探，不依赖扩展名）。
 ///
-/// 支持 PNG / JPEG / GIF / WebP（编译期 feature 决定）。产出非预乘 RGBA8，
-/// 供 [`Command::DrawImage`] 消费。
+/// 支持 PNG / JPEG / GIF / WebP / ICO（编译期 feature 决定；ICO 为
+/// favicon 路径服务，image 的 `ico` feature 隐含 `bmp`，故 BMP 亦可嗅探
+/// 解码）。产出非预乘 RGBA8，供 [`Command::DrawImage`] 消费。
 ///
 /// 解码前先 `into_dimensions()` 只读头部做尺寸预检：边长 ≤ [`MAX_DIMENSION`]
 /// 且 `宽 × 高` ≤ [`MAX_PIXEL_AREA`]，超限返回 [`DecodeError::SizeUnsupported`]
@@ -69,6 +79,13 @@ pub const MAX_PIXEL_AREA: u64 = 1 << 26;
 ///
 /// 上游 `image` 系列的错误一律映射为 [`DecodeError::InvalidImage`]，不引入
 /// `image::error::ImageError`——依赖类型不得出现在 pub 导出中。
+///
+/// 已知偏差（K13）：**动图不播放**——GIF 与 WebP 动图解码取帧 1（上游
+/// 解码器的静态帧语义，fixture 钉住），逐帧推进留给后续图片动效轮；
+/// **EXIF 方向不应用**——`Orientation` 标记被忽略，像素按存储顺序原样输出
+/// （上游 `apply_orientation` 是显式 opt-in，本层不调用）；**ICO 多尺寸
+/// 容器不做条目选择**——取上游解码器的默认条目（favicon 常见单帧场景
+/// 不受影响）。
 #[cfg(feature = "cpu")]
 pub fn decode(bytes: &[u8]) -> Result<Image, DecodeError> {
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
@@ -261,6 +278,21 @@ pub enum Command {
         /// [`Scene::images`] 中的图像下标。
         image: usize,
     },
+    /// 压入一个矩形裁剪（K6 T0 接缝；CSS Overflow §3：滚动/裁剪容器
+    /// 将内容裁到 padding-box，简化档以矩形表达，圆角裁剪记偏差）。
+    ///
+    /// 裁剪按**栈**语义：嵌套的 `PushClip` 逐层相交（后压入的矩形与已
+    /// 有裁剪区求交），[`Command::PopClip`] 弹回上一层。后续指令直到配对
+    /// 的 `PopClip` 前都被裁剪。场景结束时有未弹出的裁剪是允许的
+    /// （后端兼容）；未配对的 `PopClip` 由后端防御（不 panic，忽略）。
+    PushClip {
+        /// 裁剪矩形（场景坐标，随 [`Scene::translated`] 平移）。
+        rect: Rect,
+    },
+    /// 弹出最近一次 [`Command::PushClip`] 压入的裁剪。
+    ///
+    /// 栈空时无效果（光栅后端防御忽略，不 panic）。
+    PopClip,
 }
 
 /// 一幅已解码的图像：非预乘 RGBA8，行优先。
@@ -407,6 +439,15 @@ impl Scene {
                     },
                     image: *image,
                 },
+                // 裁剪矩形是场景坐标，必须随滚动平移，否则容器裁剪区错位
+                Command::PushClip { rect } => Command::PushClip {
+                    rect: Rect {
+                        x: rect.x + dx,
+                        y: rect.y + dy,
+                        ..*rect
+                    },
+                },
+                Command::PopClip => Command::PopClip,
             })
             .collect();
         Scene {
@@ -521,6 +562,9 @@ impl Rasterizer for VelloCpuRasterizer {
 
         let mut context = vello_cpu::RenderContext::new(width, height);
         let mut resources = vello_cpu::Resources::new();
+        // PushClip/PopClip 的配对深度：vello_cpu 的 clip 栈空弹会 panic（探针
+        // 结论，见模块文档），未配对的 PopClip 在此防御为无操作
+        let mut clip_depth = 0usize;
         for command in &scene.commands {
             match command {
                 Command::FillRect { rect, color } => {
@@ -677,6 +721,21 @@ impl Rasterizer for VelloCpuRasterizer {
                     };
                     draw_image(&mut context, &mut resources, source, rect);
                 }
+                // K6 T3：矩形裁剪（CSS Overflow §3 简化档）。vello_cpu 无
+                // rect clip 变体，矩形转路径压入相交 clip 栈；非法矩形跳过
+                // push（裁剪不生效），深度不增以保持与 PopClip 配对平衡。
+                Command::PushClip { rect } => {
+                    if let Some(path) = clip_rect_path(*rect) {
+                        context.push_clip_path(&path);
+                        clip_depth += 1;
+                    }
+                }
+                Command::PopClip => {
+                    if clip_depth > 0 {
+                        context.pop_clip_path();
+                        clip_depth -= 1;
+                    }
+                }
             }
         }
 
@@ -792,6 +851,29 @@ fn sanitize_radii(radii: [f32; 4]) -> [f32; 4] {
             0.0
         }
     })
+}
+
+/// 裁剪矩形 → 光栅路径；矩形不可绘制时返回 `None`（调用方跳过 push，
+/// 裁剪不生效——退化矩形按不裁剪处理，偏差见模块文档）。
+///
+/// 探针结论（K6 T3，vello_cpu 0.2）：无 rect clip 专用 API，只有
+/// `push_clip_path` / `pop_clip_path`（嵌套相交 clip 栈，render 前允许
+/// 未弹平）与更贵的 `push_clip_layer` / `pop_layer`，故矩形转路径。
+#[cfg(feature = "cpu")]
+fn clip_rect_path(rect: Rect) -> Option<vello_cpu::kurbo::BezPath> {
+    if !rect_is_paintable(&rect) {
+        return None;
+    }
+    use vello_cpu::kurbo::Shape as _;
+    Some(
+        vello_cpu::kurbo::Rect::new(
+            f64::from(rect.x),
+            f64::from(rect.y),
+            f64::from(rect.x) + f64::from(rect.width),
+            f64::from(rect.y) + f64::from(rect.height),
+        )
+        .to_path(0.1),
+    )
 }
 
 /// CSS Backgrounds §5.5（角重叠）：任一边上相邻两角半径之和超过边长时，
@@ -1306,6 +1388,142 @@ mod tests {
         assert_eq!(image.pixel(1, 1), Some([1, 2, 3, 4]));
         assert_eq!(image.pixel(2, 0), None);
         assert_eq!(image.pixel(0, 2), None);
+    }
+
+    // ---- 矩形裁剪栈（K6 T3，CSS Overflow §3 简化档） ----
+
+    #[test]
+    fn clip_limits_fill_to_clip_rect() {
+        // 全画布填充被裁到 (4,2,8,6)：内红外透（clip 内外采样）
+        let scene = Scene {
+            commands: vec![
+                Command::PushClip {
+                    rect: rect(4.0, 2.0, 8.0, 6.0),
+                },
+                fill(0.0, 0.0, 20.0, 10.0, Color::opaque(255, 0, 0)),
+                Command::PopClip,
+            ],
+            images: Vec::new(),
+        };
+        let pixmap = VelloCpuRasterizer::new()
+            .rasterize(&scene, size(20, 10))
+            .expect("rasterize");
+        for y in 0..10u32 {
+            for x in 0..20u32 {
+                let pixel = pixmap.pixel(x, y).expect("in bounds");
+                let inside = (4..12).contains(&x) && (2..8).contains(&y);
+                if inside {
+                    assert_eq!(pixel, [255, 0, 0, 255], "({x}, {y}) 应被填充");
+                } else {
+                    assert_eq!(pixel, [0, 0, 0, 0], "({x}, {y}) 应被裁掉");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_clips_intersect() {
+        // 两层裁剪矩形：(2,2,10,10) ∩ (6,2,10,10) = x∈[6,12), y∈[2,12)
+        let scene = Scene {
+            commands: vec![
+                Command::PushClip {
+                    rect: rect(2.0, 2.0, 10.0, 10.0),
+                },
+                Command::PushClip {
+                    rect: rect(6.0, 2.0, 10.0, 10.0),
+                },
+                fill(0.0, 0.0, 20.0, 16.0, Color::opaque(0, 128, 0)),
+                Command::PopClip,
+                Command::PopClip,
+            ],
+            images: Vec::new(),
+        };
+        let pixmap = VelloCpuRasterizer::new()
+            .rasterize(&scene, size(20, 16))
+            .expect("rasterize");
+        for y in 0..16u32 {
+            for x in 0..20u32 {
+                let pixel = pixmap.pixel(x, y).expect("in bounds");
+                let inside = (6..12).contains(&x) && (2..12).contains(&y);
+                assert_eq!(
+                    pixel[3] > 0,
+                    inside,
+                    "({x}, {y}) 应{}相交区",
+                    if inside { "在" } else { "不在" }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pop_without_push_is_ignored() {
+        // 未配对的 PopClip：防御为无操作（vello_cpu clip 栈空弹会 panic），
+        // 后续填充不受影响、不 panic
+        let scene = Scene {
+            commands: vec![
+                Command::PopClip,
+                fill(0.0, 0.0, 4.0, 4.0, Color::opaque(255, 0, 0)),
+                Command::PopClip,
+            ],
+            images: Vec::new(),
+        };
+        let pixmap = VelloCpuRasterizer::new()
+            .rasterize(&scene, size(6, 4))
+            .expect("rasterize");
+        assert_eq!(pixmap.pixel(1, 1), Some([255, 0, 0, 255]));
+        assert_eq!(pixmap.pixel(5, 3), Some([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn unbalanced_push_and_degenerate_rect_are_harmless() {
+        // 场景结束未弹平：允许（vello_cpu 兼容 pending clip）；退化矩形
+        // （宽 ≤ 0）按不裁剪处理（偏差），填充完整可见
+        let scene = Scene {
+            commands: vec![
+                Command::PushClip {
+                    rect: rect(3.0, 0.0, 0.0, 4.0),
+                },
+                Command::PushClip {
+                    rect: rect(0.0, 0.0, 4.0, 4.0),
+                },
+                fill(0.0, 0.0, 4.0, 4.0, Color::opaque(255, 0, 0)),
+            ],
+            images: Vec::new(),
+        };
+        let pixmap = VelloCpuRasterizer::new()
+            .rasterize(&scene, size(6, 4))
+            .expect("rasterize");
+        assert_eq!(pixmap.pixel(1, 1), Some([255, 0, 0, 255]));
+        assert_eq!(pixmap.pixel(5, 1), Some([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn translated_scene_moves_clip_rect() {
+        // 平移后的场景与直接按平移坐标发的场景像素一致：clip 矩形随平移
+        let build = |push_rect: Rect, fill_rect: Rect| Scene {
+            commands: vec![
+                Command::PushClip { rect: push_rect },
+                Command::FillRect {
+                    rect: fill_rect,
+                    color: Color::opaque(0, 0, 255),
+                },
+                Command::PopClip,
+            ],
+            images: Vec::new(),
+        };
+        let direct = build(rect(7.0, 3.0, 6.0, 4.0), rect(0.0, 0.0, 20.0, 10.0));
+        let shifted =
+            build(rect(4.0, 2.0, 6.0, 4.0), rect(0.0, 0.0, 20.0, 10.0)).translated(3.0, 1.0);
+        let direct_pixmap = VelloCpuRasterizer::new()
+            .rasterize(&direct, size(20, 10))
+            .expect("rasterize direct");
+        let shifted_pixmap = VelloCpuRasterizer::new()
+            .rasterize(&shifted, size(20, 10))
+            .expect("rasterize shifted");
+        assert_eq!(direct_pixmap.data, shifted_pixmap.data, "平移后裁剪区一致");
+        // 裁剪确实生效：x=6 处被裁掉，x=7 起填充
+        assert_eq!(direct_pixmap.pixel(6, 4), Some([0, 0, 0, 0]));
+        assert_eq!(direct_pixmap.pixel(7, 4), Some([0, 0, 255, 255]));
     }
 
     /// 生成一张指定颜色的 PNG 字节（用 image 编码，覆盖我们声明支持的格式）。
@@ -2282,5 +2500,154 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- K13 图片格式：入库 fixture 解码 / 渲染 / 预检超限 / 动图与 EXIF 偏差 ----
+
+    /// 读入库 fixture（`tests/data/`，由 `gen_k13_fixtures.py` 生成，随仓
+    /// 入库；测试不现场编码，保证确定性）。
+    fn fixture(name: &str) -> Vec<u8> {
+        std::fs::read(format!("{}/tests/data/{name}", env!("CARGO_MANIFEST_DIR")))
+            .unwrap_or_else(|error| panic!("fixture {name} 缺失: {error:?}"))
+    }
+
+    /// 断言解码产物某像素接近期望色（有损格式允许每通道 `tol` 偏差）。
+    fn assert_decoded_pixel_near(image: &Image, x: u32, y: u32, expected: [u8; 4], tol: u32) {
+        let actual = image.pixel(x, y).expect("pixel in bounds");
+        for (index, (got, want)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                i32::from(*got).abs_diff(i32::from(want)) <= tol,
+                "({x}, {y}) 通道{index}: 实际 {got}，期望 {want}±{tol}，像素 {actual:?}"
+            );
+        }
+    }
+
+    /// fixture 的四象限颜色与采样中心（gen_k13_fixtures.py：左上红 /
+    /// 右上绿 / 左下蓝 / 右下白，8x8 象限各 4x4，中心不落象限边缘）。
+    fn quadrant_samples() -> [((u32, u32), [u8; 4]); 4] {
+        [
+            ((2, 2), [255, 0, 0, 255]),
+            ((5, 2), [0, 255, 0, 255]),
+            ((2, 5), [0, 0, 255, 255]),
+            ((5, 5), [255, 255, 255, 255]),
+        ]
+    }
+
+    #[test]
+    fn k13_fixtures_decode_each_format_with_quadrant_pixels() {
+        for (name, tolerance) in [
+            ("k13-8x8.png", 0),
+            ("k13-8x8.jpeg", 24),
+            ("k13-8x8.gif", 0),
+            ("k13-8x8.webp", 24),
+        ] {
+            let decoded =
+                decode(&fixture(name)).unwrap_or_else(|error| panic!("{name} 应可解码: {error:?}"));
+            assert_eq!((decoded.width, decoded.height), (8, 8), "{name} 尺寸");
+            for ((x, y), color) in quadrant_samples() {
+                assert_decoded_pixel_near(&decoded, x, y, color, tolerance);
+            }
+        }
+    }
+
+    #[test]
+    fn k13_fixtures_render_through_draw_image_scaled_2x() {
+        // 解码产物进资源池 → DrawImage 放大 2x 绘制：象限颜色落在放大后的
+        // 对应区域。无损格式（png/gif，源像素精确）用 ±1（预乘往返量化）；
+        // 有损格式用 ±48：解码振铃 + vello 采样核（宽于双线性，带负瓣）在
+        // 象限边缘的过冲叠加——四象限色两两通道间隔 ≥ 160，±48 不会把一个
+        // 象限色混认成另一个（本断言只验「正确象限的显著色」，无损格式的
+        // 逐像素精确行为由上方解码测试与纯色图渲染测试钉住）。
+        let rasterizer = VelloCpuRasterizer::new();
+        for (name, tolerance) in [
+            ("k13-8x8.png", 1),
+            ("k13-8x8.jpeg", 48),
+            ("k13-8x8.gif", 1),
+            ("k13-8x8.webp", 48),
+        ] {
+            let decoded =
+                decode(&fixture(name)).unwrap_or_else(|error| panic!("{name} 应可解码: {error:?}"));
+            let scene = Scene {
+                commands: vec![Command::DrawImage {
+                    rect: rect(0.0, 0.0, 16.0, 16.0),
+                    image: 0,
+                }],
+                images: vec![Arc::new(decoded)],
+            };
+            let pixmap = rasterizer
+                .rasterize(&scene, size(16, 16))
+                .expect("rasterize");
+            for ((x, y), color) in quadrant_samples() {
+                assert_pixel_within(&pixmap, x * 2 + 1, y * 2 + 1, color, tolerance);
+            }
+        }
+    }
+
+    #[test]
+    fn k13_oversize_jpeg_fixtures_fail_preflight_without_panic() {
+        // 真实 jpeg 头部声明的超限尺寸在预检拒绝：不进像素解码、不分配、
+        // 不 panic（分配失败是 abort，panic 兑底兑不住——防线必须在头部）。
+        // 边长 20000 > MAX_DIMENSION：
+        assert_eq!(
+            decode(&fixture("k13-oversize-20000x1.jpeg")).expect_err("side over"),
+            DecodeError::SizeUnsupported
+        );
+        // 16384x5000：边长都在限内，面积 8.19e7 > MAX_PIXEL_AREA（2^26）：
+        assert_eq!(
+            decode(&fixture("k13-oversize-16384x5000.jpeg")).expect_err("area over"),
+            DecodeError::SizeUnsupported
+        );
+    }
+
+    #[test]
+    fn k13_animated_gif_and_webp_decode_first_frame() {
+        // 两帧动图（帧 1 全红、帧 2 全蓝）：静态解码取帧 1（已知偏差）
+        for (name, tolerance) in [("k13-8x8-anim.gif", 0), ("k13-8x8-anim.webp", 24)] {
+            let decoded = decode(&fixture(name))
+                .unwrap_or_else(|error| panic!("{name} 应可解码帧 1: {error:?}"));
+            assert_eq!((decoded.width, decoded.height), (8, 8), "{name} 画布尺寸");
+            assert_decoded_pixel_near(&decoded, 4, 4, [255, 0, 0, 255], tolerance);
+        }
+    }
+
+    #[test]
+    fn k13_exif_orientation_is_not_applied() {
+        // EXIF Orientation=6（顺时针转 90°）被忽略：尺寸保持存储序 8x4，
+        // 左半红右半蓝（已知偏差，fixture 钉住防止上游静默改行为）
+        let decoded = decode(&fixture("k13-exif-rot.jpeg")).expect("decode");
+        assert_eq!(
+            (decoded.width, decoded.height),
+            (8, 4),
+            "EXIF 方向不应用，尺寸按像素数据"
+        );
+        assert_decoded_pixel_near(&decoded, 0, 0, [255, 0, 0, 255], 24);
+        assert_decoded_pixel_near(&decoded, 7, 0, [0, 0, 255, 255], 24);
+    }
+
+    #[test]
+    fn k13_ico_fixture_decodes_for_favicon_path() {
+        // ICO（Pillow 生成的 PNG 内嵌条目）：favicon 抓取路径的解码前提
+        let decoded = decode(&fixture("k13-16x16.ico")).expect("decode ico");
+        assert_eq!((decoded.width, decoded.height), (16, 16));
+        assert_eq!(
+            decoded.pixel(8, 8),
+            Some([255, 136, 0, 255]),
+            "ICO 中心为 fixture 橙色"
+        );
+    }
+
+    #[test]
+    fn k13_unknown_format_still_invalid_image() {
+        // 未知格式仍走 DecodeError（不 panic；ico feature 连带 bmp 后，
+        // 样本须避开 BM 头等新可识别魔数）
+        assert_eq!(
+            decode(b"<!DOCTYPE html><html><body>k13</body></html>").expect_err("html"),
+            DecodeError::InvalidImage
+        );
+        assert_eq!(
+            decode(b"{\"json\": true}").expect_err("json"),
+            DecodeError::InvalidImage
+        );
+        assert_eq!(decode(&[]).expect_err("empty"), DecodeError::InvalidImage);
     }
 }

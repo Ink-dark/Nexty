@@ -49,6 +49,8 @@ mod block;
 mod fragment;
 #[cfg(any(feature = "inline", feature = "replaced"))]
 mod inline;
+#[cfg(feature = "scroll")]
+mod scroll;
 #[cfg(feature = "selection")]
 mod selection;
 #[cfg(feature = "taffy-map")]

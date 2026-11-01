@@ -29,7 +29,9 @@
 //!   复用同一对象再派发会携带旧标志。
 //! - [`FocusEvent`] 仅类型面，无派发点（K10 焦点模型补）；无 pointer capture /
 //!   合成事件 / IME（本轮明确不做）。
-//! - 微任务队列只留接口空位（K5 填充），见 [`EventLoop`] 模块文档。
+//! - 微任务队列已落地（`jsrt` feature）：DOM 微任务在 `EventLoop` 预留位上执行
+//!   （`run_microtasks` / `TaskContext::post_microtask`），与引擎微任务源在每个
+//!   检查点交替清空，见 [`EventLoop`] 模块文档与 `jsrt` 模块。
 
 mod data;
 mod event_loop;
@@ -185,6 +187,24 @@ impl Event {
         if self.cancelable {
             self.default_prevented = true;
         }
+    }
+
+    /// 传播停止标志（crate 内部：`jsrt` 模块的派发算法读取）。
+    #[cfg(feature = "jsrt")]
+    pub(crate) fn is_propagation_stopped(&self) -> bool {
+        self.stop_propagation_flag
+    }
+
+    /// 当前节点剩余监听器终止标志（crate 内部：`jsrt` 模块的派发算法读取）。
+    #[cfg(feature = "jsrt")]
+    pub(crate) fn is_immediate_propagation_stopped(&self) -> bool {
+        self.stop_immediate_propagation_flag
+    }
+
+    /// 设置派发阶段（crate 内部：`jsrt` 模块的派发算法推进三阶段）。
+    #[cfg(feature = "jsrt")]
+    pub(crate) fn set_dispatch_phase(&mut self, phase: EventPhase) {
+        self.phase = phase;
     }
 }
 

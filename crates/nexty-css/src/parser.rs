@@ -43,8 +43,9 @@ use crate::value::{
     TextDecorationStyleValue, parse_background_image_value, parse_border_color_value,
     parse_border_radius_value, parse_border_style_value, parse_border_width_value, parse_color,
     parse_css_wide_keyword, parse_declared_value, parse_font_shorthand, parse_gap_value,
-    parse_inset_value, parse_margin_value, parse_padding_value, parse_text_decoration_color_value,
-    parse_text_decoration_line_value, parse_text_decoration_style_value,
+    parse_inset_value, parse_margin_value, parse_overflow, parse_padding_value,
+    parse_text_decoration_color_value, parse_text_decoration_line_value,
+    parse_text_decoration_style_value,
 };
 use cssparser::{
     AtRuleParser, DeclarationParser, ParseError, Parser, QualifiedRuleParser, RuleBodyItemParser,
@@ -986,6 +987,47 @@ fn expand_shorthand(name: &str, input: &mut Parser<'_>) -> Option<Result<Shortha
         return Some(parse_gap_shorthand(input));
     }
 
+    // overflow 简写：<visual-value>{1,2}（CSS Overflow 3 §3：1 值双轴同值，
+    // 2 值第 1 个为 overflow-x、第 2 个为 overflow-y）。
+    if name.eq_ignore_ascii_case("overflow") {
+        if let Ok(keyword) = input.try_parse(parse_css_wide_keyword) {
+            let important = input.try_parse(cssparser::parse_important).is_ok();
+            if input.expect_exhausted().is_err() {
+                return Some(Err(()));
+            }
+            let longhands = [PropertyId::OverflowX, PropertyId::OverflowY];
+            return Some(Ok((
+                longhands
+                    .into_iter()
+                    .map(|property| (property, DeclaredValue::CssWide(keyword)))
+                    .collect(),
+                important,
+            )));
+        }
+        let expanded = parse_overflow(input).map(|x| {
+            // 1 值：缺省的 y 轴取同值；2 值：第 1 个 = x，第 2 个 = y
+            let y = input.try_parse(parse_overflow).unwrap_or(x);
+            (x, y)
+        });
+        let important = input.try_parse(cssparser::parse_important).is_ok();
+        if input.expect_exhausted().is_err() {
+            return Some(Err(()));
+        }
+        let declarations = expanded.map(|(x, y)| {
+            vec![
+                (
+                    PropertyId::OverflowX,
+                    DeclaredValue::Typed(PropertyValue::Overflow(x)),
+                ),
+                (
+                    PropertyId::OverflowY,
+                    DeclaredValue::Typed(PropertyValue::Overflow(y)),
+                ),
+            ]
+        });
+        return Some(declarations.map(|declarations| (declarations, important)));
+    }
+
     // text-decoration 简写：<'text-decoration-line'> || <'text-decoration-style'>
     // || <'text-decoration-color'>（CSS Text Decoration 3 §3.3 基础档；缺省成分
     // 重置为 initial——line none / style solid / color currentcolor。thickness
@@ -1466,7 +1508,7 @@ mod tests {
     use super::*;
     use crate::value::{
         BorderColorValue, BorderStyle, BorderWidthValue, CssWideKeyword, FontSizeValue,
-        LineHeightValue, MarginValue, PaddingValue, PropertyValue, Rgba, SizeValue,
+        LineHeightValue, MarginValue, OverflowValue, PaddingValue, PropertyValue, Rgba, SizeValue,
     };
 
     fn rule_texts(sheet: &Stylesheet) -> Vec<&str> {
@@ -1915,6 +1957,68 @@ mod tests {
                 "{css} should drop the declaration"
             );
         }
+    }
+
+    // ---- overflow 简写（CSS Overflow 3 §3，K6） ----
+
+    #[test]
+    fn overflow_shorthand_expands_to_both_axes() {
+        // 1 值：双轴同值
+        let sheet = Stylesheet::parse("p { overflow: hidden }");
+        for axis in [PropertyId::OverflowX, PropertyId::OverflowY] {
+            assert_eq!(
+                declaration_of(&sheet, 0, axis).value,
+                DeclaredValue::Typed(PropertyValue::Overflow(OverflowValue::Hidden))
+            );
+        }
+        // 2 值：第 1 个 = x 轴，第 2 个 = y 轴
+        let sheet = Stylesheet::parse("p { overflow: hidden scroll }");
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::OverflowX).value,
+            DeclaredValue::Typed(PropertyValue::Overflow(OverflowValue::Hidden))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::OverflowY).value,
+            DeclaredValue::Typed(PropertyValue::Overflow(OverflowValue::Scroll))
+        );
+    }
+
+    #[test]
+    fn overflow_shorthand_css_wide_keyword_applies_to_both_axes() {
+        let sheet = Stylesheet::parse("p { overflow: inherit !important }");
+        for axis in [PropertyId::OverflowX, PropertyId::OverflowY] {
+            let declaration = declaration_of(&sheet, 0, axis);
+            assert_eq!(
+                declaration.value,
+                DeclaredValue::CssWide(CssWideKeyword::Inherit)
+            );
+            assert!(declaration.important);
+        }
+    }
+
+    #[test]
+    fn overflow_shorthand_invalid_value_dropped_entirely() {
+        // 任一轴无效整条丢弃（声明级恢复），不产生半份展开
+        let sheet = Stylesheet::parse("p { overflow: hidden clip; color: red }");
+        let properties: Vec<PropertyId> = sheet.rules()[0]
+            .declarations()
+            .iter()
+            .map(|d| d.property)
+            .collect();
+        assert_eq!(properties, vec![PropertyId::Color]);
+    }
+
+    #[test]
+    fn overflow_longhands_parse_independently() {
+        let sheet = Stylesheet::parse("p { overflow-x: auto; overflow-y: hidden }");
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::OverflowX).value,
+            DeclaredValue::Typed(PropertyValue::Overflow(OverflowValue::Auto))
+        );
+        assert_eq!(
+            declaration_of(&sheet, 0, PropertyId::OverflowY).value,
+            DeclaredValue::Typed(PropertyValue::Overflow(OverflowValue::Hidden))
+        );
     }
 
     // ---- font 简写（CSS Fonts 4 §3.3） ----

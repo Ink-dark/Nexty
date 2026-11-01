@@ -14,8 +14,10 @@
 //!
 //! 基线结论入 `docs/2026-10-25-perf-baseline.md`。
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hint::black_box;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -102,7 +104,11 @@ impl Corpus {
     fn once(&self, shaper: &CountingShaper) {
         let document = nexty_html::parse_document(&self.html, ParseOptions::default());
         let sheet = Stylesheet::parse(&self.css);
-        let mut page = pipeline::build_page(document, vec![sheet], self.images.clone());
+        let mut page = pipeline::build_page(
+            Rc::new(RefCell::new(document)),
+            vec![sheet],
+            self.images.clone(),
+        );
         pipeline::recascade(&mut page, VIEWPORT);
         let root = pipeline::layout_page(&page, shaper, VIEWPORT.width).expect("layout");
         black_box(pipeline::build_scene_at_with_highlights(
@@ -132,7 +138,8 @@ impl Corpus {
             let start = Instant::now();
             let sheet = Stylesheet::parse(&self.css);
             // build_page 的级联 + recascade 的视口级联：首屏共两次全量级联
-            let mut page = pipeline::build_page(document, vec![sheet], owned_images);
+            let mut page =
+                pipeline::build_page(Rc::new(RefCell::new(document)), vec![sheet], owned_images);
             pipeline::recascade(&mut page, VIEWPORT);
             cascade_samples.push(ms(start.elapsed()));
 
@@ -160,7 +167,11 @@ impl Corpus {
     fn resize_storm(&self, shaper: &CountingShaper) -> (f64, usize, usize, usize, usize, usize) {
         let document = nexty_html::parse_document(&self.html, ParseOptions::default());
         let sheet = Stylesheet::parse(&self.css);
-        let mut page = pipeline::build_page(document, vec![sheet], self.images.clone());
+        let mut page = pipeline::build_page(
+            Rc::new(RefCell::new(document)),
+            vec![sheet],
+            self.images.clone(),
+        );
         pipeline::recascade(&mut page, VIEWPORT);
         pipeline::layout_page(&page, shaper, VIEWPORT.width).expect("layout");
 
@@ -212,7 +223,11 @@ impl Corpus {
     fn scroll_storm(&self, shaper: &CountingShaper, frames: usize) -> (f64, f64, usize) {
         let document = nexty_html::parse_document(&self.html, ParseOptions::default());
         let sheet = Stylesheet::parse(&self.css);
-        let mut page = pipeline::build_page(document, vec![sheet], self.images.clone());
+        let mut page = pipeline::build_page(
+            Rc::new(RefCell::new(document)),
+            vec![sheet],
+            self.images.clone(),
+        );
         pipeline::recascade(&mut page, VIEWPORT);
         let root = pipeline::layout_page(&page, shaper, VIEWPORT.width).expect("layout");
         let content_height = root.border_box.height;
@@ -280,7 +295,11 @@ fn run() {
         let document = nexty_html::parse_document(&corpus.html, ParseOptions::default());
         let chunks = count_text_nodes(&document);
         let sheet = Stylesheet::parse(&corpus.css);
-        let mut page = pipeline::build_page(document, vec![sheet], corpus.images.clone());
+        let mut page = pipeline::build_page(
+            Rc::new(RefCell::new(document)),
+            vec![sheet],
+            corpus.images.clone(),
+        );
         pipeline::recascade(&mut page, VIEWPORT);
         shaper.reset();
         let _ = pipeline::layout_page(&page, &shaper, VIEWPORT.width).expect("layout");

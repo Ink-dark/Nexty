@@ -15,8 +15,9 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use nexty_paint::{Color, Command, Rect, Scene, TextGlyph};
+use nexty_paint::{Color, Command, Image, Rect, Scene, TextGlyph};
 use nexty_text::{ShapedText, TextShaper, TextStyle};
 
 /// 工具带高度，px。
@@ -46,6 +47,10 @@ const SELECTION_COLOR: Color = Color {
 const CARET_WIDTH: f32 = 1.0;
 /// 光标距输入框上下缘的留白，px。
 const CARET_INSET: f32 = 3.0;
+/// favicon 图标槽边长（K13 T2）：地址栏左侧 16×16。
+const FAVICON_SIZE: f32 = 16.0;
+/// favicon 槽与输入框左缘 / URL 文本的间距，px。
+const FAVICON_INSET: f32 = 4.0;
 
 /// 工具带按钮（从左到右）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,6 +221,9 @@ pub struct AddressBar {
     /// URL 整形缓存（M7）：键为 URL 文本 + 字号（样式固定），URL 未变
     /// 不 reshape；光标/选区前缀宽度从缓存字形按 cluster 前缀累加。
     url_cache: RefCell<Option<UrlShapeCache>>,
+    /// 当前页 favicon（K13 T2）：页面装配后由外壳设置；`None` = 无图标或
+    /// 未就绪，不占位（文本从原位起，行为不变）。
+    favicon: Option<Arc<Image>>,
 }
 
 /// URL 整形缓存的条目。
@@ -301,6 +309,7 @@ impl AddressBar {
             },
             button_cache: RefCell::new(HashMap::new()),
             url_cache: RefCell::new(None),
+            favicon: None,
         }
     }
 
@@ -340,6 +349,14 @@ impl AddressBar {
     pub fn set_history(&mut self, can_back: bool, can_forward: bool) {
         self.can_back = can_back;
         self.can_forward = can_forward;
+    }
+
+    /// 设置当前页 favicon（K13 T2，外壳在页面装配 / favicon 就绪时调用）。
+    ///
+    /// `None` 清空图标槽（导航到无图标页面 / 抓取失败）；像素按 `Arc`
+    /// 共享，不复制（与页面图片同一共享语义）。
+    pub fn set_favicon(&mut self, favicon: Option<Arc<Image>>) {
+        self.favicon = favicon;
     }
 
     /// 取消聚焦并清空选区（Esc）。
@@ -554,7 +571,33 @@ impl AddressBar {
             width: 1.5,
         });
 
+        // favicon 图标槽（K13 T2）：16×16 画在输入框左缘内侧，走页面同款
+        // DrawImage 路径（像素进资源池按 Arc 共享）；无图标不占位。
+        if let Some(image) = &self.favicon {
+            let slot = Rect {
+                x: input.x + FAVICON_INSET,
+                y: input.y + (input.height - FAVICON_SIZE) / 2.0,
+                width: FAVICON_SIZE,
+                height: FAVICON_SIZE,
+            };
+            let index = scene.images.len();
+            scene.images.push(Arc::clone(image));
+            scene.commands.push(Command::DrawImage {
+                rect: slot,
+                image: index,
+            });
+        }
+
         self.draw_text(shaper, scene, style, input);
+    }
+
+    /// URL 文本的左缘留白：有 favicon 时右移让出图标槽（图标 + 间距）。
+    fn text_left_padding(&self) -> f32 {
+        if self.favicon.is_some() {
+            TEXT_PADDING + FAVICON_SIZE + FAVICON_INSET
+        } else {
+            TEXT_PADDING
+        }
     }
 
     /// 按钮字形的缓存读取（M7）：常量字符一次整形，后续帧直接复用。
@@ -590,7 +633,7 @@ impl AddressBar {
         let Some(shaped) = self.cached_url_glyph(shaper, style) else {
             return;
         };
-        let max_width = (input.width - 2.0 * TEXT_PADDING).max(0.0);
+        let max_width = (input.width - self.text_left_padding() - TEXT_PADDING).max(0.0);
         let caret_x = prefix_width(&shaped, self.caret);
         // 横向滚动：把光标保持在输入框内
         let offset = if shaped.width > max_width {
@@ -605,7 +648,7 @@ impl AddressBar {
         } else {
             0.0
         };
-        let origin_x = input.x + TEXT_PADDING - offset;
+        let origin_x = input.x + self.text_left_padding() - offset;
         let baseline = input.y + input.height - 8.0;
 
         // 选区高亮（画在文本之下），夹取到输入框内
@@ -1121,6 +1164,102 @@ mod tests {
         assert_eq!(strokes, 1, "输入框描边");
         // URL 文本 + 两个可用按钮字形
         assert_eq!(texts, 3);
+    }
+
+    /// URL 文本的首个字形 x（按钮字形在输入框左侧，URL 字形 x ≥ input.x）。
+    fn url_text_origin(scene: &Scene, viewport_width: f32) -> Option<f32> {
+        let input_x = input_rect(viewport_width).x;
+        let mut origin: Option<f32> = None;
+        for command in &scene.commands {
+            if let Command::DrawText { glyphs, .. } = command {
+                for glyph in glyphs {
+                    if glyph.x >= input_x && origin.is_none_or(|current| glyph.x < current) {
+                        origin = Some(glyph.x);
+                    }
+                }
+            }
+        }
+        origin
+    }
+
+    /// K13 T2：favicon 图标槽——有图标画 16×16 DrawImage 且 URL 文本右移；
+    /// 无图标不占位（文本原位，无 DrawImage）；清槽后恢复。
+    #[test]
+    fn draw_favicon_slot_places_16px_image_and_shifts_url_text() {
+        let shaper = ParleyTextShaper::new();
+        let mut bar = AddressBar::new("example.test");
+
+        // 无 favicon：无 DrawImage，文本从 TEXT_PADDING 起
+        let mut scene = Scene::default();
+        bar.draw(&shaper, &mut scene, 400.0);
+        assert!(
+            !scene
+                .commands
+                .iter()
+                .any(|command| matches!(command, Command::DrawImage { .. })),
+            "无图标不画槽位"
+        );
+        let base_x = url_text_origin(&scene, 400.0).expect("URL 文本存在");
+        let input = input_rect(400.0);
+        assert_eq!(base_x, input.x + TEXT_PADDING, "无图标时文本从原位起");
+
+        // 有 favicon：一条 16×16 DrawImage，槽在输入框内左缘，文本右移
+        let image = Arc::new(Image::new(
+            16,
+            16,
+            vec![255, 136, 0, 255]
+                .into_iter()
+                .cycle()
+                .take(16 * 16 * 4)
+                .collect(),
+        ));
+        bar.set_favicon(Some(image.clone()));
+        let mut scene = Scene::default();
+        bar.draw(&shaper, &mut scene, 400.0);
+        let slots: Vec<_> = scene
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::DrawImage { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(slots.len(), 1, "恰好一个图标槽");
+        assert_eq!(
+            (slots[0].x, slots[0].y, slots[0].width, slots[0].height),
+            (
+                input.x + FAVICON_INSET,
+                input.y + (input.height - FAVICON_SIZE) / 2.0,
+                FAVICON_SIZE,
+                FAVICON_SIZE
+            ),
+            "槽为输入框左缘内 16×16"
+        );
+        assert_eq!(scene.images.len(), 1);
+        assert!(Arc::ptr_eq(&scene.images[0], &image), "像素 Arc 共享");
+        let shifted_x = url_text_origin(&scene, 400.0).expect("URL 文本存在");
+        assert_eq!(
+            shifted_x,
+            base_x + FAVICON_SIZE + FAVICON_INSET,
+            "URL 文本右移让出图标槽"
+        );
+
+        // 清槽：恢复原位，无 DrawImage
+        bar.set_favicon(None);
+        let mut scene = Scene::default();
+        bar.draw(&shaper, &mut scene, 400.0);
+        assert!(
+            !scene
+                .commands
+                .iter()
+                .any(|command| matches!(command, Command::DrawImage { .. })),
+            "清槽后不画图标"
+        );
+        assert_eq!(
+            url_text_origin(&scene, 400.0),
+            Some(base_x),
+            "清槽后文本回原位"
+        );
     }
 
     /// 选区高亮与光标互斥：有选区画高亮带，无选区画光标竖线。

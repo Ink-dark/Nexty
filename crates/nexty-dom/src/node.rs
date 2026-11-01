@@ -16,6 +16,16 @@ impl NodeId {
     pub fn index(self) -> usize {
         self.0
     }
+
+    /// 由 arena 索引构造节点身份。
+    ///
+    /// JSRT 绑定面以数值在引擎与 DOM 之间传递节点身份（T1 `jsrt` 接缝）。
+    /// 非法索引不会立即失稳：`Document` 的访问方法对越界索引统一返回
+    /// `None` / [`DomError::NotFound`]。
+    #[must_use]
+    pub fn from_index(index: usize) -> Self {
+        Self(index)
+    }
 }
 
 /// 元素或属性的命名空间。

@@ -19,16 +19,28 @@
 //! border-width 不等时圆角边框降级直角填充带；text-decoration 按文本 run
 //! 自身元素的 computed style 绘制（规范的祖先「传播」未实现，css 层偏差；
 //! 跨行内元素边界按 run 分段断线）、非 solid 不画、度量用经验值
-//! （0.06em 厚 / underline 基线下 0.08em，无字体 underline 数据）；
-//! 片段树不做滚动裁剪。
+//! （0.06em 厚 / underline 基线下 0.08em，无字体 underline 数据）。
+//!
+//! **容器滚动与裁剪（K6）**：滚动/裁剪容器（任一轴 overflow ≠ visible）的
+//! 内容经 `PushClip`/`PopClip` 裁到 padding box；滚动偏移存于
+//! [`Page::scroll_offsets`]（NodeId → scrollTop），**绘制期施加**（内容平移）、
+//! 不参与布局（layout 层契约）。视口滚动仍是 `Scene::translated` 整体平移
+//! （零 emit 不变量）；容器滚动经页面代次推进使场景缓存重建（记偏差）。
+//! 命中测试按可见内容逆映射（[`hit_test_scrolled`]）；滚动条区域与滚轮链
+//! 由 [`collect_container_scroll_areas`] / [`scroll_chain_at`] 提供。偏差：
+//! 横向滚动未建模（wheel deltaX 忽略）；选区命中/端点解析不感知容器滚动
+//! （点击滚动容器内的文本会偏移 scrollTop，高亮绘制跟随内容）；hidden
+//! 容器不可编程滚动；退化 padding box 不发裁剪。
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use nexty_css::{
     BackgroundImageValue, BorderRadiusValue, ComputedStyle, GradientColorStop, MediaViewport,
-    PositionValue, Rgba, Stylesheet, TextDecorationLineValue, TextDecorationStyleValue,
-    ZIndexValue, html_ua_stylesheet,
+    OverflowValue, PositionValue, Rgba, Stylesheet, TextDecorationLineValue,
+    TextDecorationStyleValue, ZIndexValue, html_ua_stylesheet,
 };
 use nexty_dom::{Document, Event, EventLoop, NodeId, Task, TaskContext};
 use nexty_html::ParseOptions;
@@ -38,8 +50,9 @@ use nexty_text::TextShaper;
 
 /// 一个已解析、已级联的页面。
 pub struct Page {
-    /// arena 文档。
-    pub document: Document,
+    /// arena 文档（Rc 共享：JSRT 脚本会话与页面共用同一棵树，K5 T3——
+    /// ADR `docs/decisions/2026-10-31-jsrt.md`「页面与引擎同生共死」）。
+    pub document: Rc<RefCell<Document>>,
     /// 各元素的 computed style。
     pub styles: HashMap<NodeId, ComputedStyle>,
     /// 作者样式表（视口变化后重级联用；UA 样式表固定不存）。
@@ -50,6 +63,11 @@ pub struct Page {
     /// 已解码图片（`<img>` 节点 → RGBA 图像），构建 Scene 时进入图片池。
     /// 按 `Arc` 共享：构建/发送/光栅全程零像素拷贝（M1）。
     pub images: HashMap<NodeId, Arc<Image>>,
+    /// 容器滚动偏移（K6）：滚动容器 NodeId → scrollTop（纵向 px，≥0）。
+    /// 滚动与布局解耦：布局输出不含偏移，绘制期施加；重排后经
+    /// [`clamp_scroll_offsets`] 保留并夹取（scrollTop 语义）。导航换页随
+    /// Page 重建归零。
+    pub scroll_offsets: HashMap<NodeId, f32>,
 }
 
 /// 用已解析文档与作者样式表构建页面（UA 样式表固定为 nexty-css 的 HTML 默认）。
@@ -61,14 +79,14 @@ pub struct Page {
 /// 实际视口走 [`recascade`]（后台线程拿不到窗口尺寸）。
 #[must_use]
 pub fn build_page(
-    document: Document,
+    document: Rc<RefCell<Document>>,
     stylesheets: Vec<Stylesheet>,
     images: HashMap<NodeId, Arc<Image>>,
 ) -> Page {
     let sheet_refs: Vec<&Stylesheet> = stylesheets.iter().collect();
     let mut inline_style_cache = nexty_css::InlineStyleCache::new();
     let styles = nexty_css::compute_document_styles_in_with_cache(
-        &document,
+        &document.borrow(),
         &sheet_refs,
         Some(html_ua_stylesheet()),
         None,
@@ -80,6 +98,7 @@ pub fn build_page(
         stylesheets,
         inline_style_cache,
         images,
+        scroll_offsets: HashMap::new(),
     }
 }
 
@@ -88,7 +107,7 @@ pub fn build_page(
 pub fn recascade(page: &mut Page, viewport: MediaViewport) {
     let sheet_refs: Vec<&Stylesheet> = page.stylesheets.iter().collect();
     page.styles = nexty_css::compute_document_styles_in_with_cache(
-        &page.document,
+        &page.document.borrow(),
         &sheet_refs,
         Some(html_ua_stylesheet()),
         Some(viewport),
@@ -99,7 +118,10 @@ pub fn recascade(page: &mut Page, viewport: MediaViewport) {
 /// 解析并级联一份页面（单张作者样式表，无图片——内部页/空白页用）。
 #[must_use]
 pub fn load_page(html: &str, author_css: &str) -> Page {
-    let document = nexty_html::parse_document(html, ParseOptions::default());
+    let document = Rc::new(RefCell::new(nexty_html::parse_document(
+        html,
+        ParseOptions::default(),
+    )));
     let sheet = Stylesheet::parse(author_css);
     build_page(document, vec![sheet], HashMap::new())
 }
@@ -165,7 +187,7 @@ pub fn layout_page(page: &Page, shaper: &dyn TextShaper, viewport_width: f32) ->
         .map(|(node, image)| (*node, (image.width as f32, image.height as f32)))
         .collect();
     nexty_layout::layout_document(
-        &page.document,
+        &page.document.borrow(),
         shaper,
         &page.styles,
         &image_sizes,
@@ -367,12 +389,60 @@ fn emit(
         }
     }
 
-    // 内容盒原点：子片段与文本行的参照
+    // 内容盒原点：子片段与文本行的参照。滚动容器（K6）在绘制期施加滚动
+    // 偏移：内容整体上移 scrollTop（偏移不参与布局，见模块文档契约）。
     let content_x = x + fragment.border.left + fragment.padding.left;
     let content_y = y + fragment.border.top + fragment.padding.top;
 
+    // K6 滚动/裁剪容器（CSS Overflow §3）：内容裁到 padding box；容器自身
+    // 背景与边框不裁不移。退化 padding box 不发裁剪——paint 层对非法矩形
+    // 跳过 push，发端不发才能保证 PushClip/PopClip 配对（否则配对的
+    // PopClip 会弹掉外层裁剪）。
+    let scroll_offset = if fragment.scrollable {
+        page.scroll_offsets
+            .get(&fragment.node)
+            .copied()
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    let clip_rect = PaintRect {
+        x: x + fragment.border.left,
+        y: y + fragment.border.top,
+        width: width - fragment.border.left - fragment.border.right,
+        height: height - fragment.border.top - fragment.border.bottom,
+    };
+    let clipped = (fragment.scrollable
+        || matches!(style.overflow_x, OverflowValue::Hidden)
+        || matches!(style.overflow_y, OverflowValue::Hidden))
+        && clip_rect.x.is_finite()
+        && clip_rect.y.is_finite()
+        && clip_rect.width.is_finite()
+        && clip_rect.height.is_finite()
+        && clip_rect.width > 0.0
+        && clip_rect.height > 0.0;
+    let content_y = content_y - scroll_offset;
+    if clipped {
+        scene.commands.push(Command::PushClip { rect: clip_rect });
+    }
+    // 选区高亮按未滚动布局坐标计算（TextMap 基于布局片段树）：容器滚动后
+    // 高亮随内容一起平移（y - scrollTop），保持与行盒对齐。
+    let highlights_storage: Vec<LayoutRect>;
+    let highlights: &[LayoutRect] = if scroll_offset != 0.0 {
+        highlights_storage = highlights
+            .iter()
+            .map(|rect| LayoutRect {
+                y: rect.y - scroll_offset,
+                ..*rect
+            })
+            .collect();
+        &highlights_storage
+    } else {
+        highlights
+    };
+
     // 块级替换元素（`<img>` display:block）：内容盒即图片矩形
-    if is_image_node(&page.document, fragment.node) {
+    if is_image_node(&page.document.borrow(), fragment.node) {
         draw_image_at(
             page,
             fragment.node,
@@ -523,6 +593,10 @@ fn emit(
             highlights,
             canvas_source,
         );
+    }
+
+    if clipped {
+        scene.commands.push(Command::PopClip);
     }
 }
 
@@ -702,17 +776,18 @@ fn has_background(style: &ComputedStyle) -> bool {
 fn find_html_element(page: &Page, name: &str) -> Option<NodeId> {
     use nexty_dom::{Namespace, NodeKind};
     fn walk(page: &Page, node: NodeId, name: &str) -> Option<NodeId> {
-        if let Some(NodeKind::Element(data)) = page.document.node(node)
+        if let Some(NodeKind::Element(data)) = page.document.borrow().node(node)
             && data.namespace == Namespace::Html
             && data.name == name
         {
             return Some(node);
         }
         page.document
+            .borrow()
             .children(node)
             .find_map(|child| walk(page, child, name))
     }
-    walk(page, page.document.root(), name)
+    walk(page, page.document.borrow().root(), name)
 }
 
 /// CSS 2.2 §14.2 的画布背景传播源：html 携带背景用 html，否则 body，
@@ -829,7 +904,7 @@ pub enum HoverKind {
 /// 链接触发优先于文本：命中节点的祖先链上存在带 `href` 的 `<a>` 即为链接。
 #[must_use]
 pub fn hover_kind(page: &Page, root: &Fragment, x: f32, y: f32) -> HoverKind {
-    let Some(hit) = hit_test_ex(root, x, y) else {
+    let Some(hit) = hit_test_scrolled(root, x, y, &page.scroll_offsets) else {
         return HoverKind::Default;
     };
     if link_target(page, hit.node).is_some() {
@@ -849,7 +924,20 @@ pub fn hover_kind(page: &Page, root: &Fragment, x: f32, y: f32) -> HoverKind {
 /// 更深层时返回本盒节点。
 #[must_use]
 pub fn hit_test_ex(root: &Fragment, x: f32, y: f32) -> Option<Hit> {
-    hit_fragment(root, 0.0, 0.0, x, y)
+    hit_test_scrolled(root, x, y, &HashMap::new())
+}
+
+/// 命中测试（K6）：同 [`hit_test_ex`]，但计入容器滚动偏移——`offsets` 为
+/// [`Page::scroll_offsets`]，滚动容器内容按「可见位置」逆映射（与绘制
+/// 坐标一致）：屏幕点命中的是滚动后实际显示的内容。
+#[must_use]
+pub fn hit_test_scrolled(
+    root: &Fragment,
+    x: f32,
+    y: f32,
+    offsets: &HashMap<NodeId, f32>,
+) -> Option<Hit> {
+    hit_fragment(root, 0.0, 0.0, x, y, offsets)
 }
 
 /// 命中测试：只取命中的节点（[`hit_test_ex`] 的薄封装）。
@@ -858,8 +946,16 @@ pub fn hit_test(root: &Fragment, x: f32, y: f32) -> Option<NodeId> {
     hit_test_ex(root, x, y).map(|hit| hit.node)
 }
 
-/// `hit_test_ex` 的递归体：`(ox, oy)` 为父链累积的本片段边框盒原点。
-fn hit_fragment(fragment: &Fragment, ox: f32, oy: f32, x: f32, y: f32) -> Option<Hit> {
+/// `hit_test_ex` 的递归体：`(ox, oy)` 为父链累积的本片段边框盒原点（已含
+/// 祖先滚动平移）；`offsets` 是容器滚动偏移表（K6）。
+fn hit_fragment(
+    fragment: &Fragment,
+    ox: f32,
+    oy: f32,
+    x: f32,
+    y: f32,
+    offsets: &HashMap<NodeId, f32>,
+) -> Option<Hit> {
     let bx = ox + fragment.border_box.x;
     let by = oy + fragment.border_box.y;
     if x < bx || x > bx + fragment.border_box.width || y < by || y > by + fragment.border_box.height
@@ -868,6 +964,13 @@ fn hit_fragment(fragment: &Fragment, ox: f32, oy: f32, x: f32, y: f32) -> Option
     }
     let content_x = bx + fragment.border.left + fragment.padding.left;
     let content_y = by + fragment.border.top + fragment.padding.top;
+    // 滚动容器（K6）：内容绘制在 `content_y - scrollTop`，命中逆映射同式
+    let content_y = content_y
+        - if fragment.scrollable {
+            offsets.get(&fragment.node).copied().unwrap_or(0.0)
+        } else {
+            0.0
+        };
 
     // 行内内容按行堆叠（与 emit 的行偏移累加一致）
     let mut line_offset = 0.0_f32;
@@ -905,7 +1008,7 @@ fn hit_fragment(fragment: &Fragment, ox: f32, oy: f32, x: f32, y: f32) -> Option
                 }
             }
             for atomic in &line.boxes {
-                if let Some(hit) = hit_fragment(atomic, content_x, line_y, x, y) {
+                if let Some(hit) = hit_fragment(atomic, content_x, line_y, x, y, offsets) {
                     return Some(hit);
                 }
             }
@@ -914,7 +1017,7 @@ fn hit_fragment(fragment: &Fragment, ox: f32, oy: f32, x: f32, y: f32) -> Option
     }
 
     for child in &fragment.children {
-        if let Some(hit) = hit_fragment(child, content_x, content_y, x, y) {
+        if let Some(hit) = hit_fragment(child, content_x, content_y, x, y, offsets) {
             return Some(hit);
         }
     }
@@ -932,7 +1035,7 @@ pub fn link_target(page: &Page, node: NodeId) -> Option<String> {
     use nexty_dom::{Namespace, NodeKind};
     let mut current = Some(node);
     while let Some(id) = current {
-        if let Some(NodeKind::Element(data)) = page.document.node(id)
+        if let Some(NodeKind::Element(data)) = page.document.borrow().node(id)
             && data.namespace == Namespace::Html
             && data.name == "a"
         {
@@ -947,7 +1050,7 @@ pub fn link_target(page: &Page, node: NodeId) -> Option<String> {
             }
             return Some(href);
         }
-        current = page.document.parent(id);
+        current = page.document.borrow().parent(id);
     }
     None
 }
@@ -1131,6 +1234,134 @@ impl SceneCache {
     }
 }
 
+/// 一个可滚动容器的滚动条区域信息（K6）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContainerScrollArea {
+    /// 容器元素节点（滚动偏移键）。
+    pub node: NodeId,
+    /// padding box（页面坐标；轨道贴其右缘、纵向贯穿）。退化（宽或高 ≤ 0）
+    /// 的容器无滚动条但仍在列表中（max_scroll 以布局结果为准）。
+    pub padding_box: LayoutRect,
+    /// 当前 scrollTop（[`Page::scroll_offsets`] 查不到时为 0）。
+    pub scroll: f32,
+    /// 最大 scrollTop：scrollable overflow 底缘超出 padding box 底缘的部分。
+    pub max_scroll: f32,
+}
+
+/// 收集滚动容器的滚动条区域（K6）：整树遍历，外→内排列（命中测试应逆序）；
+/// 只含 `max_scroll > 0` 的滚动容器（无滚动空间的容器不参与交互）。嵌套
+/// 坐标按当前滚动偏移换算（与绘制/命中一致）。
+#[must_use]
+pub fn collect_container_scroll_areas(
+    root: &Fragment,
+    offsets: &HashMap<NodeId, f32>,
+) -> Vec<ContainerScrollArea> {
+    fn walk(
+        fragment: &Fragment,
+        ox: f32,
+        oy: f32,
+        offsets: &HashMap<NodeId, f32>,
+        out: &mut Vec<ContainerScrollArea>,
+    ) {
+        let x = ox + fragment.border_box.x;
+        let y = oy + fragment.border_box.y;
+        let scroll = if fragment.scrollable {
+            offsets.get(&fragment.node).copied().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let max = if fragment.scrollable {
+            container_max_scroll(fragment)
+        } else {
+            0.0
+        };
+        if fragment.scrollable && max > 0.0 {
+            out.push(ContainerScrollArea {
+                node: fragment.node,
+                padding_box: LayoutRect {
+                    x: x + fragment.border.left,
+                    y: y + fragment.border.top,
+                    width: (fragment.border_box.width
+                        - fragment.border.left
+                        - fragment.border.right)
+                        .max(0.0),
+                    height: (fragment.border_box.height
+                        - fragment.border.top
+                        - fragment.border.bottom)
+                        .max(0.0),
+                },
+                scroll,
+                max_scroll: max,
+            });
+        }
+        let content_x = x + fragment.border.left + fragment.padding.left;
+        let content_y = y + fragment.border.top + fragment.padding.top - scroll;
+        let mut line_offset = 0.0_f32;
+        for line in &fragment.lines {
+            let line_y = content_y + line_offset;
+            for atomic in &line.boxes {
+                walk(atomic, content_x, line_y, offsets, out);
+            }
+            line_offset += line.height;
+        }
+        for child in &fragment.children {
+            walk(child, content_x, content_y, offsets, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, 0.0, 0.0, offsets, &mut out);
+    out
+}
+
+/// 容器最大 scrollTop（K6，scrollTop 语义）：scrollable overflow 底缘
+/// （相对边框盒）超出 padding box 底缘的部分，下限 0。纵向 only——横向
+/// 滚动未建模（偏差）。
+fn container_max_scroll(fragment: &Fragment) -> f32 {
+    let Some(rect) = fragment.scrollable_overflow else {
+        return 0.0;
+    };
+    let padding_bottom = fragment.border_box.height - fragment.border.bottom;
+    (rect.y + rect.height - padding_bottom).max(0.0)
+}
+
+/// 滚轮链（K6）：点 `(x, y)`（root 原点参照，含滚动换算）下的可滚动容器，
+/// 由内向外排列；条目 `(node, 当前偏移, max_scroll)`，供
+/// `scrollbar::wheel_chain_target` 消费。只含 `max_scroll > 0` 的容器。
+#[must_use]
+pub fn scroll_chain_at(
+    root: &Fragment,
+    x: f32,
+    y: f32,
+    offsets: &HashMap<NodeId, f32>,
+) -> Vec<(NodeId, f32, f32)> {
+    let mut chain: Vec<(NodeId, f32, f32)> = collect_container_scroll_areas(root, offsets)
+        .into_iter()
+        .filter(|area| {
+            let rect = &area.padding_box;
+            x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height
+        })
+        .map(|area| (area.node, area.scroll, area.max_scroll))
+        .collect();
+    chain.reverse();
+    chain
+}
+
+/// 重排后保留并 clamp 容器滚动偏移（K6，scrollTop 语义）：仍有对应可滚
+/// 容器（`max_scroll > 0`）的偏移夹取到新 max；容器不再溢出、变为 hidden
+/// 或节点已消失的条目清除（等价于 scrollTop 被夹到 0 后的干净状态）。
+pub fn clamp_scroll_offsets(root: &Fragment, offsets: &mut HashMap<NodeId, f32>) {
+    let extents: HashMap<NodeId, f32> = collect_container_scroll_areas(root, offsets)
+        .into_iter()
+        .map(|area| (area.node, area.max_scroll))
+        .collect();
+    offsets.retain(|node, _| extents.contains_key(node));
+    for (node, offset) in offsets.iter_mut() {
+        if let Some(max) = extents.get(node) {
+            *offset = offset.min(*max);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1140,7 +1371,10 @@ mod tests {
     /// recascade 按视口折算视口单位：50vw @800×600 → 400px、10vh → 60px。
     #[test]
     fn recascade_resolves_viewport_units() {
-        let document = nexty_html::parse_document("<div></div>", ParseOptions::default());
+        let document = Rc::new(RefCell::new(nexty_html::parse_document(
+            "<div></div>",
+            ParseOptions::default(),
+        )));
         let sheet = Stylesheet::parse("div { width: 50vw; height: 10vh }");
         let mut page = build_page(document, vec![sheet], HashMap::new());
 
@@ -1150,7 +1384,7 @@ mod tests {
             .keys()
             .find(|&&id| {
                 matches!(
-                    page.document.node(id),
+                    page.document.borrow().node(id),
                     Some(NodeKind::Element(data)) if data.name == "div"
                 )
             })

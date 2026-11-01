@@ -8,7 +8,9 @@
 //! （见 AGENTS.md 硬规则「渲染隔离」）。模块分工：
 //!
 //! - [`pipeline`]：HTML 字符串 → 级联 → 布局 → 片段树 → paint 显示列表；
-//! - [`resources`]：子资源（外链 CSS + 图片 + @font-face 字体）清单解析、并发抓取与解码编排；
+//! - [`resources`]：子资源（外链 CSS + 图片 + @font-face 字体 + 外链脚本）清单解析、并发抓取与解码编排；
+//! - [`script`]：页面脚本编排（K5 T3）：ScriptHost 装配、注入钩子（querySelector /
+//!   getComputedStyle 经 nexty-css）、事件间隙任务泵、DOM 变更重排触发；
 //! - [`render`]：渲染隔离线程（panic 兜底，线程存活可继续服务）；
 //! - [`ui`]：自绘工具带状态机（纯逻辑，可测试）；
 //! - [`scrollbar`]：滚动几何与拖拽状态机（纯逻辑，可测试）；
@@ -37,6 +39,8 @@ pub mod pipeline;
 pub mod render;
 #[cfg(feature = "resources")]
 pub mod resources;
+#[cfg(feature = "script")]
+pub mod script;
 #[cfg(feature = "scrollbar")]
 pub mod scrollbar;
 #[cfg(feature = "selection")]

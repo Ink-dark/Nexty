@@ -31,6 +31,11 @@
 //! 与 `<font-width-css3>`（宽度关键字/百分比）——按语法接受后丢弃（无渲染
 //! 效果但声明不整体失效）；系统字体关键字（`caption` / `menu` 等）整条无效。
 //!
+//! K6 overflow（记偏差）：`overflow` 简写展开为 `overflow-x`/`overflow-y`
+//! （1–2 值，第 1 值 = x 轴）；`clip` 关键字暂按无效声明丢弃；
+//! visible→auto 的双轴冲突转换在 cascade computed 阶段施加（CSS Overflow
+//! §3 简化档，见 cascade 模块文档）。
+//!
 //! **Feature**：本模块受 `values` feature 控制（由 lib.rs 装配）。其中的
 //! `parse_*` 逐属性解析函数供 `parser` / `cascade` 模块消费，故当上层 feature
 //! 关闭时这些内部函数没有调用方——此时按模块整体抑制 dead_code。
@@ -127,8 +132,10 @@ pub enum PropertyId {
     MaxHeight,
     /// `box-sizing`。
     BoxSizing,
-    /// `overflow`。
-    Overflow,
+    /// `overflow-x`（CSS Overflow 3 §3.1）。
+    OverflowX,
+    /// `overflow-y`（CSS Overflow 3 §3.2）。
+    OverflowY,
     /// `flex-grow`。
     FlexGrow,
     /// `flex-basis`。
@@ -257,7 +264,8 @@ impl PropertyId {
             PropertyId::MinHeight => "min-height",
             PropertyId::MaxHeight => "max-height",
             PropertyId::BoxSizing => "box-sizing",
-            PropertyId::Overflow => "overflow",
+            PropertyId::OverflowX => "overflow-x",
+            PropertyId::OverflowY => "overflow-y",
             PropertyId::FlexGrow => "flex-grow",
             PropertyId::FlexBasis => "flex-basis",
             PropertyId::Position => "position",
@@ -314,7 +322,7 @@ impl PropertyId {
     /// （CSS Syntax：声明名匹配大小写不敏感）。
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
-        const ALL: [PropertyId; 73] = [
+        const ALL: [PropertyId; 74] = [
             PropertyId::Display,
             PropertyId::Color,
             PropertyId::BackgroundColor,
@@ -338,7 +346,8 @@ impl PropertyId {
             PropertyId::MinHeight,
             PropertyId::MaxHeight,
             PropertyId::BoxSizing,
-            PropertyId::Overflow,
+            PropertyId::OverflowX,
+            PropertyId::OverflowY,
             PropertyId::FlexGrow,
             PropertyId::FlexBasis,
             PropertyId::Position,
@@ -460,7 +469,8 @@ pub enum PropertyValue {
     Size(SizeValue),
     /// `box-sizing` 关键字。
     BoxSizing(BoxSizingValue),
-    /// `overflow` 关键字。
+    /// `overflow-x` / `overflow-y` 关键字（两轴共用同一语法，
+    /// CSS Overflow 3 §3；`overflow` 简写展开为两轴）。
     Overflow(OverflowValue),
     /// `flex-grow` 数值。
     FlexGrow(f32),
@@ -854,17 +864,22 @@ pub enum BoxSizingValue {
     BorderBox,
 }
 
-/// `overflow` 值
-/// （[CSS Overflow 3 §3](https://drafts.csswg.org/css-overflow-3/#overflow-control)）。
+/// `overflow` 单轴值（`overflow-x` / `overflow-y` 共用，
+/// [CSS Overflow 3 §3](https://drafts.csswg.org/css-overflow-3/#overflow-control)）。
 ///
-/// 本层只建模 visible / hidden 的裁剪标记；`auto` / `scroll` / `clip`
-/// 暂按无效声明丢弃（回退 initial `visible`，见模块偏差）。
+/// 建模 visible / hidden / scroll / auto 四值；`clip` 暂按无效声明丢弃
+/// （回退 initial `visible`，见模块偏差）。`visible` 在双轴冲突时的
+/// visible→auto 转换在 computed 阶段施加（cascade）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverflowValue {
     /// `visible`（initial）：内容溢出可见。
     Visible,
-    /// `hidden`：内容裁剪标记（裁剪实现待 paint/layout 接入）。
+    /// `hidden`：内容裁剪，不提供滚动 UI（程序化滚动语义未建模）。
     Hidden,
+    /// `scroll`：内容裁剪且容器可滚动（滚动条空间预留未建模，记偏差）。
+    Scroll,
+    /// `auto`：溢出时可滚动（滚动条出现与否由消费方决定）。
+    Auto,
 }
 
 /// `position` 值
@@ -1339,7 +1354,9 @@ fn parse_property_value(property: PropertyId, input: &mut Parser<'_>) -> Result<
         | PropertyId::MinHeight
         | PropertyId::MaxHeight => parse_size(input).map(PropertyValue::Size),
         PropertyId::BoxSizing => parse_box_sizing(input).map(PropertyValue::BoxSizing),
-        PropertyId::Overflow => parse_overflow(input).map(PropertyValue::Overflow),
+        PropertyId::OverflowX | PropertyId::OverflowY => {
+            parse_overflow(input).map(PropertyValue::Overflow)
+        }
         PropertyId::FlexGrow => parse_flex_grow(input).map(PropertyValue::FlexGrow),
         PropertyId::FlexBasis => parse_size(input).map(PropertyValue::FlexBasis),
         PropertyId::Position => parse_position(input).map(PropertyValue::Position),
@@ -1585,11 +1602,14 @@ fn parse_box_sizing(input: &mut Parser<'_>) -> Result<BoxSizingValue, ()> {
     }
 }
 
-/// `overflow`：visible | hidden（偏差：auto/scroll/clip 暂按无效丢弃）。
-fn parse_overflow(input: &mut Parser<'_>) -> Result<OverflowValue, ()> {
+/// `overflow` 单轴值：visible | hidden | scroll | auto（ASCII case-insensitive；
+/// CSS Overflow 3 §3。偏差：`clip` 暂按无效丢弃，见模块偏差清单）。
+pub(crate) fn parse_overflow(input: &mut Parser<'_>) -> Result<OverflowValue, ()> {
     match input.next().map_err(|_| ())? {
         Token::Ident(name) if name.eq_ignore_ascii_case("visible") => Ok(OverflowValue::Visible),
         Token::Ident(name) if name.eq_ignore_ascii_case("hidden") => Ok(OverflowValue::Hidden),
+        Token::Ident(name) if name.eq_ignore_ascii_case("scroll") => Ok(OverflowValue::Scroll),
+        Token::Ident(name) if name.eq_ignore_ascii_case("auto") => Ok(OverflowValue::Auto),
         _ => Err(()),
     }
 }
@@ -3415,17 +3435,24 @@ mod tests {
         parse_err(PropertyId::BoxSizing, "padding-box");
 
         assert_eq!(
-            parse_one(PropertyId::Overflow, "hidden"),
+            parse_one(PropertyId::OverflowX, "hidden"),
             PropertyValue::Overflow(OverflowValue::Hidden)
         );
         assert_eq!(
-            parse_one(PropertyId::Overflow, "visible"),
+            parse_one(PropertyId::OverflowY, "visible"),
             PropertyValue::Overflow(OverflowValue::Visible)
         );
-        // 偏差：auto/scroll/clip 暂不建模，按无效声明丢弃
-        parse_err(PropertyId::Overflow, "auto");
-        parse_err(PropertyId::Overflow, "scroll");
-        parse_err(PropertyId::Overflow, "clip");
+        assert_eq!(
+            parse_one(PropertyId::OverflowY, "scroll"),
+            PropertyValue::Overflow(OverflowValue::Scroll)
+        );
+        assert_eq!(
+            parse_one(PropertyId::OverflowX, "AUTO"),
+            PropertyValue::Overflow(OverflowValue::Auto)
+        );
+        // 偏差：clip 暂不建模，按无效声明丢弃
+        parse_err(PropertyId::OverflowX, "clip");
+        parse_err(PropertyId::OverflowY, "bogus");
 
         assert_eq!(
             parse_one(PropertyId::MinWidth, "40px"),

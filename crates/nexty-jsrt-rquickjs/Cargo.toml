@@ -1,0 +1,15 @@
+[package]
+name = "nexty-jsrt-rquickjs"
+description = "Nexty JSRT 的 rquickjs（QuickJS-NG）引擎适配层"
+version = "0.1.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# 只需要接缝面（jsrt 隐含 event → tree → node）。
+nexty-dom = { path = "../nexty-dom", version = "0.1.5", default-features = false, features = ["jsrt"] }
+# 引擎绑定（QuickJS-NG）。最小 feature 集：仅默认 std；明确不用 parallel /
+# futures（单线程事件泵，见 ADR docs/decisions/2026-10-31-jsrt.md）。
+rquickjs = "0.14.0"

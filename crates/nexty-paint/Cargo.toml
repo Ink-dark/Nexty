@@ -1,7 +1,7 @@
 [package]
 name = "nexty-paint"
 description = "Nexty 绘制 facade：自有绘制指令 + 可替换光栅后端（CPU 后端已落地，GPU 后端待 chrome 层接入）"
-version = "0.1.8"
+version = "0.1.10"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -30,4 +30,7 @@ image = { version = "0.25.10", default-features = false, optional = true, featur
     "jpeg",
     "gif",
     "webp",
+    # ICO（K13 favicon 路径）：image 的 ico feature 隐含 bmp（同 crate 内置
+    # 编解码器，零新外部依赖），BMP 随之可嗅探解码
+    "ico",
 ] }

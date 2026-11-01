@@ -380,17 +380,17 @@ fn document_title_extraction() {
         "",
     );
     assert_eq!(
-        pipeline::document_title(&page.document).as_deref(),
+        pipeline::document_title(&page.document.borrow()).as_deref(),
         Some("文档标题")
     );
 
     // 空白 title 视为缺失
     let page = pipeline::load_page("<head><title>   </title></head><body></body>", "");
-    assert!(pipeline::document_title(&page.document).is_none());
+    assert!(pipeline::document_title(&page.document.borrow()).is_none());
 
     // 无 title
     let page = pipeline::load_page("<body></body>", "");
-    assert!(pipeline::document_title(&page.document).is_none());
+    assert!(pipeline::document_title(&page.document.borrow()).is_none());
 }
 
 #[test]
@@ -674,7 +674,7 @@ fn subresources_load_and_scene_carries_external_css_and_image() {
 
     // 组装页面 → 布局 → Scene
     let document = nexty_html::parse_document(html, ParseOptions::default());
-    let page = pipeline::build_page(document, sub.stylesheets, sub.images);
+    let page = pipeline::build_page(Rc::new(RefCell::new(document)), sub.stylesheets, sub.images);
     let shaper = ParleyTextShaper::new();
     let root = pipeline::layout_page(&page, &shaper, 400.0).expect("root");
     let scene = pipeline::build_scene(&page, &root);
@@ -746,7 +746,7 @@ fn failing_subresources_degrade_without_blocking_render() {
     assert!(sub.images.is_empty(), "失败图片无像素");
 
     let document = nexty_html::parse_document(html, ParseOptions::default());
-    let page = pipeline::build_page(document, sub.stylesheets, sub.images);
+    let page = pipeline::build_page(Rc::new(RefCell::new(document)), sub.stylesheets, sub.images);
     let shaper = ParleyTextShaper::new();
     let root = pipeline::layout_page(&page, &shaper, 400.0).expect("root");
     let scene = pipeline::build_scene(&page, &root);
@@ -786,7 +786,7 @@ fn image_natural_size_flows_from_decoding_into_layout() {
 
     let (_, sub) = load_page_with_resources(&fetcher, "https://page.test/index.html", html);
     let document = nexty_html::parse_document(html, ParseOptions::default());
-    let page = pipeline::build_page(document, sub.stylesheets, sub.images);
+    let page = pipeline::build_page(Rc::new(RefCell::new(document)), sub.stylesheets, sub.images);
     let shaper = ParleyTextShaper::new();
     let root = pipeline::layout_page(&page, &shaper, 400.0).expect("root");
     let scene = pipeline::build_scene(&page, &root);
@@ -948,7 +948,7 @@ fn hardening_full_chain_body() {
     assert_eq!(nexty_html::collect_image_resources(&document).len(), 1);
 
     // 级联 → 布局 → TextMap：页面可布局且几何全部有限
-    let page = pipeline::build_page(document, sub.stylesheets, sub.images);
+    let page = pipeline::build_page(Rc::new(RefCell::new(document)), sub.stylesheets, sub.images);
     let shaper = ParleyTextShaper::new();
     let root = pipeline::layout_page(&page, &shaper, 400.0).expect("root");
     let text_map = nexty_layout::TextMap::new(&root);
@@ -1009,16 +1009,18 @@ fn lifecycle_events_fire_once_each_in_order_after_signals() {
     );
     assert!(settled, "首轮编排 settle（成功路径）恰触发一次回调");
 
-    let mut page = pipeline::build_page(document, sub.stylesheets, sub.images);
+    let mut page =
+        pipeline::build_page(Rc::new(RefCell::new(document)), sub.stylesheets, sub.images);
     let log: LifecycleLog = Rc::new(RefCell::new(Vec::new()));
-    let root = page.document.root();
-    page.document.add_listener(
+    let root = page.document.borrow().root();
+    page.document.borrow_mut().add_listener(
         root,
         DOM_CONTENT_LOADED,
         false,
         lifecycle_recorder(&log, "dcl"),
     );
     page.document
+        .borrow_mut()
         .add_listener(root, LOAD, false, lifecycle_recorder(&log, "load"));
 
     // 信号齐 → pipeline 单处钩子 post → EventLoop 排空派发
@@ -1030,7 +1032,7 @@ fn lifecycle_events_fire_once_each_in_order_after_signals() {
             load: settled,
         },
     );
-    event_loop.run_pending_tasks(&mut page.document);
+    event_loop.run_pending_tasks(&mut page.document.borrow_mut());
     assert_eq!(
         *log.borrow(),
         ["dcl", "load"],
@@ -1038,7 +1040,7 @@ fn lifecycle_events_fire_once_each_in_order_after_signals() {
     );
 
     // 队列已空：重复排空不重复派发（每页各恰一次）
-    event_loop.run_pending_tasks(&mut page.document);
+    event_loop.run_pending_tasks(&mut page.document.borrow_mut());
     assert_eq!(log.borrow().len(), 2, "排空后无重复派发");
 }
 
@@ -1063,10 +1065,12 @@ fn lifecycle_load_fires_after_settled_degraded_subresources() {
     assert!(settled, "全失败路径 settle 回调仍触发");
     assert!(sub.stylesheets.is_empty() && sub.images.is_empty());
 
-    let mut page = pipeline::build_page(document, sub.stylesheets, sub.images);
+    let mut page =
+        pipeline::build_page(Rc::new(RefCell::new(document)), sub.stylesheets, sub.images);
     let log: LifecycleLog = Rc::new(RefCell::new(Vec::new()));
-    let root = page.document.root();
+    let root = page.document.borrow().root();
     page.document
+        .borrow_mut()
         .add_listener(root, LOAD, false, lifecycle_recorder(&log, "load"));
 
     let mut event_loop = EventLoop::new();
@@ -1077,7 +1081,7 @@ fn lifecycle_load_fires_after_settled_degraded_subresources() {
             load: settled,
         },
     );
-    event_loop.run_pending_tasks(&mut page.document);
+    event_loop.run_pending_tasks(&mut page.document.borrow_mut());
     assert_eq!(*log.borrow(), ["load"], "降级 settle 后 load 恰一次");
 }
 
@@ -1087,19 +1091,20 @@ fn lifecycle_load_fires_after_settled_degraded_subresources() {
 fn lifecycle_events_wait_for_their_signals() {
     let mut page = pipeline::load_page("<body>hi</body>", "");
     let log: LifecycleLog = Rc::new(RefCell::new(Vec::new()));
-    let root = page.document.root();
-    page.document.add_listener(
+    let root = page.document.borrow().root();
+    page.document.borrow_mut().add_listener(
         root,
         DOM_CONTENT_LOADED,
         false,
         lifecycle_recorder(&log, "dcl"),
     );
     page.document
+        .borrow_mut()
         .add_listener(root, LOAD, false, lifecycle_recorder(&log, "load"));
 
     let mut event_loop = EventLoop::new();
     page.post_lifecycle_tasks(&mut event_loop, PendingLifecycle::default());
-    event_loop.run_pending_tasks(&mut page.document);
+    event_loop.run_pending_tasks(&mut page.document.borrow_mut());
     assert!(log.borrow().is_empty(), "无信号不派发");
 
     page.post_lifecycle_tasks(
@@ -1109,7 +1114,7 @@ fn lifecycle_events_wait_for_their_signals() {
             load: false,
         },
     );
-    event_loop.run_pending_tasks(&mut page.document);
+    event_loop.run_pending_tasks(&mut page.document.borrow_mut());
     assert_eq!(*log.borrow(), ["dcl"], "只到解析信号 → 仅 DOMContentLoaded");
 }
 
@@ -1293,7 +1298,11 @@ fn font_face_page_fetches_registers_and_relayouts_exactly_once() {
     let resources = resources::fetch_subresources(&fetcher, base, &document);
     let requests = fonts.collect(&resources.stylesheets, base);
     assert_eq!(requests.len(), 1, "收集到 @font-face 的 url() 源");
-    let page = pipeline::build_page(document, resources.stylesheets, resources.images);
+    let page = pipeline::build_page(
+        Rc::new(RefCell::new(document)),
+        resources.stylesheets,
+        resources.images,
+    );
 
     // 首帧布局：注册表为空 → 系统回退字体（不 panic；字节不是注册字体）
     let root1 = {
@@ -1403,7 +1412,11 @@ fn font_failures_degrade_to_system_fonts_without_panicking() {
         3,
         "url() 源全部收集（格式/预算过滤发生在抓取、注册层）"
     );
-    let page = pipeline::build_page(document, resources.stylesheets, resources.images);
+    let page = pipeline::build_page(
+        Rc::new(RefCell::new(document)),
+        resources.stylesheets,
+        resources.images,
+    );
     let root = {
         layouts += 1;
         pipeline::layout_page(&page, &shaper, 400.0).expect("root")

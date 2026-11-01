@@ -109,6 +109,9 @@ pub(crate) fn layout_root(ctx: &Context<'_>, root: NodeId, viewport_width: f32) 
     let mut fragment = assemble_element(&boxes, ctx, root_taffy, root, (0.0, 0.0));
     fragment.border_box.x = margin_left;
     fragment.border_box.y = margin_top;
+    // 滚动容器元数据（K6 T2）：布局结果的后处理标注，不改几何
+    #[cfg(feature = "scroll")]
+    crate::scroll::annotate(&mut fragment);
     fragment
 }
 
@@ -376,6 +379,8 @@ fn assemble_element(
                     style: style.clone(),
                     children: Vec::new(),
                     lines: shifted_lines,
+                    scrollable: false,
+                    scrollable_overflow: None,
                 });
             }
         } else if let Some(dom) = boxes.taffy_to_dom.get(&child).copied() {
@@ -392,6 +397,8 @@ fn assemble_element(
         style,
         children,
         lines,
+        scrollable: false,
+        scrollable_overflow: None,
     }
 }
 
@@ -403,6 +410,7 @@ fn offset_line(mut line: LineFragment, dx: f32, dy: f32) -> LineFragment {
 
 /// [`offset_line`] 的原地版本（批量平移前先算对齐偏移时用）。
 fn offset_line_in_place(line: &mut LineFragment, dx: f32, dy: f32) {
+    line.top += dy;
     line.baseline += dy;
     for run in &mut line.runs {
         for glyph in &mut run.glyphs {
@@ -485,5 +493,7 @@ fn empty_fragment(node: NodeId, style: &ComputedStyle) -> Fragment {
         style: style.clone(),
         children: Vec::new(),
         lines: Vec::new(),
+        scrollable: false,
+        scrollable_overflow: None,
     }
 }

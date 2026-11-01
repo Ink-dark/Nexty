@@ -34,6 +34,25 @@ const ALIASES = {
   "/landing/dir/page.html": "batch1/k3/landing-page.html",
   "/landing/dir/sub.html": "batch1/k3/landing-sub.html",
   "/landing/dir/dot.png": "core/dot.png",
+  // K13 图片格式 + favicon 两态页（批次 2）
+  "/k13": "batch2/k13/formats.html",
+  "/k13icon": "batch2/k13/favicon-link.html",
+  "/k13noicon": "batch2/k13/favicon-nolink.html",
+  // K6 容器滚动三页（批次 2）：静态路径 pages/batch2/k6/*.html 亦可直接访问
+  "/k6nested": "batch2/k6/nested-scroll.html",
+  "/k6hidden": "batch2/k6/hidden-clip.html",
+  "/k6bar": "batch2/k6/container-scrollbar.html",
+  // K5 脚本演示页（批次 2）：事件驱动 DOM 变更 + 定时器 + 两段 inline 脚本
+  "/k5script": "batch2/k5/script-demo.html",
+};
+
+// K13 formats 页四张 8x8 fixture：URL → crates/nexty-paint/tests/data/ 下的
+// 文件名（复用解码单测的同一份二进制，不在 pages/ 重复入库）。
+const K13_IMAGES = {
+  "/k13/img/png.png": "k13-8x8.png",
+  "/k13/img/jpeg.jpeg": "k13-8x8.jpeg",
+  "/k13/img/gif.gif": "k13-8x8.gif",
+  "/k13/img/webp.webp": "k13-8x8.webp",
 };
 
 const MIME = {
@@ -41,6 +60,11 @@ const MIME = {
   ".png": "image/png",
   ".ttf": "font/ttf",
   ".hex": "text/plain; charset=ascii",
+  ".ico": "image/x-icon",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".jpeg": "image/jpeg",
+  ".jpg": "image/jpeg",
 };
 
 const counts = new Map();
@@ -110,6 +134,20 @@ http
     if (decoded === "/font/space-mono.ttf") {
       // 测试字体来自 text 层已入库的 OFL 字体，不在本目录复制一份
       sendFile(res, join(REPO, "crates/nexty-text/tests/data/SpaceMono-Regular.ttf"));
+      return;
+    }
+    if (decoded === "/favicon.ico") {
+      // K13 回落图标：与两态页 ① 的 link 图标同一份 16x16 橙色 ICO，
+      // 但 URL 不同 —— /stats 可分别断言 link 优先与 favicon.ico 回落
+      sendFile(res, join(REPO, "crates/nexty-paint/tests/data/k13-16x16.ico"));
+      return;
+    }
+    if (decoded === "/k13-link-icon.ico") {
+      sendFile(res, join(REPO, "crates/nexty-paint/tests/data/k13-16x16.ico"));
+      return;
+    }
+    if (K13_IMAGES[decoded]) {
+      sendFile(res, join(REPO, "crates/nexty-paint/tests/data", K13_IMAGES[decoded]));
       return;
     }
 

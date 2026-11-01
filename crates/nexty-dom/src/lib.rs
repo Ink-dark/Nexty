@@ -11,16 +11,21 @@
 //! 已落地：节点类型（含 doctype / fragment / 处理指令）与元素命名空间、
 //! 树变更算法（insert / remove / replace / clone / normalize）、事件模型
 //! （Event / 监听器注册表 / 传播算法 / 事件数据面 / EventLoop——DOM §2.9
-//! 简化档，见 `event` 模块文档及其偏差清单）。JS 绑定层尚未接入。
+//! 简化档，见 `event` 模块文档及其偏差清单）、JSRT 接缝（K5：ScriptHost
+//! runner 接缝 / JsrtListener·JsrtTimerCallback 回调面 / DomRegistry 绑定
+//! 注册表 / JsrtRuntime 任务泵，引擎无关，见 `jsrt` 模块；具体引擎接入见
+//! 适配 crate `nexty-jsrt-rquickjs`）。
 //!
-//! **Feature**：节点数据层（`node`）、树变更算法（`tree`）与事件模型
-//! （`event`）分别受 feature 控制，默认全开；`tree` 隐含 `node`，
-//! `event` 隐含 `tree`。
+//! **Feature**：节点数据层（`node`）、树变更算法（`tree`）、事件模型
+//! （`event`）与 JSRT 接缝（`jsrt`）分别受 feature 控制，默认全开；
+//! `tree` 隐含 `node`，`event` 隐含 `tree`，`jsrt` 隐含 `event`。
 
 #![forbid(unsafe_code)]
 
 #[cfg(feature = "event")]
 mod event;
+#[cfg(feature = "jsrt")]
+mod jsrt;
 #[cfg(feature = "node")]
 mod node;
 #[cfg(feature = "tree")]
@@ -30,6 +35,12 @@ mod tree;
 pub use event::{
     DOM_CONTENT_LOADED, DeltaMode, Event, EventListener, EventLoop, EventPhase, FocusEvent,
     KeyboardEvent, LOAD, ListenerId, MouseEvent, Task, TaskContext, UiEvent, WheelEvent,
+};
+#[cfg(feature = "jsrt")]
+pub use jsrt::{
+    BindingError, DomRegistry, GetComputedStyleHook, JsrtError, JsrtGate, JsrtListener,
+    JsrtRuntime, JsrtScope, JsrtTimerCallback, ListenerHandle, ListenerInvocation, ListenerOutcome,
+    PumpStatus, QuerySelectorHook, ScriptError, ScriptErrorKind, ScriptHost,
 };
 #[cfg(feature = "node")]
 pub use node::{

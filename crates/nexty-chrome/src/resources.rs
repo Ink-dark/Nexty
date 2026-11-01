@@ -31,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use nexty_css::{FontFaceSource, FontFaceStyle, Stylesheet};
-use nexty_dom::{Document, NodeId};
+use nexty_dom::{Document, Namespace, NodeId, NodeKind};
 use nexty_html::StyleResource;
 use nexty_network::{Method, NetworkError, NetworkFetcher, Request, decode_document, resolve};
 use nexty_paint::{Image, decode};
@@ -57,6 +57,89 @@ pub const MAX_IMAGE_BODY_BYTES: usize = 50 * 1024 * 1024;
 /// （分配失败是 abort，panic 兜底兜不住）。
 pub const MAX_FONT_BODY_BYTES: usize = 20 * 1024 * 1024;
 
+/// 外链脚本响应体字节预算（K5 T3）：与样式表同为文本档，10 MB 已远超真实
+/// 脚本；超预算按既有降级语义跳过该脚本（不执行，页面照常渲染）。
+pub const MAX_SCRIPT_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// 页面脚本清单项（K5 T3）：解析完成点单处收集，文档序即执行序。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptResource {
+    /// `<script>` 元素节点。
+    pub node: NodeId,
+    /// 脚本来源。
+    pub source: ScriptSource,
+}
+
+/// 脚本来源：inline 源文本或外链地址。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptSource {
+    /// 内联源文本（子文本节点拼接；无 src 属性的 script）。
+    Inline(String),
+    /// 外链（src 属性非空）；字节由主文档编排抓取。
+    External {
+        /// src 属性原值（可能是相对地址，由上层解析）。
+        src: String,
+    },
+}
+
+/// 按树序收集文档中的 `<script>` 清单（K5 T3：解析完成点单处钩子）。
+///
+/// 只收集不执行：执行在主线程页面安装点（`script::install_and_run`）。
+/// 规则：
+///
+/// - 只认 HTML 命名空间的 `script`；`<template>` 内容游离主树之外，不收。
+/// - `src` 属性非空 → [`ScriptSource::External`]（defer / async 均按 defer
+///   档处理——async 记偏差）；`src` 缺失或空 → inline（子文本拼接）。
+/// - `type` 属性不检查（偏差：type=text/javascript 之外的档位不区分，
+///   一律当 classic script）。
+#[must_use]
+pub fn collect_script_resources(document: &Document) -> Vec<ScriptResource> {
+    let mut resources = Vec::new();
+    collect_scripts_from(document, document.root(), &mut resources);
+    resources
+}
+
+/// 以先序遍历收集子树里的 `<script>`（script 子内容是 raw text，无元素后代）。
+fn collect_scripts_from(document: &Document, node: NodeId, resources: &mut Vec<ScriptResource>) {
+    for child in document.children(node) {
+        let Some(NodeKind::Element(data)) = document.node(child) else {
+            continue;
+        };
+        if data.namespace != Namespace::Html || data.name != "script" {
+            collect_scripts_from(document, child, resources);
+            continue;
+        }
+        let src = data
+            .attributes
+            .iter()
+            .find(|attr| attr.name == "src")
+            .map(|attr| attr.value.as_str())
+            .unwrap_or_default();
+        let source = if src.is_empty() {
+            let mut inline = String::new();
+            for text in document.children(child) {
+                if let Some(NodeKind::Text(content)) = document.node(text) {
+                    inline.push_str(content);
+                }
+            }
+            ScriptSource::Inline(inline)
+        } else {
+            ScriptSource::External {
+                src: src.to_string(),
+            }
+        };
+        resources.push(ScriptResource {
+            node: child,
+            source,
+        });
+    }
+}
+
+/// favicon 响应体字节预算（K13 T2）：真实站点的 favicon 几乎全部小于
+/// 100 KB，1 MiB 已远超，图片档（50 MB）对它明显过宽。超预算按既有降级
+/// 语义缺席——favicon 是纯装饰资源，任何失败都静默降级，不阻塞页面。
+pub const MAX_FAVICON_BODY_BYTES: usize = 1024 * 1024;
+
 /// 抓取完成的子资源。
 pub struct Subresources {
     /// 作者样式表，按级联优先级排列（inline 与外链按文档出现顺序交错）。
@@ -78,6 +161,9 @@ pub struct FetchedPageData {
     /// 外链样式表字节：绝对 URL → 字节。失败/超时/超预算/URL 解析失败的
     /// URL 不在表内（降级语义：该表不参与级联）。
     pub css: HashMap<String, Vec<u8>>,
+    /// 外链脚本字节（K5 T3）：绝对 URL → 字节。失败/超时/超预算/URL 解析
+    /// 失败的 URL 不在表内（降级语义：该脚本不执行，页面照常渲染）。
+    pub scripts: HashMap<String, Vec<u8>>,
     /// 已解码图片：绝对 URL → 像素。同上缺席 = 该图所有节点无像素；同
     /// URL 一份像素，装配期按 `Arc` 共享（M1 零拷贝）。
     pub images: HashMap<String, Arc<Image>>,
@@ -111,7 +197,7 @@ pub fn fetch_subresources_with_settle(
     document: &Document,
     on_settle: &mut dyn FnMut(),
 ) -> Subresources {
-    let (css, images) = fetch_resolved(fetcher, base_url, document, on_settle);
+    let (css, images, _scripts) = fetch_resolved(fetcher, base_url, document, on_settle);
     assemble_from_maps(document, base_url, &css, &images)
 }
 
@@ -129,8 +215,13 @@ pub fn fetch_page_data(
     html: String,
     on_settle: &mut dyn FnMut(),
 ) -> FetchedPageData {
-    let (css, images) = fetch_resolved(fetcher, base_url, document, on_settle);
-    FetchedPageData { html, css, images }
+    let (css, images, scripts) = fetch_resolved(fetcher, base_url, document, on_settle);
+    FetchedPageData {
+        html,
+        css,
+        images,
+        scripts,
+    }
 }
 
 /// 主文档抓取编排的产物（K3 T5）：[`fetch_document`] 的成功输出，全部为
@@ -270,6 +361,13 @@ pub fn assemble_page_data(
     assemble_from_maps(document, base_url, &fetched.css, &fetched.images)
 }
 
+/// 抓取核心的三类产物：css 字节表、已解码图片表、脚本字节表。
+type FetchedMaps = (
+    HashMap<String, Vec<u8>>,
+    HashMap<String, Arc<Image>>,
+    HashMap<String, Vec<u8>>,
+);
+
 /// 共享抓取核心：收集清单 → URL 解析/去重 → 并发抓取（按类别带预算）→
 /// 解码，成功者按绝对 URL 打包。settle（含失败/超时/预算降级路径）在
 /// 返回前恰触发一次回调。
@@ -278,9 +376,10 @@ fn fetch_resolved(
     base_url: &str,
     document: &Document,
     on_settle: &mut dyn FnMut(),
-) -> (HashMap<String, Vec<u8>>, HashMap<String, Arc<Image>>) {
+) -> FetchedMaps {
     let style_resources = nexty_html::collect_style_resources(document);
     let image_resources = nexty_html::collect_image_resources(document);
+    let script_resources = collect_script_resources(document);
 
     // ---- 阶段一：解析 URL，编出抓取任务（同 URL 只抓一次）----
     let mut css_seen: HashSet<String> = HashSet::new();
@@ -305,9 +404,22 @@ fn fetch_resolved(
         }
     }
 
+    // 外链脚本（K5 T3）：同 URL 去重，defer / async 均按 defer 档编排。
+    let mut script_seen: HashSet<String> = HashSet::new();
+    let mut script_tasks: Vec<String> = Vec::new();
+    for resource in &script_resources {
+        if let ScriptSource::External { src } = &resource.source
+            && let Ok(url) = resolve(base_url, src)
+            && script_seen.insert(url.clone())
+        {
+            script_tasks.push(url);
+        }
+    }
+
     // ---- 阶段二：并发抓取（分块限流，按类别带响应体预算）----
     let css_bytes = fetch_many(fetcher, &css_tasks, MAX_STYLESHEET_BODY_BYTES);
     let image_bytes = fetch_many(fetcher, &image_tasks, MAX_IMAGE_BODY_BYTES);
+    let script_bytes = fetch_many(fetcher, &script_tasks, MAX_SCRIPT_BODY_BYTES);
 
     // ---- 阶段三：成功者按绝对 URL 打包（图片解码在本线程完成）----
     let mut css = HashMap::new();
@@ -325,12 +437,18 @@ fn fetch_resolved(
             images.insert(url.clone(), Arc::new(image));
         } // 解码失败：同样降级
     }
+    let mut scripts = HashMap::new();
+    for (task, url) in script_tasks.iter().enumerate() {
+        if let Some(bytes) = &script_bytes[task] {
+            scripts.insert(url.clone(), bytes.clone());
+        }
+    }
 
     // ---- 首轮编排 settle：全部抓取/解码任务已出结果（含降级路径），
     // 恰触发一次回调 ----
     on_settle();
 
-    (css, images)
+    (css, images, scripts)
 }
 
 /// 按**本线程文档**的清单顺序装配（inline 用原文、外链按绝对 URL 查表、
@@ -554,6 +672,143 @@ pub fn fetch_fonts(fetcher: &dyn NetworkFetcher, requests: &[FontRequest]) -> Ve
 /// 源跳过抓取。比较不区分 ASCII 大小写（format 串规范未约束大小写）。
 fn is_skipped_font_format(hint: &str) -> bool {
     hint.eq_ignore_ascii_case("woff") || hint.eq_ignore_ascii_case("woff2")
+}
+
+// ---- favicon 编排（K13 T2）----
+
+/// 页面 favicon 地址（HTML §4.6.6.6 rel=icon 简化档）。
+///
+/// DOM 遍历收集 `link[rel~=icon]`（rel 为 ASCII 大小写不敏感的空格分隔
+/// token 表，含 `icon` token 即命中；按文档序首个带非空 href 者胜出），
+/// 回落站点根 `/favicon.ico`（HTTP 事实标准：link 图标缺席、href 为空或
+/// 解析失败时）。相对地址按文档 base 解析；两者皆不可得（base 不可解析）
+/// 返回 `None`。
+///
+/// 简化档偏差：`sizes` / `type` / `media` 不参与选择（不挑最大尺寸、不
+/// 按类型过滤；SVG 图标照常抓取，由解码侧静默降级）；`apple-touch-icon`
+/// 等复合 token 不命中（token 相等才算，与 `~=` 选择器语义一致）；回落
+/// 是 URL 级的——link 图标存在但抓取/解码失败时不重试回落 URL（页内
+/// 唯一候选，见 [`FaviconOrchestrator::favicon_for`]）。
+#[must_use]
+pub fn collect_favicon_url(document: &Document, base_url: &str) -> Option<String> {
+    find_favicon_href(document, document.root())
+        .and_then(|href| resolve(base_url, &href).ok())
+        .or_else(|| resolve(base_url, "/favicon.ico").ok())
+}
+
+/// 文档序首个 `link[rel~=icon]` 的非空 href（递归下钻，深度受 HTML 解析
+/// 入口的 [`nexty_dom::MAX_TREE_DEPTH`] 截断约束，与 `document_title`
+/// 同型）。
+fn find_favicon_href(document: &Document, node: NodeId) -> Option<String> {
+    use nexty_dom::{Namespace, NodeKind};
+    if let Some(NodeKind::Element(data)) = document.node(node)
+        && data.namespace == Namespace::Html
+        && data.name == "link"
+        && rel_contains_icon(&data.attributes)
+    {
+        let href = data
+            .attributes
+            .iter()
+            .find(|attribute| attribute.name == "href")
+            .map(|attribute| attribute.value.clone());
+        if let Some(href) = href
+            && !href.trim().is_empty()
+        {
+            return Some(href);
+        }
+        // rel=icon 但无 href：继续找下一个候选（回落语义在 collect 统一收口）
+    }
+    for child in document.children(node) {
+        if let Some(found) = find_favicon_href(document, child) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// rel 属性值是否含 `icon` token（ASCII 大小写不敏感，空格分隔 token 表）。
+fn rel_contains_icon(attributes: &[nexty_dom::Attribute]) -> bool {
+    attributes
+        .iter()
+        .filter(|attribute| attribute.name == "rel")
+        .any(|attribute| {
+            attribute
+                .value
+                .split_ascii_whitespace()
+                .any(|token| token.eq_ignore_ascii_case("icon"))
+        })
+}
+
+/// 抓取并解码 favicon（后台线程）：预算 [`MAX_FAVICON_BODY_BYTES`]，非 2xx /
+/// 传输错误 / 超预算 / 解码失败一律返回 `None`——favicon 是纯装饰资源，
+/// 任何失败都静默降级，不阻塞、不错误化页面加载（降级语义与子资源一致）。
+#[must_use]
+pub fn fetch_favicon(fetcher: &dyn NetworkFetcher, url: &str) -> Option<Arc<Image>> {
+    let request = Request {
+        url: url.to_owned(),
+        method: Method::Get,
+        headers: Vec::new(),
+    };
+    let bytes = fetch_ok(fetcher, &request, MAX_FAVICON_BODY_BYTES)?;
+    decode(&bytes).ok().map(Arc::new)
+}
+
+/// favicon 会话编排：会话级像素缓存 + 去重（K13 T2）。
+///
+/// 会话级 = 浏览器生命周期内持续有效：同一 URL 抓取成功后，后续导航直接
+/// 复用缓存像素，不再发请求（同站多页共享同一 favicon 的常规形态）。
+/// 负结果（404 / 解码失败 / 超预算）不入缓存，下次导航可重试——与字体
+/// 编排的会话去重语义一致。本类型不持 `Document`，跨线程边界只传
+/// `Option<Arc<Image>>` 数据面。
+#[derive(Default)]
+pub struct FaviconOrchestrator {
+    /// 已成功取到的 favicon（绝对 URL → 像素，`Arc` 共享给地址栏槽位）。
+    cache: HashMap<String, Arc<Image>>,
+}
+
+impl FaviconOrchestrator {
+    /// 空会话。
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 单次导航的 favicon 编排入口（后台线程，页面解析完成后调用）：
+    /// 解析 URL（link 优先 / favicon.ico 回落，[`collect_favicon_url`]）→
+    /// 会话缓存命中直接复用 → 抓取 + 解码（[`fetch_favicon`]）→ 成功入缓存。
+    ///
+    /// 返回 `None`（全部静默降级，不阻塞页面）：页面无 link 图标且 base
+    /// 不可解析、抓取失败 / 非 2xx / 超预算、字节解码失败。
+    pub fn favicon_for(
+        &mut self,
+        fetcher: &dyn NetworkFetcher,
+        document: &Document,
+        base_url: &str,
+    ) -> Option<Arc<Image>> {
+        let url = collect_favicon_url(document, base_url)?;
+        if let Some(image) = self.cache.get(&url) {
+            return Some(Arc::clone(image));
+        }
+        let image = fetch_favicon(fetcher, &url)?;
+        self.cache.insert(url, Arc::clone(&image));
+        Some(image)
+    }
+
+    /// 会话缓存命中查询（K13 T2 拆分接线用）：URL 已由
+    /// [`collect_favicon_url`] 在主线程解析，命中返回共享像素、不发请求。
+    /// 与 [`Self::favicon_for`] 的去重语义一致：负结果不在缓存，返回
+    /// `None` 只代表「未命中」，调用方自行决定是否后台抓取。
+    #[must_use]
+    pub fn cached(&self, url: &str) -> Option<Arc<Image>> {
+        self.cache.get(url).cloned()
+    }
+
+    /// 抓取成功后写入会话缓存（主线程，后台抓取完成后调用）。负结果
+    /// 不入缓存——调用方只在 `image` 为 `Some` 时调用，语义与
+    /// [`Self::favicon_for`] 一致。
+    pub fn store(&mut self, url: &str, image: Arc<Image>) {
+        self.cache.insert(url.to_owned(), image);
+    }
 }
 
 /// 并发抓取一组 URL，返回与 `urls` 等长的结果槽（失败或超预算为 `None`）。
@@ -1048,6 +1303,164 @@ mod tests {
                 rejected: 0
             },
             "同 URL 重复载荷不重复注册"
+        );
+    }
+
+    // ---- K13 T2：favicon 编排（link 优先 / 回落 / 失败降级 / 会话去重）----
+
+    const FAVICON_PNG: &str = "https://page.test/favicon.png";
+    const FAVICON_ICO: &str = "https://page.test/favicon.ico";
+
+    #[test]
+    fn favicon_link_icon_takes_priority_over_favicon_ico() {
+        let fetcher = MockFetcher::new();
+        fetcher.serve(FAVICON_PNG, &tiny_png());
+        let page = document("<head><link rel=icon href=/favicon.png></head><body></body>");
+
+        let mut favicons = FaviconOrchestrator::new();
+        let image = favicons
+            .favicon_for(&fetcher, &page, BASE)
+            .expect("link 图标应抓取解码成功");
+        assert_eq!(image.width, 1, "link 图标像素已解码");
+        let hits = fetcher.hits.lock().unwrap();
+        assert!(hits.contains(&FAVICON_PNG.to_owned()), "抓取 link 图标");
+        assert!(
+            !hits.contains(&FAVICON_ICO.to_owned()),
+            "link 命中时不回落 /favicon.ico"
+        );
+    }
+
+    #[test]
+    fn favicon_rel_token_matching_follows_html_semantics() {
+        // token 相等才命中（ASCII 大小写不敏感）：shortcut icon / ICON 命中；
+        // apple-touch-icon、stylesheet 等其它 token 不命中
+        let fetcher = MockFetcher::new();
+        fetcher.serve(FAVICON_PNG, &tiny_png());
+        let page = document(
+            "<head>\
+             <link rel=stylesheet href=style.css>\
+             <link rel=apple-touch-icon href=/touch.png>\
+             <link rel=\"shortcut ICON\" href=/favicon.png>\
+             </head>",
+        );
+        assert_eq!(
+            collect_favicon_url(&page, BASE).as_deref(),
+            Some(FAVICON_PNG)
+        );
+        let mut favicons = FaviconOrchestrator::new();
+        assert!(favicons.favicon_for(&fetcher, &page, BASE).is_some());
+        let hits = fetcher.hits.lock().unwrap();
+        assert_eq!(hits.len(), 1, "只抓 token 命中的那个 URL");
+    }
+
+    #[test]
+    fn favicon_falls_back_to_site_root_favicon_ico() {
+        let fetcher = MockFetcher::new();
+        fetcher.serve(FAVICON_ICO, &tiny_png());
+        // 无 link 图标：回落站点根 /favicon.ico（相对地址按文档 base 解析）
+        let page = document("<head><title>no icon link</title></head><body></body>");
+
+        let mut favicons = FaviconOrchestrator::new();
+        assert!(
+            favicons.favicon_for(&fetcher, &page, BASE).is_some(),
+            "回落 /favicon.ico 应命中"
+        );
+        assert!(
+            fetcher
+                .hits
+                .lock()
+                .unwrap()
+                .contains(&FAVICON_ICO.to_owned()),
+            "请求发到站点根 /favicon.ico"
+        );
+
+        // link 存在但 href 为空：同样回落（root-absolute 落在 origin 根）
+        fetcher.serve("https://page.test/dir/favicon.ico", &tiny_png());
+        let page = document("<head><link rel=icon href=''></head>");
+        assert_eq!(
+            collect_favicon_url(&page, "https://page.test/dir/page.html").as_deref(),
+            Some("https://page.test/favicon.ico"),
+            "空 href 回落站点根 /favicon.ico（root-absolute 按 origin 解析）"
+        );
+    }
+
+    #[test]
+    fn favicon_failures_degrade_silently_without_blocking() {
+        // link 404：URL 级回落只在 link 缺席/不可解析时发生，link 图标
+        // 抓取失败不重试回落 URL（简化档，见 collect_favicon_url 偏差）——
+        // 静默降级为 None，不 panic、不阻塞（返回即代表页面照常装配）
+        let fetcher = MockFetcher::new();
+        fetcher.fail("https://page.test/lost.png", 404);
+        let page = document("<head><link rel=icon href=/lost.png></head><body>x</body>");
+
+        let mut favicons = FaviconOrchestrator::new();
+        assert!(
+            favicons.favicon_for(&fetcher, &page, BASE).is_none(),
+            "抓取失败静默降级"
+        );
+        {
+            let hits = fetcher.hits.lock().unwrap();
+            assert!(hits.contains(&"https://page.test/lost.png".to_owned()));
+            assert!(
+                !hits.contains(&FAVICON_ICO.to_owned()),
+                "link 图标抓取失败不重试回落 URL（URL 级回落）"
+            );
+        }
+
+        // 超预算（> MAX_FAVICON_BODY_BYTES）：按降级语义缺席
+        fetcher.serve(
+            "https://page.test/huge.png",
+            &vec![0u8; MAX_FAVICON_BODY_BYTES + 1],
+        );
+        let page = document("<head><link rel=icon href=/huge.png></head>");
+        assert!(
+            favicons.favicon_for(&fetcher, &page, BASE).is_none(),
+            "超预算 favicon 缺席"
+        );
+
+        // base 不可解析（about:blank）：URL 解析不出 → None
+        let page = document("<head></head>");
+        assert_eq!(collect_favicon_url(&page, "about:blank"), None);
+
+        // 回落 URL 解码失败（非图片字节）：同样静默降级
+        fetcher.serve(FAVICON_ICO, b"<html>not an image</html>");
+        assert!(
+            favicons.favicon_for(&fetcher, &page, BASE).is_none(),
+            "回落 URL 解码失败静默降级"
+        );
+    }
+
+    #[test]
+    fn favicon_session_dedup_reuses_pixels_without_refetch() {
+        let fetcher = MockFetcher::new();
+        fetcher.serve(FAVICON_PNG, &tiny_png());
+        let page = document("<head><link rel=icon href=/favicon.png></head>");
+
+        let mut favicons = FaviconOrchestrator::new();
+        let first = favicons.favicon_for(&fetcher, &page, BASE).expect("first");
+        // 同页再次导航（同文档同 URL）：命中会话缓存，不发请求，像素共享
+        let second = favicons.favicon_for(&fetcher, &page, BASE).expect("second");
+        assert!(Arc::ptr_eq(&first, &second), "缓存像素按 Arc 共享");
+        assert_eq!(
+            fetcher
+                .hits
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|url| *url == FAVICON_PNG)
+                .count(),
+            1,
+            "同 URL 二次导航命中会话缓存，网络只打一次"
+        );
+
+        // 负结果不入缓存：失败后服务端恢复，下次导航可重试成功
+        fetcher.fail(FAVICON_ICO, 404);
+        let page = document("<head></head>");
+        assert!(favicons.favicon_for(&fetcher, &page, BASE).is_none());
+        fetcher.serve(FAVICON_ICO, &tiny_png());
+        assert!(
+            favicons.favicon_for(&fetcher, &page, BASE).is_some(),
+            "负结果不入缓存，恢复后重试成功"
         );
     }
 }

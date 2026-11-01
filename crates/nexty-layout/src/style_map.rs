@@ -22,8 +22,10 @@
 //! - `display: table` 及表格内部盒：taffy roadmap 未覆盖 table，本轮按 `Display::Block`
 //!   近似（维持现状，非目标）。
 //! - grid `min` 尺寸函数中出现 `fr`（非法 CSS）：降级为 `auto`。
-//! - `overflow` 仅 `visible` / `hidden` 被建模（`auto`/`scroll`/`clip` 在 cascade 已丢弃），
-//!   影响 taffy 的 flex/grid item 自动最小尺寸。
+//! - `overflow`：per-axis 独立映射（K6 T1）；`hidden`→taffy `Hidden`，
+//!   `scroll`/`auto`→taffy `Scroll`（taffy 无 auto；滚动容器的自动最小尺寸
+//!   归零、不向父滚动区贡献溢出）；`clip` 在 cascade 已丢弃。滚动容器元数据
+//!   （scrollable 标志 + scrollable overflow rect）在 `scroll` 模块（T2）。
 //! - `position: fixed`：映射为 taffy `Absolute`。taffy 不做「最近定位祖先」包含块
 //!   搜索，绝对定位盒相对其**树内父盒**定位——父盒自身定位（relative/absolute）时
 //!   与 CSS 一致；父盒 static 时 CSS 应上溯定位祖先，此处偏差（见 `block` 模块文档
@@ -115,14 +117,19 @@ pub(crate) fn map_style(style: &ComputedStyle) -> Style {
         top: border_side(style.border_width.top),
         bottom: border_side(style.border_width.bottom),
     };
-    // overflow：仅裁剪标记影响 taffy 的自动最小尺寸（flex/grid item）。
-    let overflow = match style.overflow {
+    // overflow：per-axis 独立映射（CSS Overflow 3 §3；K6 T1）。非 visible 值
+    // 影响 taffy 的自动最小尺寸（flex/grid item）；hidden 与 scroll/auto 在
+    // taffy 侧都裁剪，差别在最小尺寸档位（scroll/auto 归零）。
+    let map_overflow = |value: OverflowValue| match value {
         OverflowValue::Visible => Overflow::Visible,
         OverflowValue::Hidden => Overflow::Hidden,
+        // taffy 无 auto：滚动容器（含 auto）映射 Scroll（自动最小尺寸归零、
+        // 不向父滚动区贡献溢出，与 CSS 滚动容器语义一致）
+        OverflowValue::Scroll | OverflowValue::Auto => Overflow::Scroll,
     };
     s.overflow = Point {
-        x: overflow,
-        y: overflow,
+        x: map_overflow(style.overflow_x),
+        y: map_overflow(style.overflow_y),
     };
 
     // float / clear（CSS 2.1 §9.5.1/§9.5.2）：blockify 拦截——绝对/固定定位的

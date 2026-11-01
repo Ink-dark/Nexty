@@ -85,6 +85,52 @@
   <p>与主站 <code>core/index.html</code> 结构一致的回归形态。</p>
 </div>
 
+<h2>批次 2（K13 图片格式 + favicon / K6 容器滚动 / K5 脚本）</h2>
+
+<div class="item">
+  <h3><a href="/k13">/k13</a> — 图片格式并排（png / jpeg / gif / webp）</h3>
+  <p>四张 8×8 fixture 放大 64×64：每张均为四象限色块（左上红/右上绿/左下蓝/右下白）；
+  jpeg/webp 允许有损噪点，象限主色可辨。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/k13icon">/k13icon</a> — favicon 两态页 ①（有 link）</h3>
+  <p>地址栏左侧出现 16×16 橙色图标；<a href="/stats">/stats</a> 有
+  <code>/k13-link-icon.ico</code> 且无 <code>/favicon.ico</code>（link 优先）；
+  二次导航计数不变（会话去重）。前提：favicon 编排已在 app.rs 接线（见 README）。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/k13noicon">/k13noicon</a> — favicon 两态页 ②（无 link，回落）</h3>
+  <p>无 <code>link[rel~=icon]</code>：回落站点根 <code>/favicon.ico</code>，图标照常出现；
+  <a href="/stats">/stats</a> 有 <code>/favicon.ico</code> 计数。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/k6nested">/k6nested</a> — K6 嵌套滚动（内外双层 overflow:auto）</h3>
+  <p>内外两层各自出现滚动条且独立拖拽；滚轮在内层先滚、到边界冒泡外层再冒泡页面；
+  拖内层滚动条不带动页面；resize 后偏移保留并夹取。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/k6hidden">/k6hidden</a> — K6 hidden 裁剪</h3>
+  <p>overflow:hidden 容器只显示顶部内容、无滚动条；滚轮不可滚它、直接冒泡页面；
+  被裁内容不渗出边框。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/k6bar">/k6bar</a> — K6 容器滚动条拖拽</h3>
+  <p>容器右缘滚动条：thumb 按内容比例取高；拖拽抓取点不跳变、端点对齐；
+  轨道点击翻页；拖容器滚动条期间页面不滚。</p>
+</div>
+
+<div class="item">
+  <h3><a href="/k5script">/k5script</a> — K5 脚本演示（事件驱动 DOM 变更）</h3>
+  <p>两段 inline 脚本按文档序执行：点击按钮 → JS 监听器改 textContent/style
+  并重排；setTimeout(0) 经事件间隙任务泵改色；createElement + appendChild
+  新增段落；页面无脚本错误页。按钮为文本形态（控件替换盒属 K10）。</p>
+</div>
+
 <h2>核心站（滚动 / 键盘 / 选区 / 图片）</h2>
 
 <div class="item">

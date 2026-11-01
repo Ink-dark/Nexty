@@ -1,7 +1,7 @@
 [package]
 name = "nexty-dom"
 description = "Nexty 自研 arena DOM"
-version = "0.1.4"
+version = "0.1.6"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -9,7 +9,7 @@ rust-version.workspace = true
 
 [features]
 # 默认开启全部已实现能力；DOM 是所有层的地基，默认必须全开。
-default = ["node", "tree", "event"]
+default = ["node", "tree", "event", "jsrt"]
 # 节点数据层：NodeKind / ElementData / Attribute / Namespace / QuirksMode 等。
 node = []
 # 树变更算法：Document / Children（pre-insert / insert / remove / replace /
@@ -19,5 +19,11 @@ tree = ["node"]
 # 传播算法 / 事件数据面 / EventLoop 与生命周期事件。传播沿祖先链走、监听器
 # 容器挂在 Document 上，故隐含 tree。
 event = ["tree"]
+# JSRT 接缝（K5）：runner 接缝 trait（ScriptHost）、回调面（JsrtListener /
+# JsrtTimerCallback）、绑定注册表（DomRegistry + querySelector /
+# getComputedStyle 注入钩子）与 JsrtRuntime 任务泵（微任务检查点 / 定时器 /
+# 宏任务合流）。引擎无关；具体引擎接入见适配 crate（nexty-jsrt-rquickjs）。
+# 微任务执行点落在 EventLoop 预留位上，故隐含 event。
+jsrt = ["event"]
 
 [dependencies]
