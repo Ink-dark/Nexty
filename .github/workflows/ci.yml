@@ -1,14 +1,17 @@
 name: CI
 
-# 持续集成：每次推送到 main 或开 PR 时，对全部 workspace 跑格式 / 静态检查 /
+# 持续集成：推送到任意分支或开 PR 到 main 时，对全部 workspace 跑格式 / 静态检查 /
 # 测试 / 安全门禁（cargo-deny、cargo-about）与 MSRV 校验。
+# macOS 测试不在 main 热路径上跑：仅推送到非 main 分支或手动触发（workflow_dispatch）
+# 时执行——非 main push 跑全套含 macOS；main push / PR 不跑 macOS。
 # 行为基准见仓库根 AGENTS.md「Build & Test Commands」与「Hard Rules」。
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -52,14 +55,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
-  # ---------- 测试（三平台原生 runner）----------
+  # ---------- 测试（Linux / Windows，每次必跑）----------
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies (Linux)
@@ -74,6 +77,19 @@ jobs:
             libegl1-mesa-dev libgles2-mesa-dev libfontconfig1-dev \
             vulkan-tools libvulkan-dev \
             fonts-noto-cjk
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  # ---------- macOS 测试（非 main 热路径：手动触发或非 main 分支 push 时跑）----------
+  test-macos:
+    name: Test (macos-latest)
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref != 'refs/heads/main')
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
